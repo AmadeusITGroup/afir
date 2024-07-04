@@ -27,12 +27,7 @@
 
 4. Set up the configuration files in the `config/` directory. Refer to `configuration.md` for details.
 
-5. Train the fraud prediction model:
-   ```
-   python src/fraud_prediction.py
-   ```
-
-6. Start the main application:
+5. Start the main application:
    ```
    python src/main.py
    ```

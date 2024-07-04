@@ -9,31 +9,24 @@ from log_retrieval import LogRetrievalEngine
 from anomaly_detection import AnomalyDetectionModule
 from report_generation import ReportGenerationModule
 from output_interface import OutputInterface
-from src.utils.error_handling import async_retry_with_backoff
+from utils.error_handling import async_retry_with_backoff
+from utils.performance import batch_process
 from plugin_system import PluginManager
 from feedback_loop import FeedbackLoop
 from export_results import ResultExporter
-from fraud_prediction import FraudPredictionModel
 from notifications import NotificationSystem, send_notification
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-
 def load_config(config_file):
     with open(config_file, 'r') as f:
         return yaml.safe_load(f)
 
-
 @async_retry_with_backoff(max_attempts=3, backoff_in_seconds=1)
-async def process_incident(incident, modules, fraud_model):
+async def process_incident(incident, modules):
     try:
         send_notification(incident['id'], 'processing', 'Started processing incident')
-
-        # Predict fraud probability
-        prediction = fraud_model.predict(incident)
-        incident['fraud_prediction'] = prediction
-        logger.info(f"Fraud prediction for incident {incident['id']}: {prediction['fraud_probability']:.2f}")
 
         understanding = await modules['understanding'].process(incident)
         logger.info(f"Incident {incident['id']} understanding complete")
@@ -74,7 +67,6 @@ async def process_incident(incident, modules, fraud_model):
         send_notification(incident['id'], 'error', f'Error processing incident: {str(e)}')
         raise
 
-
 async def main():
     main_config = load_config('config/main_config.yaml')
     llm_config = load_config('config/llm_config.yaml')
@@ -95,9 +87,6 @@ async def main():
         'feedback': FeedbackLoop(llm_config)
     }
 
-    fraud_model = FraudPredictionModel()
-    fraud_model.load_model('models/fraud_model.joblib')
-
     # Start the incident input server
     await modules['input'].start_server()
 
@@ -114,7 +103,7 @@ async def main():
                 continue
 
             tasks = [
-                asyncio.create_task(process_incident(incident, modules, fraud_model))
+                asyncio.create_task(process_incident(incident, modules))
                 for incident in incidents
             ]
 
@@ -128,7 +117,6 @@ async def main():
 
             # Process feedback periodically
             await modules['feedback'].process_feedback()
-
 
 if __name__ == "__main__":
     asyncio.run(main())
