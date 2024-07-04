@@ -1,0 +1,64 @@
+# templates/dashboard.html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Fraud Investigation System Dashboard</title>
+    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script>
+</head>
+<body>
+<h1>Fraud Investigation System Dashboard</h1>
+<div id="performance-chart" style="width:100%; height:400px;"></div>
+<div id="fraud-types-chart" style="width:100%; height:400px;"></div>
+
+<script>
+// Performance Chart
+axios.get('/performance_data')
+.then(response => {
+    const data = response.data;
+const trace1 = {
+    x: data.dates,
+    y: data.incidents,
+    type: 'scatter',
+    name: 'Incidents'
+};
+const trace2 = {
+    x: data.dates,
+    y: data.accuracy,
+    type: 'scatter',
+    name: 'Accuracy',
+    yaxis: 'y2'
+};
+const layout = {
+    title: 'System Performance Over Time',
+    yaxis: {title: 'Number of Incidents'},
+    yaxis2: {
+        title: 'Accuracy',
+        overlaying: 'y',
+        side: 'right'
+    }
+};
+Plotly.newPlot('performance-chart', [trace1, trace2], layout);
+});
+
+// Fraud Types Chart
+axios.get('/fraud_types')
+.then(response => {
+    const data = response.data;
+const values = Object.values(data);
+const labels = Object.keys(data);
+const trace = {
+    values: values,
+    labels: labels,
+    type: 'pie'
+};
+const layout = {
+    title: 'Distribution of Fraud Types'
+};
+Plotly.newPlot('fraud-types-chart', [trace], layout);
+});
+</script>
+</body>
+</html>

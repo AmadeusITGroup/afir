@@ -1,0 +1,21 @@
+raud_investigation_project/
+├── config/
+│   ├── main_config.yaml
+│   └── llm_config.yaml
+├── src/
+│   ├── __init__.py
+│   ├── main.py
+│   ├── incident_input.py
+│   ├── incident_understanding.py
+│   ├── api_call_generator.py
+│   ├── log_retrieval.py
+│   ├── anomaly_detection.py
+│   ├── report_generation.py
+│   └── output_interface.py
+├── utils/
+│   ├── __init__.py
+│   └── llm_utils.py
+├── tests/
+│   └── __init__.py
+├── requirements.txt
+└── README.md
