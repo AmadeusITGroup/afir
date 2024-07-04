@@ -43,8 +43,8 @@ These components are supported by utility modules for LLM integration, error han
 
 1. Clone the repository:
    ```
-   git clone https://github.com/yourusername/fraud-investigation-system.git
-   cd fraud-investigation-system
+   git clone https://github.com/AmadeusITGroup/afir.git
+   cd afir
    ```
 
 2. Create a virtual environment and activate it:
