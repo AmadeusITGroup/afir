@@ -20,53 +20,56 @@ from utils.llm_utils import RAG
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+
 def load_config(config_file):
     with open(config_file, 'r') as f:
         return yaml.safe_load(f)
+
 
 @async_retry_with_backoff(max_attempts=3, backoff_in_seconds=1)
 async def process_incident(incident, modules):
     try:
         send_notification(incident['id'], 'processing', 'Started processing incident')
-        
+
         understanding = await modules['understanding'].process(incident)
         logger.info(f"Incident {incident['id']} understanding complete")
-        
+
         api_calls = await modules['api_call'].generate(understanding)
         logger.info(f"Generated {len(api_calls)} API calls for incident {incident['id']}")
-        
+
         logs = await modules['log_retrieval'].retrieve(api_calls)
         logger.info(f"Retrieved logs from {len(logs)} sources for incident {incident['id']}")
-        
+
         anomalies = await modules['anomaly_detection'].detect(logs, understanding)
         logger.info(f"Detected {len(anomalies)} anomalies for incident {incident['id']}")
-        
+
         # Use plugins for additional processing
         for plugin in modules['plugins'].get_active_plugins():
             plugin_result = await modules['plugins'].execute_plugin(plugin, incident, understanding, logs, anomalies)
             logger.info(f"Executed plugin {plugin} for incident {incident['id']}")
-        
+
         report = await modules['report_generation'].generate(incident, understanding, logs, anomalies)
         logger.info(f"Generated investigation report for incident {incident['id']}")
-        
+
         await modules['output'].send(report, incident['id'])
         logger.info(f"Sent investigation report for incident {incident['id']}")
-        
+
         # Export results
         exporter = ResultExporter({'incident': incident, 'understanding': understanding, 'anomalies': anomalies})
         exporter.export_json(f"exports/incident_{incident['id']}.json")
         exporter.export_csv(f"exports/incident_{incident['id']}.csv")
         logger.info(f"Exported results for incident {incident['id']}")
-        
+
         # Collect feedback (this would typically be done after human review)
         await modules['feedback'].collect_feedback(incident['id'], {'anomalies': anomalies}, {'accuracy': 0.9})
-        
+
         send_notification(incident['id'], 'completed', 'Incident processing completed')
         return report
     except Exception as e:
         logger.error(f"Error processing incident {incident['id']}: {str(e)}")
         send_notification(incident['id'], 'error', f'Error processing incident: {str(e)}')
         raise
+
 
 async def main():
     main_config = load_config('config/main_config.yaml')
@@ -115,9 +118,9 @@ async def main():
                 asyncio.create_task(process_incident(incident, modules))
                 for incident in incidents
             ]
-            
+
             results = await asyncio.gather(*tasks, return_exceptions=True)
-            
+
             for incident, result in zip(incidents, results):
                 if isinstance(result, Exception):
                     logger.error(f"Failed to process incident {incident['id']}: {str(result)}")
@@ -126,6 +129,7 @@ async def main():
 
             # Process feedback periodically
             await modules['feedback'].process_feedback()
+
 
 if __name__ == "__main__":
     asyncio.run(main())

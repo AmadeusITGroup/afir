@@ -6,6 +6,7 @@ import json
 
 logger = logging.getLogger(__name__)
 
+
 class IncidentUnderstandingModule:
     def __init__(self, llm_config, rag):
         self.llm_config = llm_config
@@ -39,10 +40,10 @@ class IncidentUnderstandingModule:
                 timestamp=incident['timestamp'],
                 description=incident['description']
             )
-            
+
             understanding = await get_llm_response(prompt, self.llm_config, self.rag)
             structured_understanding = self.structure_understanding(understanding)
-            
+
             logger.info(f"Processed understanding for incident {incident['id']}")
             return {
                 "incident_id": incident['id'],

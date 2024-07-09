@@ -6,6 +6,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+
 class AnomalyDetectionModule:
     def __init__(self, config, llm_config, rag):
         self.config = config
@@ -45,18 +46,18 @@ class AnomalyDetectionModule:
     async def detect(self, logs, understanding):
         try:
             combined_logs = self.preprocess_logs(logs)
-            
+
             prompt = self.prompt_template.format(
                 incident_understanding=json.dumps(understanding['analysis'], indent=2),
                 log_data=combined_logs
             )
-            
+
             llm_response = await get_llm_response(prompt, self.llm_config, self.rag)
-            
+
             anomalies = self.parse_llm_response(llm_response)
-            
+
             filtered_anomalies = self.filter_anomalies(anomalies)
-            
+
             logger.info(f"Detected {len(filtered_anomalies)} anomalies for incident {understanding['incident_id']}")
             return filtered_anomalies
         except Exception as e:
@@ -68,12 +69,12 @@ class AnomalyDetectionModule:
         for source, entries in logs.items():
             for entry in entries:
                 combined_logs.append(f"[{source}] {json.dumps(entry)}")
-        
+
         max_chars = 15000  # Adjust based on LLM token limit
         combined_logs_str = "\n".join(combined_logs)
         if len(combined_logs_str) > max_chars:
             combined_logs_str = combined_logs_str[:max_chars] + "... [truncated]"
-        
+
         return combined_logs_str
 
     def parse_llm_response(self, llm_response):
@@ -90,7 +91,6 @@ class AnomalyDetectionModule:
         return [
             anomaly for anomaly in anomalies
             if anomaly.get('confidence_score', 0) >= self.config['threshold']
-        ]
         ]
 
 
@@ -111,6 +111,8 @@ async def main():
             }
         }
     }
+
+    rag = None  # You should initialize this with your actual RAG system
 
     logs = {
         'application_logs': [
@@ -139,7 +141,7 @@ async def main():
         }
     }
 
-    anomaly_detection = AnomalyDetectionModule(config, llm_config)
+    anomaly_detection = AnomalyDetectionModule(config, llm_config, rag)
     anomalies = await anomaly_detection.detect(logs, understanding)
 
     print(json.dumps(anomalies, indent=2))
