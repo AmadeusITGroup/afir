@@ -15,6 +15,7 @@ from plugin_system import PluginManager
 from feedback_loop import FeedbackLoop
 from export_results import ResultExporter
 from notifications import NotificationSystem, send_notification
+from utils.llm_utils import RAG
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -27,39 +28,39 @@ def load_config(config_file):
 async def process_incident(incident, modules):
     try:
         send_notification(incident['id'], 'processing', 'Started processing incident')
-
+        
         understanding = await modules['understanding'].process(incident)
         logger.info(f"Incident {incident['id']} understanding complete")
-
+        
         api_calls = await modules['api_call'].generate(understanding)
         logger.info(f"Generated {len(api_calls)} API calls for incident {incident['id']}")
-
+        
         logs = await modules['log_retrieval'].retrieve(api_calls)
         logger.info(f"Retrieved logs from {len(logs)} sources for incident {incident['id']}")
-
+        
         anomalies = await modules['anomaly_detection'].detect(logs, understanding)
         logger.info(f"Detected {len(anomalies)} anomalies for incident {incident['id']}")
-
+        
         # Use plugins for additional processing
         for plugin in modules['plugins'].get_active_plugins():
             plugin_result = await modules['plugins'].execute_plugin(plugin, incident, understanding, logs, anomalies)
             logger.info(f"Executed plugin {plugin} for incident {incident['id']}")
-
+        
         report = await modules['report_generation'].generate(incident, understanding, logs, anomalies)
         logger.info(f"Generated investigation report for incident {incident['id']}")
-
+        
         await modules['output'].send(report, incident['id'])
         logger.info(f"Sent investigation report for incident {incident['id']}")
-
+        
         # Export results
         exporter = ResultExporter({'incident': incident, 'understanding': understanding, 'anomalies': anomalies})
         exporter.export_json(f"exports/incident_{incident['id']}.json")
         exporter.export_csv(f"exports/incident_{incident['id']}.csv")
         logger.info(f"Exported results for incident {incident['id']}")
-
+        
         # Collect feedback (this would typically be done after human review)
         await modules['feedback'].collect_feedback(incident['id'], {'anomalies': anomalies}, {'accuracy': 0.9})
-
+        
         send_notification(incident['id'], 'completed', 'Incident processing completed')
         return report
     except Exception as e:
@@ -71,20 +72,28 @@ async def main():
     main_config = load_config('config/main_config.yaml')
     llm_config = load_config('config/llm_config.yaml')
 
+    # Initialize RAG
+    rag = RAG(
+        knowledge_base_path=main_config['knowledge_base']['path'],
+        sentence_transformer_model=main_config['rag']['sentence_transformer_model'],
+        max_retrieved_documents=main_config['rag']['max_retrieved_documents'],
+        similarity_threshold=main_config['rag']['similarity_threshold']
+    )
+
     # Initialize notification system
     notification_system = NotificationSystem()
     await notification_system.start_server()
 
     modules = {
         'input': IncidentInputInterface(main_config['incident_input']),
-        'understanding': IncidentUnderstandingModule(llm_config),
-        'api_call': ApiCallGenerator(llm_config),
+        'understanding': IncidentUnderstandingModule(llm_config, rag),
+        'api_call': ApiCallGenerator(llm_config, rag),
         'log_retrieval': LogRetrievalEngine(main_config['log_sources']),
-        'anomaly_detection': AnomalyDetectionModule(main_config['anomaly_detection'], llm_config),
-        'report_generation': ReportGenerationModule(main_config['report_generation'], llm_config),
+        'anomaly_detection': AnomalyDetectionModule(main_config['anomaly_detection'], llm_config, rag),
+        'report_generation': ReportGenerationModule(main_config['report_generation'], llm_config, rag),
         'output': OutputInterface(main_config['output_interface']),
         'plugins': PluginManager(main_config['plugin_dir']),
-        'feedback': FeedbackLoop(llm_config)
+        'feedback': FeedbackLoop(llm_config, rag)
     }
 
     # Start the incident input server
@@ -106,9 +115,9 @@ async def main():
                 asyncio.create_task(process_incident(incident, modules))
                 for incident in incidents
             ]
-
+            
             results = await asyncio.gather(*tasks, return_exceptions=True)
-
+            
             for incident, result in zip(incidents, results):
                 if isinstance(result, Exception):
                     logger.error(f"Failed to process incident {incident['id']}: {str(result)}")

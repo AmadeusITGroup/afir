@@ -1,15 +1,15 @@
 import asyncio
-from src.utils.llm_utils import get_llm_response
-from src.utils.error_handling import async_retry_with_backoff
+from utils.llm_utils import get_llm_response
+from utils.error_handling import async_retry_with_backoff
 import logging
 import json
 
 logger = logging.getLogger(__name__)
 
-
 class IncidentUnderstandingModule:
-    def __init__(self, llm_config):
+    def __init__(self, llm_config, rag):
         self.llm_config = llm_config
+        self.rag = rag
         self.prompt_template = """
         Analyze the following incident and provide a detailed understanding:
         
@@ -26,6 +26,8 @@ class IncidentUnderstandingModule:
         6. Recommended immediate actions
         7. Potential stakeholders to be notified
         
+        Use the provided context to enhance your analysis. Consider any similar past incidents or known fraud patterns.
+        
         Format your response as a JSON object with clearly labeled sections.
         """
 
@@ -37,10 +39,10 @@ class IncidentUnderstandingModule:
                 timestamp=incident['timestamp'],
                 description=incident['description']
             )
-
-            understanding = await get_llm_response(prompt, self.llm_config)
+            
+            understanding = await get_llm_response(prompt, self.llm_config, self.rag)
             structured_understanding = self.structure_understanding(understanding)
-
+            
             logger.info(f"Processed understanding for incident {incident['id']}")
             return {
                 "incident_id": incident['id'],

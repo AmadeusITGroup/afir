@@ -11,6 +11,36 @@ The objective is to develop reusable, modular components to strengthen reliabili
 
 This project implements an advanced automated system for fraud investigation and reporting using Large Language Models (LLMs) and machine learning techniques. The system is designed to process incidents, analyze logs, detect anomalies, generate comprehensive reports, and continuously improve its performance.
 
+## System Architecture
+
+Below is a high-level overview of the Fraud Investigation System architecture:
+
+```
++-------------------+      +------------------------+
+|   Incident Input  |----->|  Incident Understanding|
++-------------------+      +------------------------+
+                                       |
+                                       v
++-------------------+      +------------------------+
+|    Knowledge Base |<---->|     RAG Processing     |
++-------------------+      +------------------------+
+                                       |
+                                       v
++-------------------+      +------------------------+
+|   Log Retrieval   |<---->|   Anomaly Detection    |
++-------------------+      +------------------------+
+                                       |
+                                       v
++-------------------+      +------------------------+
+| Report Generation |<-----|    Output Interface    |
++-------------------+      +------------------------+
+        |
+        v
++-------------------+
+|  Feedback Loop    |
++-------------------+
+```
+
 ## Features
 
 - Automated incident understanding using LLMs

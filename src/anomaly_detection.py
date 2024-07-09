@@ -1,16 +1,16 @@
 import asyncio
 import json
-from src.utils.llm_utils import get_llm_response
-from src.utils.error_handling import async_retry_with_backoff
+from utils.llm_utils import get_llm_response
+from utils.error_handling import async_retry_with_backoff
 import logging
 
 logger = logging.getLogger(__name__)
 
-
 class AnomalyDetectionModule:
-    def __init__(self, config, llm_config):
+    def __init__(self, config, llm_config, rag):
         self.config = config
         self.llm_config = llm_config
+        self.rag = rag
         self.prompt_template = """
         Analyze the following log data and incident understanding to detect any anomalies, suspicious patterns, or indicators of fraud:
 
@@ -36,6 +36,8 @@ class AnomalyDetectionModule:
         - Unusual network traffic or communication patterns
         - Inconsistencies in user profiles or account activities
 
+        Use the provided context to enhance your analysis. Consider any similar past incidents, known fraud patterns, or relevant information from the knowledge base.
+
         Format your response as a JSON array of anomaly objects.
         """
 
@@ -43,18 +45,18 @@ class AnomalyDetectionModule:
     async def detect(self, logs, understanding):
         try:
             combined_logs = self.preprocess_logs(logs)
-
+            
             prompt = self.prompt_template.format(
                 incident_understanding=json.dumps(understanding['analysis'], indent=2),
                 log_data=combined_logs
             )
-
-            llm_response = await get_llm_response(prompt, self.llm_config)
-
+            
+            llm_response = await get_llm_response(prompt, self.llm_config, self.rag)
+            
             anomalies = self.parse_llm_response(llm_response)
-
+            
             filtered_anomalies = self.filter_anomalies(anomalies)
-
+            
             logger.info(f"Detected {len(filtered_anomalies)} anomalies for incident {understanding['incident_id']}")
             return filtered_anomalies
         except Exception as e:
@@ -66,12 +68,12 @@ class AnomalyDetectionModule:
         for source, entries in logs.items():
             for entry in entries:
                 combined_logs.append(f"[{source}] {json.dumps(entry)}")
-
+        
         max_chars = 15000  # Adjust based on LLM token limit
         combined_logs_str = "\n".join(combined_logs)
         if len(combined_logs_str) > max_chars:
             combined_logs_str = combined_logs_str[:max_chars] + "... [truncated]"
-
+        
         return combined_logs_str
 
     def parse_llm_response(self, llm_response):
@@ -88,6 +90,7 @@ class AnomalyDetectionModule:
         return [
             anomaly for anomaly in anomalies
             if anomaly.get('confidence_score', 0) >= self.config['threshold']
+        ]
         ]
 
 

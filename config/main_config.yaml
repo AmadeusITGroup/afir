@@ -52,6 +52,16 @@ output_interface:
   cc:
     - "management@example.com"
   attachment_size_limit_mb: 25
+  
+  
+knowledge_base:
+  path: "/path/to/your/knowledge_base"
+  update_frequency: "daily"
+
+rag:
+  sentence_transformer_model: "all-MiniLM-L6-v2"
+  max_retrieved_documents: 5
+  similarity_threshold: 0.7  
 
 error_handling:
   max_retries: 3
