@@ -7,7 +7,7 @@
 This has been developed in the scope of RESCUE (RESilient Cloud for EUropE) project. 
 The objective is to develop reusable, modular components to strengthen reliability and recover capabilities for (critical) digital services. Pilot Cyber Resilient Digital Twins for Data Centers and Edges that use open cloud infrastructure and are capable of hosting mission-critical applications at large scale.
 
-# Automated Fraud Investigation and Reporting System
+# Automated Fraud Investigation and Reporting system
 
 This project implements an advanced automated system for fraud investigation and reporting using Large Language Models (LLMs) and machine learning techniques. The system is designed to process incidents, analyze logs, detect anomalies, generate comprehensive reports, and continuously improve its performance.
 
