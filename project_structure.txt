@@ -1,0 +1,53 @@
+fraud_investigation_system/
+├── src/
+│   ├── __init__.py
+│   ├── main.py
+│   ├── incident_input.py
+│   ├── incident_understanding.py
+│   ├── api_call_generator.py
+│   ├── log_retrieval.py
+│   ├── anomaly_detection.py
+│   ├── report_generation.py
+│   ├── output_interface.py
+│   ├── notifications.py
+│   ├── plugin_system.py
+│   ├── feedback_loop.py
+│   ├── export_results.py
+│   └── utils/
+│       ├── __init__.py
+│       ├── error_handling.py
+│       ├── performance.py
+│       └── llm_utils.py
+├── config/
+│   ├── main_config.yaml
+│   ├── llm_config.yaml
+│   └── plugin_config.yaml
+├── plugins/
+│   ├── __init__.py
+│   └── example_plugin.py
+├── logs/
+│   └── fraud_investigation.log
+├── exports/
+│   └── .gitkeep
+├── tests/
+│   ├── __init__.py
+│   ├── test_incident_input.py
+│   ├── test_incident_understanding.py
+│   ├── test_api_call_generator.py
+│   ├── test_log_retrieval.py
+│   ├── test_anomaly_detection.py
+│   ├── test_report_generation.py
+│   ├── test_output_interface.py
+│   ├── test_notifications.py
+│   ├── test_plugin_system.py
+│   ├── test_feedback_loop.py
+│   └── test_export_results.py
+├── docs/
+│   ├── setup.md
+│   ├── configuration.md
+│   ├── api_documentation.md
+│   └── user_guide.md
+├── requirements.txt
+├── README.md
+└── .gitignore
+

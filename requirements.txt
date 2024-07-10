@@ -1,0 +1,84 @@
+# Core dependencies
+Flask==2.3.2
+PyYAML==6.0.1
+aiohttp==3.8.5
+asyncio==3.4.3
+pydantic==2.1.1
+
+# Database and logging
+elasticsearch==8.9.0
+splunk-sdk==1.7.3
+redis==4.6.0
+
+# LLM and NLP
+openai==0.27.8
+anthropic==0.3.6
+transformers==4.31.0
+torch==2.0.1
+sentence-transformers==2.2.2
+
+# RAG and vector search
+faiss-cpu==1.7.4  # Use faiss-gpu if you have CUDA support
+
+# Async email
+aiosmtplib==2.0.1
+
+# Data processing and visualization
+pandas==2.0.3
+matplotlib==3.7.2
+plotly==5.15.0
+
+# PDF generation
+reportlab==4.0.4
+
+# Error handling and retrying
+tenacity==8.2.2
+
+# Testing
+pytest==7.4.0
+pytest-asyncio==0.21.1
+pytest-cov==4.1.0
+
+# Code quality and formatting
+black==23.7.0
+flake8==6.1.0
+isort==5.12.0
+
+# Async file operations
+aiofiles==23.1.0
+
+# Environment variable management
+python-dotenv==1.0.0
+
+# Web framework for API
+fastapi==0.100.1
+uvicorn==0.23.1
+
+# Background tasks
+celery==5.3.1
+
+# Markdown support (for documentation in plugins)
+markdown==3.4.4
+
+# Security
+bcrypt==4.0.1
+cryptography==41.0.3
+
+# Caching
+cachetools==5.3.1
+
+# Parsing
+beautifulsoup4==4.12.2
+
+# Date and time handling
+python-dateutil==2.8.2
+
+# Progress bars (for long-running tasks)
+tqdm==4.65.0
+
+# Networking
+requests==2.31.0
+
+# Development tools
+ipython==8.14.0
+jupyter==1.0.0
