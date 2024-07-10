@@ -51,7 +51,7 @@ aiofiles==23.1.0
 python-dotenv==1.0.0
 
 # Web framework for API
-fastapi==0.100.1
+fastapi==0.109.1
 uvicorn==0.23.1
 
 # Background tasks
