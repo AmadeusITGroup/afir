@@ -173,14 +173,11 @@ async def main():
     }
 
     llm_config = {
-        'provider': 'openai',
-        'models': {
-            'default': {
-                'name': 'gpt-4',
-                'api_key': 'your_api_key_here',
-                'max_tokens': 2000,
-                'temperature': 0.7
-            }
+        'provider': 'huggingface',
+        'model': {
+            'name': 'gpt-2',
+            'max_tokens': 2000,
+            'temperature': 0.7
         },
         'use_fine_tuned': False
     }

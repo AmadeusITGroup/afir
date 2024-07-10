@@ -85,11 +85,11 @@ async def get_anthropic_response(prompt, config):
 
 
 async def get_huggingface_response(prompt, config):
-    generator = pipeline('text-generation', model=config['alternative_providers']['huggingface']['model'])
+    generator = pipeline('text-generation', model=config['model']['name'])
     response = await asyncio.to_thread(
         generator,
         prompt,
-        max_length=config['alternative_providers']['huggingface']['max_tokens'],
-        temperature=config['alternative_providers']['huggingface']['temperature']
+        max_length=config['model']['max_tokens'],
+        temperature=config['model']['temperature']
     )
     return response[0]['generated_text']
