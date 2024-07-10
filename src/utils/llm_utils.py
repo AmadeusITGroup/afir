@@ -41,7 +41,7 @@ class RAG:
 
 
 async def get_llm_response(prompt, config, rag=None):
-    provider = config['llm']['provider']
+    provider = config['provider']
 
     if rag:
         retrieved_context = rag.retrieve(prompt)
@@ -61,14 +61,14 @@ async def get_llm_response(prompt, config, rag=None):
 
 
 async def get_openai_response(prompt, config):
-    openai.api_key = os.getenv(config['llm']['models']['default']['api_key'])
-    model = config['llm']['models']['fine_tuned' if config['llm']['use_fine_tuned'] else 'default']['name']
+    openai.api_key = os.getenv(config['models']['default']['api_key'])
+    model = config['models']['fine_tuned' if config['use_fine_tuned'] else 'default']['name']
 
     response = await openai.ChatCompletion.acreate(
         model=model,
         messages=[{"role": "user", "content": prompt}],
-        max_tokens=config['llm']['models']['default']['max_tokens'],
-        temperature=config['llm']['models']['default']['temperature']
+        max_tokens=config['models']['default']['max_tokens'],
+        temperature=config['models']['default']['temperature']
     )
     return response.choices[0].message.content.strip()
 

@@ -181,7 +181,8 @@ async def main():
                 'max_tokens': 2000,
                 'temperature': 0.7
             }
-        }
+        },
+        'use_fine_tuned': False
     }
 
     incident = {
