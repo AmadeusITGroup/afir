@@ -62,7 +62,7 @@ markdown==3.4.4
 
 # Security
 bcrypt==4.0.1
-cryptography==41.0.3
+cryptography==42.0.4
 
 # Caching
 cachetools==5.3.1
