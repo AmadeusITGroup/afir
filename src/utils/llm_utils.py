@@ -40,11 +40,15 @@ class RAG:
         return retrieved
 
 
-async def get_llm_response(prompt, config, rag):
+async def get_llm_response(prompt, config, rag=None):
     provider = config['llm']['provider']
-    retrieved_context = rag.retrieve(prompt)
-    context_str = "\n".join([f"- {item['content']}" for item in retrieved_context])
-    augmented_prompt = f"Context from knowledge base:\n{context_str}\n\nPrompt: {prompt}"
+
+    if rag:
+        retrieved_context = rag.retrieve(prompt)
+        context_str = "\n".join([f"- {item['content']}" for item in retrieved_context])
+        augmented_prompt = f"Context from knowledge base:\n{context_str}\n\nPrompt: {prompt}"
+    else:
+        augmented_prompt = f"Prompt: {prompt}"
 
     if provider == 'openai':
         return await get_openai_response(augmented_prompt, config)
