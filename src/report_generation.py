@@ -183,7 +183,6 @@ async def main():
         'models': {
             'default': {
                 'name': "gpt-3.5-turbo-0613",
-                'api_key': "kQqfUAK1aXZ2SmRgk64is0",
                 'max_tokens': 2000,
                 'temperature': 0.7
             }
