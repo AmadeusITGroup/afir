@@ -48,7 +48,17 @@ class ReportGenerationModule:
 
         Format the output as a structured JSON object with sections and subsections.
         Include relevant statistics, key metrics, and potential business impact where applicable.
+        Make sure to use escaping with all the symbols that may be a problem if I am using APIs.
         """
+
+    def append_pdf_content(self, story, content, styles):
+        if isinstance(content, str):
+            story.append(Paragraph(content, styles['Justify']))
+        elif isinstance(content, dict):
+            for subsection, subcontent in content.items():
+                story.append(Paragraph(subsection, styles['Heading2']))
+                self.append_pdf_content(story, subcontent, styles)
+        return story
 
     @retry_with_backoff(max_attempts=3, backoff_in_seconds=1)
     async def generate(self, incident, understanding, logs, anomalies):
@@ -94,12 +104,7 @@ class ReportGenerationModule:
             story.append(Paragraph(section, styles['Heading1']))
             story.append(Spacer(1, 6))
 
-            if isinstance(content, str):
-                story.append(Paragraph(content, styles['Justify']))
-            elif isinstance(content, dict):
-                for subsection, subcontent in content.items():
-                    story.append(Paragraph(subsection, styles['Heading2']))
-                    story.append(Paragraph(subcontent, styles['Justify']))
+            story = self.append_pdf_content(story, content, styles)
 
             story.append(Spacer(1, 12))
 
@@ -168,18 +173,21 @@ class ReportGenerationModule:
 async def main():
     config = {
         'output_format': 'pdf',
-        'logo_path': '/path/to/company_logo.png',
+        'logo_path': '../assets/company_logo.jfif',
         'include_visualizations': True
     }
 
     llm_config = {
-        'provider': 'huggingface',
-        'model': {
-            'name': 'gpt-2',
-            'max_tokens': 2000,
-            'temperature': 0.7
-        },
-        'use_fine_tuned': False
+        'provider': 'generic',
+        "use_fine_tuned": False,
+        'models': {
+            'default': {
+                'name': "gpt-3.5-turbo-0613",
+                'api_key': "kQqfUAK1aXZ2SmRgk64is0",
+                'max_tokens': 2000,
+                'temperature': 0.7
+            }
+        }
     }
 
     incident = {
@@ -211,9 +219,14 @@ async def main():
     report_generation = ReportGenerationModule(config, llm_config)
     report = await report_generation.generate(incident, understanding, {}, anomalies)
 
-    with open('fraud_report.pdf', 'wb') as f:
-        f.write(report)
-    print("Report generated and saved as fraud_report.pdf")
+    if config['output_format'] == 'pdf':
+        with open('fraud_report.pdf', 'wb') as f:
+            f.write(report)
+        print("Report generated and saved")
+    else:
+        with open('fraud_report.txt', 'w') as f:
+            f.write(report)
+        print("Report generated and saved")
 
 
 if __name__ == "__main__":

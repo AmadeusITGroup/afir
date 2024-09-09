@@ -7,6 +7,8 @@ import asyncio
 import logging
 from sentence_transformers import SentenceTransformer
 import faiss
+import requests
+import json
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +58,8 @@ async def get_llm_response(prompt, config, rag=None):
         return await get_anthropic_response(augmented_prompt, config)
     elif provider == 'huggingface':
         return await get_huggingface_response(augmented_prompt, config)
+    elif provider == "generic":
+        return await get_generic_post_response(augmented_prompt, config)
     else:
         raise ValueError(f"Unsupported LLM provider: {provider}")
 
@@ -93,3 +97,35 @@ async def get_huggingface_response(prompt, config):
         temperature=config['model']['temperature']
     )
     return response[0]['generated_text']
+
+
+async def get_generic_post_response(prompt, config):
+
+    # Define the URL and headers
+    url = "YOUR_URL"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": "YOUR_TOKEN"
+    }
+
+    # Define the payload
+    payload = {
+        "messages": [
+            {"role": "user", "content": prompt}
+        ],
+        "max_tokens": 2000,
+        "temperature": 0.2
+    }
+
+    # Make the POST request
+    response = requests.post(url, headers=headers, data=json.dumps(payload))
+
+    # Check if the request was successful
+    if response.status_code == 200:
+        response_data = response.json()
+        choices = response_data.get('choices', 'Field not found')
+        content = choices[0]["message"]["content"]
+        print(content)
+        return content
+    else:
+        print(f"Request failed with status code {response.status_code}")
