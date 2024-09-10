@@ -6,6 +6,7 @@ import json
 
 logger = logging.getLogger(__name__)
 
+
 class ApiCallGenerator:
     def __init__(self, llm_config):
         self.llm_config = llm_config
@@ -61,6 +62,7 @@ class ApiCallGenerator:
                 api_call[field] = "Not provided"
         return api_call
 
+
 # Example usage
 async def main():
     llm_config = {
@@ -88,6 +90,7 @@ async def main():
     api_call_generator = ApiCallGenerator(llm_config)
     api_calls = await api_call_generator.generate(understanding)
     print(json.dumps(api_calls, indent=2))
+
 
 if __name__ == "__main__":
     asyncio.run(main())

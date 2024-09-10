@@ -90,10 +90,10 @@ async def main():
     modules = {
         'input': IncidentInputInterface(main_config['incident_input']),
         'understanding': IncidentUnderstandingModule(llm_config, rag),
-        'api_call': ApiCallGenerator(llm_config, rag),
+        'api_call': ApiCallGenerator(llm_config),
         'log_retrieval': LogRetrievalEngine(main_config['log_sources']),
         'anomaly_detection': AnomalyDetectionModule(main_config['anomaly_detection'], llm_config, rag),
-        'report_generation': ReportGenerationModule(main_config['report_generation'], llm_config, rag),
+        'report_generation': ReportGenerationModule(main_config['report_generation'], llm_config),
         'output': OutputInterface(main_config['output_interface']),
         'plugins': PluginManager(main_config['plugin_dir']),
         'feedback': FeedbackLoop(llm_config, rag)
