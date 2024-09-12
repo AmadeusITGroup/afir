@@ -28,6 +28,8 @@ class ApiCallGenerator:
         - User activity logs
         
         Format the output as a list of JSON objects, each representing an API call.
+        Make sure to use escaping with all the symbols that may be a problem if I am using APIs.
+        Do not write anything apart from the JSON objects.
         """
 
     @async_retry_with_backoff(max_attempts=3, backoff_in_seconds=1)
@@ -66,11 +68,11 @@ class ApiCallGenerator:
 # Example usage
 async def main():
     llm_config = {
-        'provider': 'openai',
+        'provider': 'generic',
+        "use_fine_tuned": False,
         'models': {
             'default': {
-                'name': 'gpt-4',
-                'api_key': 'your_api_key_here',
+                'name': "gpt-3.5-turbo-0613",
                 'max_tokens': 2000,
                 'temperature': 0.7
             }
