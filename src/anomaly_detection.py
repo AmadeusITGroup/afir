@@ -101,11 +101,11 @@ async def main():
     }
 
     llm_config = {
-        'provider': 'openai',
+        'provider': 'generic',
+        "use_fine_tuned": False,
         'models': {
             'default': {
-                'name': 'gpt-4',
-                'api_key': 'your_api_key_here',
+                'name': "gpt-3.5-turbo-0613",
                 'max_tokens': 2000,
                 'temperature': 0.7
             }
