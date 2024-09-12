@@ -8,6 +8,7 @@ import json
 
 logger = logging.getLogger(__name__)
 
+
 class IncidentInputInterface:
     def __init__(self, config):
         self.config = config
@@ -53,6 +54,7 @@ class IncidentInputInterface:
             pass
         return incidents
 
+
 # Example usage
 async def main():
     config = {
@@ -86,6 +88,7 @@ async def main():
         if not incidents:
             break
         print(f"Processing {len(incidents)} incidents")
+
 
 if __name__ == "__main__":
     asyncio.run(main())

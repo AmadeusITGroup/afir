@@ -85,7 +85,7 @@ async def main():
 
     # Initialize notification system
     notification_system = NotificationSystem()
-    await notification_system.start_server()
+    await notification_system.start_notification_server()
 
     modules = {
         'input': IncidentInputInterface(main_config['incident_input']),
