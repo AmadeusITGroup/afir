@@ -1,5 +1,7 @@
 import asyncio
 import json
+import os.path
+
 from src.utils.llm_utils import get_llm_response
 from src.utils.error_handling import retry_with_backoff
 import logging
@@ -49,6 +51,7 @@ class ReportGenerationModule:
         Format the output as a structured JSON object with sections and subsections.
         Include relevant statistics, key metrics, and potential business impact where applicable.
         Make sure to use escaping with all the symbols that may be a problem if I am using APIs.
+        Don't output anything else except the JSON.
         """
 
     def append_pdf_content(self, story, content, styles):
@@ -73,9 +76,13 @@ class ReportGenerationModule:
             structured_report = json.loads(report_content)
 
             if self.config['output_format'] == 'pdf':
-                return self.generate_pdf_report(structured_report, incident, anomalies)
+                report = self.generate_pdf_report(structured_report, incident, anomalies)
+                self.export_report(report, 'pdf', self.config['output_path'])
+                return report
             else:
-                return json.dumps(structured_report, indent=2)
+                report = json.dumps(structured_report, indent=2)
+                self.export_report(report, 'txt', self.config['output_path'])
+                return report
         except Exception as e:
             logger.error(f"Error generating report for incident {incident['id']}: {str(e)}")
             raise
@@ -112,12 +119,12 @@ class ReportGenerationModule:
         story.append(Paragraph("Detailed Anomalies", styles['Heading1']))
         story.append(Spacer(1, 6))
 
-        anomalies_data = [["Description", "Confidence", "Implications", "Recommended Actions"]]
+        anomalies_data = [["Description", "Confidence", "Potential Implications", "Recommended Actions"]]
         for anomaly in anomalies:
             anomalies_data.append([
                 anomaly['description'],
                 f"{anomaly['confidence_score']:.2f}",
-                anomaly['implications'],
+                anomaly['potential_implications'],
                 anomaly['recommended_actions']
             ])
 
@@ -168,6 +175,15 @@ class ReportGenerationModule:
 
         return Image(img_buffer, width=300, height=200)
 
+    def export_report(self, report, file_type, path):
+        if file_type == 'pdf':
+            with open(os.path.join(path, "fraud_report.pdf"), 'wb') as f:
+                f.write(report)
+            print("Report generated and saved")
+        else:
+            with open(os.path.join(path, "fraud_report.txt"), 'w') as f:
+                f.write(report)
+
 
 # Example usage
 async def main():
@@ -217,15 +233,6 @@ async def main():
 
     report_generation = ReportGenerationModule(config, llm_config)
     report = await report_generation.generate(incident, understanding, {}, anomalies)
-
-    if config['output_format'] == 'pdf':
-        with open('fraud_report.pdf', 'wb') as f:
-            f.write(report)
-        print("Report generated and saved")
-    else:
-        with open('fraud_report.txt', 'w') as f:
-            f.write(report)
-        print("Report generated and saved")
 
 
 if __name__ == "__main__":

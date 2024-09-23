@@ -40,6 +40,7 @@ class AnomalyDetectionModule:
         Use the provided context to enhance your analysis. Consider any similar past incidents, known fraud patterns, or relevant information from the knowledge base.
 
         Format your response as a JSON array of anomaly objects.
+        Don't output anything else except the JSON.
         """
 
     @async_retry_with_backoff(max_attempts=3, backoff_in_seconds=1)

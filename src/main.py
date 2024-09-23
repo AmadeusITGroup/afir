@@ -51,13 +51,13 @@ async def process_incident(incident, modules):
         report = await modules['report_generation'].generate(incident, understanding, logs, anomalies)
         logger.info(f"Generated investigation report for incident {incident['id']}")
 
-        await modules['output'].send(report, incident['id'])
-        logger.info(f"Sent investigation report for incident {incident['id']}")
+        #await modules['output'].send(report, incident['id'])
+        #logger.info(f"Sent investigation report for incident {incident['id']}")
 
         # Export results
         exporter = ResultExporter({'incident': incident, 'understanding': understanding, 'anomalies': anomalies})
-        exporter.export_json(f"exports/incident_{incident['id']}.json")
-        exporter.export_csv(f"exports/incident_{incident['id']}.csv")
+        exporter.export_json(f"../exports/incident_{incident['id']}.json")
+        exporter.export_csv(f"../exports/incident_{incident['id']}.csv")
         logger.info(f"Exported results for incident {incident['id']}")
 
         # Collect feedback (this would typically be done after human review)
@@ -72,16 +72,20 @@ async def process_incident(incident, modules):
 
 
 async def main():
-    main_config = load_config('config/main_config.yaml')
-    llm_config = load_config('config/llm_config.yaml')
+    main_config = load_config('../config/main_config.yaml')
+    llm_config = load_config('../config/llm_config.yaml')
 
     # Initialize RAG
-    rag = RAG(
-        knowledge_base_path=main_config['knowledge_base']['path'],
-        sentence_transformer_model=main_config['rag']['sentence_transformer_model'],
-        max_retrieved_documents=main_config['rag']['max_retrieved_documents'],
-        similarity_threshold=main_config['rag']['similarity_threshold']
-    )
+    use_rag = main_config['rag']['use_rag']
+    if use_rag:
+        rag = RAG(
+            knowledge_base_path=main_config['knowledge_base']['path'],
+            sentence_transformer_model=main_config['rag']['sentence_transformer_model'],
+            max_retrieved_documents=main_config['rag']['max_retrieved_documents'],
+            similarity_threshold=main_config['rag']['similarity_threshold']
+        )
+    else:
+        rag = None
 
     # Initialize notification system
     notification_system = NotificationSystem()
@@ -96,7 +100,7 @@ async def main():
         'report_generation': ReportGenerationModule(main_config['report_generation'], llm_config),
         'output': OutputInterface(main_config['output_interface']),
         'plugins': PluginManager(main_config['plugin_dir']),
-        'feedback': FeedbackLoop(llm_config, rag)
+        'feedback': FeedbackLoop(llm_config)  # RAG feedback loop to be implemented
     }
 
     # Start the incident input server

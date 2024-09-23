@@ -31,6 +31,7 @@ class IncidentUnderstandingModule:
         
         Format your response as a JSON object with clearly labeled sections.
         Make sure to use escaping with all the symbols that may be a problem if I am using APIs.
+        Don't output anything else except the JSON.
         """
 
     @async_retry_with_backoff(max_attempts=3, backoff_in_seconds=1)

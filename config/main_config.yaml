@@ -34,10 +34,11 @@ anomaly_detection:
 
 report_generation:
   template: "standard_report"
-  output_format: "pdf"
-  logo_path: "/path/to/company_logo.png"
+  output_path: '../exports'
+  output_format: 'pdf'
+  logo_path: '../assets/company_logo.jfif'
+  include_visualizations: True
   max_report_size_mb: 10
-  include_visualizations: true
 
 output_interface:
   type: "email"
@@ -52,13 +53,15 @@ output_interface:
   cc:
     - "management@example.com"
   attachment_size_limit_mb: 25
-  
-  
+
+plugin_dir: "../plugins"
+
 knowledge_base:
   path: "/path/to/your/knowledge_base"
   update_frequency: "daily"
 
 rag:
+  use_rag: false
   sentence_transformer_model: "all-MiniLM-L6-v2"
   max_retrieved_documents: 5
   similarity_threshold: 0.7  
