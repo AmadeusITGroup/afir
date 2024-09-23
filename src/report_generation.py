@@ -56,7 +56,7 @@ class ReportGenerationModule:
 
     def append_pdf_content(self, story, content, styles):
         if isinstance(content, str):
-            story.append(Paragraph(content, styles['Justify']))
+            story.append(Paragraph(content, styles['Normal']))
         elif isinstance(content, dict):
             for subsection, subcontent in content.items():
                 story.append(Paragraph(subsection, styles['Heading2']))
