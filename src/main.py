@@ -33,6 +33,7 @@ async def process_incident(incident, modules):
 
         understanding = await modules['understanding'].process(incident)
         logger.info(f"Incident {incident['id']} understanding complete")
+        print(understanding)
 
         api_calls = await modules['api_call'].generate(understanding)
         logger.info(f"Generated {len(api_calls)} API calls for incident {incident['id']}")
@@ -42,6 +43,7 @@ async def process_incident(incident, modules):
 
         anomalies = await modules['anomaly_detection'].detect(logs, understanding)
         logger.info(f"Detected {len(anomalies)} anomalies for incident {incident['id']}")
+        print(anomalies)
 
         # Use plugins for additional processing
         for plugin in modules['plugins'].get_active_plugins():
@@ -61,7 +63,7 @@ async def process_incident(incident, modules):
         logger.info(f"Exported results for incident {incident['id']}")
 
         # Collect feedback (this would typically be done after human review)
-        await modules['feedback'].collect_feedback(incident['id'], {'anomalies': anomalies}, {'accuracy': 0.9})
+        # await modules['feedback'].collect_feedback(incident['id'], {'anomalies': anomalies}, {'accuracy': 0.9})
 
         send_notification(incident['id'], 'completed', 'Incident processing completed')
         return report

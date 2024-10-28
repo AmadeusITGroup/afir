@@ -48,19 +48,28 @@ class ReportGenerationModule:
         - Confidence score
         - Recommended investigation or mitigation steps
 
-        Format the output as a structured JSON object with sections and subsections.
+        Format the output as a structured JSON object called "report" with sections and subsections. Each section or 
+        subsection will have a "section_title" and "content" field. 
+        This is an example: 
         Include relevant statistics, key metrics, and potential business impact where applicable.
-        Make sure to use escaping with all the symbols that may be a problem if I am using APIs.
-        Don't output anything else except the JSON.
-        """
+        Ensure that the generated JSON is well-formed, properly escaped, and follows the specified 
+        structure without any additional text output. Validate the JSON structure before returning the result."""
 
     def append_pdf_content(self, story, content, styles):
         if isinstance(content, str):
             story.append(Paragraph(content, styles['Normal']))
         elif isinstance(content, dict):
             for subsection, subcontent in content.items():
-                story.append(Paragraph(subsection, styles['Heading2']))
-                self.append_pdf_content(story, subcontent, styles)
+                if subsection == "section_title":
+                    story.append(Paragraph(subcontent, styles['Heading2']))
+                elif subsection == "sections" or subsection == "content":
+                    self.append_pdf_content(story, subcontent, styles)
+                else:
+                    story.append(Paragraph(subsection, styles['Heading2']))
+                    self.append_pdf_content(story, subcontent, styles)
+        elif isinstance(content, list):
+            for item in content:
+                self.append_pdf_content(story, item, styles)
         return story
 
     @retry_with_backoff(max_attempts=3, backoff_in_seconds=1)
@@ -73,10 +82,11 @@ class ReportGenerationModule:
             )
 
             report_content = await get_llm_response(prompt, self.llm_config)
+            print(report_content)
             structured_report = json.loads(report_content)
 
             if self.config['output_format'] == 'pdf':
-                report = self.generate_pdf_report(structured_report, incident, anomalies)
+                report = self.generate_pdf_report(structured_report["report"], incident, anomalies)
                 self.export_report(report, 'pdf', self.config['output_path'])
                 return report
             else:
@@ -188,6 +198,7 @@ class ReportGenerationModule:
 # Example usage
 async def main():
     config = {
+        'output_path': '../exports',
         'output_format': 'pdf',
         'logo_path': '../assets/company_logo.jfif',
         'include_visualizations': True
@@ -207,26 +218,27 @@ async def main():
 
     incident = {
         'id': 'INC-12345',
-        'timestamp': '2023-07-06T12:00:00Z',
+        'timestamp': '2023',
         'description': 'Unusual login activity detected from multiple IP addresses.'
     }
 
     understanding = {
         'incident_id': 'INC-12345',
-        'analysis': 'Potential unauthorized access detected with multiple failed login attempts followed by a successful login from an unrecognized IP address.'
+        'analysis': 'Potential unauthorized access detected with multiple failed login attempts followed by a '
+                    'successful login from an unrecognized IP address.'
     }
 
     anomalies = [
         {
             'description': 'Multiple failed login attempts from various IP addresses',
             'confidence_score': 0.95,
-            'implications': 'Possible brute force attack attempt',
+            'potential_implications': 'Possible brute force attack attempt',
             'recommended_actions': 'Implement IP-based rate limiting and notify the account owner'
         },
         {
             'description': 'Successful login from an unrecognized IP address after failed attempts',
             'confidence_score': 0.85,
-            'implications': 'Potential account compromise',
+            'potential_implications': 'Potential account compromise',
             'recommended_actions': 'Force password reset and enable two-factor authentication'
         }
     ]
