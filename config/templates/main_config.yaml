@@ -1,0 +1,87 @@
+incident_input:
+  type: "api"
+  post_incident_endpoint: "/api/v1/incidents"
+  post_ir_endpoint: "/api/v1/ir"
+  win_url: [WIN@PROACH URL]
+  win_username: [WIN@PROACH USERNAME]
+  win_password: [WIN@PROACH PASSWORD]
+  port: 5000
+  max_incidents_per_batch: 100
+  rate_limit:
+    requests: 1000
+    per_seconds: 3600
+
+log_sources:
+  use_ssh_tunnel: true
+  tunnel:
+    url: [TUNNEL URL]
+    user: [TUNNEL USER]
+    password: [TUNNEL PASSWORD]
+    remote_bind_url: [REMOTE BIND URL]
+    remote_bind_port: [REMOTE BIND URL]
+    local_bind_url: [LOCAL BIND URL]
+    local_bind_port: [LOCAL BIND URL]
+  names_list:
+    - application_logs
+  sources:
+    - name: "application_logs"
+      type: "elasticsearch"
+      url: [ELASTICSEARCH URL]
+      username: [ELASTICSEARCH USERNAME]
+      password: [ELASTICSEARCH PASSWORD]
+      timeout: 30
+      retry_attempts: 3
+      retry_delay: 5
+
+
+anomaly_detection:
+  use_llm: true
+  threshold: 0.8
+  max_anomalies: 50
+  time_window:
+    hours: 24
+
+report_generation:
+  template: "standard_report"
+  output_path: '../exports'
+  output_format: 'pdf'
+  logo_path: '../assets/company_logo.jfif'
+  max_report_size_mb: 10
+
+output_interface:
+  type: "email"
+  smtp_server: "smtp.gmail.com"
+  smtp_port: 587
+  smtp_username: "${SMTP_USERNAME}"
+  smtp_password: "${SMTP_PASSWORD}"
+  sender_email: "fraud_detection@example.com"
+  recipients:
+    - "security_team@example.com"
+    - "fraud_analysts@example.com"
+  cc:
+    - "management@example.com"
+  attachment_size_limit_mb: 25
+
+plugin_dir: "../plugins"
+
+knowledge_base:
+  path: "/path/to/your/knowledge_base"
+  update_frequency: "daily"
+
+rag:
+  use_rag: false
+  sentence_transformer_model: "all-MiniLM-L6-v2"
+  max_retrieved_documents: 5
+  similarity_threshold: 0.7  
+
+error_handling:
+  max_retries: 3
+  backoff_factor: 2
+  jitter: 0.1
+  log_errors: true
+  notify_on_critical: true
+
+performance:
+  use_multiprocessing: true
+  max_workers: 4
+  batch_size: 50

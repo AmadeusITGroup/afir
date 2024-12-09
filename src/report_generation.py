@@ -1,16 +1,18 @@
 import asyncio
+import io
 import json
+import logging
 import os.path
 
-from src.utils.llm_utils import get_llm_response
-from src.utils.error_handling import retry_with_backoff
-import logging
-from reportlab.lib.pagesizes import letter
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
-import matplotlib.pyplot as plt
-import io
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
+
+from src.utils.error_handling import retry_with_backoff
+from src.utils.llm_utils import get_llm_response
 
 logger = logging.getLogger(__name__)
 
@@ -41,26 +43,39 @@ class ReportGenerationModule:
         7. Conclusion
         8. Next Steps
 
-        For each anomaly, include:
-        - Description
-        - Supporting evidence
-        - Potential implications
-        - Confidence score
-        - Recommended investigation or mitigation steps
+        For each anomaly, provide a comprehensive and detailed analysis, making sure to be thorough and step-by-step 
+        in your explanations. Each subsection should be explained in full, with a clear, conversational tone. Here’s 
+        the format to follow for each anomaly: 
+        - Description: Provide a detailed overview of the anomaly. Be clear and specific about what the anomaly is and any relevant context that helps in understanding it.
+        - Reason of detection:  Explain in depth why this was detected as an anomaly. Guide the reader step-by-step through the reasoning, making sure to break down any criteria, patterns, or unusual behaviors that flagged this as significant.
+        - Supporting Evidence: List all pieces of evidence used to identify the anomaly, providing a brief description for each. Make sure to explain how the pieces of information combine or interact to reinforce the detection, using a step-by-step rationale.
+        - Potential implications: Outline the potential impacts of this anomaly if left unaddressed. Discuss any risks, consequences, or changes it could trigger, explaining each in full to provide a clear picture of its significance.
+        - Confidence score: Assign a confidence score to this detection. Explain the reasoning behind this score, covering all relevant factors that contribute to your level of certainty.
+        - Recommended investigation or mitigation steps: Lay out step-by-step actions that could be taken to investigate or mitigate this anomaly. Provide rationale for each recommended step, explaining how it could help further clarify or resolve the issue.
+        Make sure to approach each section in a way that thoroughly explains each piece of reasoning, building a clear and detailed narrative for every part of the analysis.
+     
+        
+        Keep in mind these definitions: 
+        - section: a dictionary with only two fields called "section_title" and "content".
+        - subsection: a dictionary with only two fields called "section_title" and "content". 
+        - content: can only be a string, a list of strings, or a list of subsections (i.e. list of dictionaries).
 
-        Format the output as a structured JSON object called "report" with sections and subsections. Each section or 
-        subsection will have a "section_title" and "content" field. 
-        This is an example: 
+        Format the output as an array of JSONs. The JSONs will be sections, referring to the above definitions. 
+        No other types of data or structure should be part of the JSON.
+        
         Include relevant statistics, key metrics, and potential business impact where applicable.
-        Ensure that the generated JSON is well-formed, properly escaped, and follows the specified 
-        structure without any additional text output. Validate the JSON structure before returning the result."""
+        
+        Prefer long and descriptive paragraphs over lists of strings.
+        
+        Ensure that the generated JSONs are well-formed, properly escaped, and follow the specified 
+        structure without any additional text output. Validate the JSONs structure before returning the result."""
 
     def append_pdf_content(self, story, content, styles):
-        if isinstance(content, str):
-            story.append(Paragraph(content, styles['Normal']))
+        if isinstance(content, str) or isinstance(content, int) or isinstance(content, float):
+            story.append(Paragraph(str(content), styles['Normal']))
         elif isinstance(content, dict):
             for subsection, subcontent in content.items():
-                if subsection == "section_title":
+                if subsection == "section_title" or subsection == "subsection_title":
                     story.append(Paragraph(subcontent, styles['Heading2']))
                 elif subsection == "sections" or subsection == "content":
                     self.append_pdf_content(story, subcontent, styles)
@@ -84,9 +99,10 @@ class ReportGenerationModule:
             report_content = await get_llm_response(prompt, self.llm_config)
             print(report_content)
             structured_report = json.loads(report_content)
+            logger.info(f"Correctly generated report content...")
 
             if self.config['output_format'] == 'pdf':
-                report = self.generate_pdf_report(structured_report["report"], incident, anomalies)
+                report = self.generate_pdf_report(structured_report, incident, anomalies)
                 self.export_report(report, 'pdf', self.config['output_path'])
                 return report
             else:
@@ -108,7 +124,7 @@ class ReportGenerationModule:
 
         # Add logo
         if 'logo_path' in self.config:
-            logo = Image(self.config['logo_path'], width=100, height=50)
+            logo = Image(self.config['logo_path'], width=250, height=40)
             story.append(logo)
             story.append(Spacer(1, 12))
 
@@ -117,12 +133,8 @@ class ReportGenerationModule:
         story.append(Spacer(1, 12))
 
         # Add content
-        for section, content in structured_report.items():
-            story.append(Paragraph(section, styles['Heading1']))
-            story.append(Spacer(1, 6))
-
-            story = self.append_pdf_content(story, content, styles)
-
+        for section in structured_report:
+            story = self.append_pdf_content(story, section, styles)
             story.append(Spacer(1, 12))
 
         # Add anomalies table
@@ -138,7 +150,21 @@ class ReportGenerationModule:
                 anomaly['recommended_actions']
             ])
 
-        anomalies_table = Table(anomalies_data)
+        page_width, page_height = A4
+        left_margin = 0.5 * inch
+        right_margin = 0.5 * inch
+        available_width = page_width - left_margin - right_margin
+        column_count = len(anomalies_data[0])
+        column_widths = [available_width / column_count] * column_count
+        styles = getSampleStyleSheet()
+        style_normal = styles['Normal']
+
+        wrapped_data = [
+            [Paragraph(str(cell), style_normal) for cell in row]
+            for row in anomalies_data
+        ]
+
+        anomalies_table = Table(wrapped_data, colWidths=column_widths)
         anomalies_table.setStyle(TableStyle([
             ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
             ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
@@ -153,37 +179,14 @@ class ReportGenerationModule:
             ('FONTSIZE', (0, 1), (-1, -1), 10),
             ('TOPPADDING', (0, 1), (-1, -1), 6),
             ('BOTTOMPADDING', (0, 1), (-1, -1), 6),
-            ('GRID', (0, 0), (-1, -1), 1, colors.black)
+            ('GRID', (0, 0), (-1, -1), 1, colors.black),
+            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
         ]))
         story.append(anomalies_table)
-
-        # Add visualizations
-        if self.config['include_visualizations']:
-            story.append(Paragraph("Visualizations", styles['Heading1']))
-            story.append(Spacer(1, 6))
-
-            # Anomaly confidence distribution
-            confidence_chart = self.create_confidence_chart(anomalies)
-            story.append(confidence_chart)
-            story.append(Spacer(1, 12))
 
         doc.build(story)
         buffer.seek(0)
         return buffer.getvalue()
-
-    def create_confidence_chart(self, anomalies):
-        confidences = [anomaly['confidence_score'] for anomaly in anomalies]
-        plt.figure(figsize=(6, 4))
-        plt.hist(confidences, bins=10, edgecolor='black')
-        plt.title('Distribution of Anomaly Confidence Scores')
-        plt.xlabel('Confidence Score')
-        plt.ylabel('Frequency')
-
-        img_buffer = io.BytesIO()
-        plt.savefig(img_buffer, format='png')
-        img_buffer.seek(0)
-
-        return Image(img_buffer, width=300, height=200)
 
     def export_report(self, report, file_type, path):
         if file_type == 'pdf':

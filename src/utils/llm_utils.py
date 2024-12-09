@@ -1,14 +1,14 @@
-import os
-import json
-import openai
-from anthropic import Anthropic
-from transformers import pipeline
 import asyncio
-import logging
-from sentence_transformers import SentenceTransformer
-import faiss
-import requests
 import json
+import logging
+import os
+
+import faiss
+import openai
+import requests
+from anthropic import Anthropic
+from sentence_transformers import SentenceTransformer
+from transformers import pipeline
 
 logger = logging.getLogger(__name__)
 
@@ -100,32 +100,27 @@ async def get_huggingface_response(prompt, config):
 
 
 async def get_generic_post_response(prompt, config):
-
-    # Define the URL and headers
-    url = "YOUR_URL"
+    url = config['url']
     headers = {
         "Content-Type": "application/json",
-        "Authorization": "YOUR_TOKEN"
+        "Authorization": f"Bearer {config['token']}"
     }
 
-    # Define the payload
     payload = {
+        "model": config['models']['default']['name'],
         "messages": [
             {"role": "user", "content": prompt}
         ],
-        "max_tokens": 2000,
-        "temperature": 0.2
+        "max_tokens": config['models']['default']['max_tokens'],
+        "temperature": config['models']['default']['temperature']
     }
 
-    # Make the POST request
     response = requests.post(url, headers=headers, data=json.dumps(payload))
 
-    # Check if the request was successful
     if response.status_code == 200:
         response_data = response.json()
         choices = response_data.get('choices', 'Field not found')
         content = choices[0]["message"]["content"]
-        print(content)
         return content
     else:
         print(f"Request failed with status code {response.status_code}")

@@ -1,10 +1,19 @@
 import asyncio
-from utils.llm_utils import get_llm_response
-from utils.error_handling import async_retry_with_backoff
-import logging
 import json
+import logging
+
+from utils.error_handling import async_retry_with_backoff
+from utils.llm_utils import get_llm_response
 
 logger = logging.getLogger(__name__)
+
+
+def structure_understanding(raw_understanding):
+    try:
+        return json.loads(raw_understanding)
+    except json.JSONDecodeError:
+        logger.warning("Failed to parse LLM response as JSON. Returning raw output.")
+        return {"raw_output": raw_understanding}
 
 
 class IncidentUnderstandingModule:
@@ -12,6 +21,7 @@ class IncidentUnderstandingModule:
         self.llm_config = llm_config
         self.rag = rag
         self.prompt_template = """
+
         Analyze the following incident and provide a detailed understanding:
         
         Incident ID: {incident_id}
@@ -31,8 +41,7 @@ class IncidentUnderstandingModule:
         
         Format your response as a JSON object with clearly labeled sections.
         Make sure to use escaping with all the symbols that may be a problem if I am using APIs.
-        Don't output anything else except the JSON.
-        """
+        Don't output anything else except the JSON.\""""
 
     @async_retry_with_backoff(max_attempts=3, backoff_in_seconds=1)
     async def process(self, incident):
@@ -43,8 +52,11 @@ class IncidentUnderstandingModule:
                 description=incident['description']
             )
 
+            if self.rag is None:
+                prompt = self.llm_config['context'] + prompt
+
             understanding = await get_llm_response(prompt, self.llm_config, self.rag)
-            structured_understanding = self.structure_understanding(understanding)
+            structured_understanding = structure_understanding(understanding)
 
             logger.info(f"Processed understanding for incident {incident['id']}")
             return {
@@ -55,37 +67,10 @@ class IncidentUnderstandingModule:
             logger.error(f"Error processing incident {incident['id']}: {str(e)}")
             raise
 
-    def structure_understanding(self, raw_understanding):
-        try:
-            return json.loads(raw_understanding)
-        except json.JSONDecodeError:
-            logger.warning("Failed to parse LLM response as JSON. Returning raw output.")
-            return {"raw_output": raw_understanding}
-
 
 # Example usage
 async def main():
-    llm_config = {
-        'provider': 'generic',
-        "use_fine_tuned": False,
-        'models': {
-            'default': {
-                'name': "gpt-3.5-turbo-0613",
-                'max_tokens': 2000,
-                'temperature': 0.7
-            }
-        }
-    }
-
-    incident = {
-        'id': 'INC-12345',
-        'timestamp': '2023-07-07T12:00:00Z',
-        'description': 'Multiple failed login attempts followed by a large transaction from a new IP address.'
-    }
-
-    understanding_module = IncidentUnderstandingModule(llm_config, rag=None)
-    result = await understanding_module.process(incident)
-    print(json.dumps(result, indent=2))
+    return
 
 
 if __name__ == "__main__":

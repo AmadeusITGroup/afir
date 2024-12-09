@@ -1,10 +1,36 @@
 import asyncio
 import json
-from utils.llm_utils import get_llm_response
-from utils.error_handling import async_retry_with_backoff
 import logging
 
+from utils.error_handling import async_retry_with_backoff
+from utils.llm_utils import get_llm_response
+
 logger = logging.getLogger(__name__)
+
+
+def preprocess_logs(logs):
+    combined_logs = []
+    for source, entries in logs.items():
+        for entry in entries:
+            combined_logs.append(f"[{source}] {json.dumps(entry)}")
+
+    max_chars = 15000  # Adjust based on LLM token limit
+    combined_logs_str = "\n".join(combined_logs)
+    if len(combined_logs_str) > max_chars:
+        combined_logs_str = combined_logs_str[:max_chars] + "... [truncated]"
+
+    return combined_logs_str
+
+
+def parse_llm_response(llm_response):
+    try:
+        anomalies = json.loads(llm_response)
+        if not isinstance(anomalies, list):
+            raise ValueError("LLM response is not a JSON array")
+        return anomalies
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse LLM response: {str(e)}")
+        return []
 
 
 class AnomalyDetectionModule:
@@ -13,6 +39,7 @@ class AnomalyDetectionModule:
         self.llm_config = llm_config
         self.rag = rag
         self.prompt_template = """
+
         Analyze the following log data and incident understanding to detect any anomalies, suspicious patterns, or indicators of fraud:
 
         Incident Understanding:
@@ -37,25 +64,35 @@ class AnomalyDetectionModule:
         - Unusual network traffic or communication patterns
         - Inconsistencies in user profiles or account activities
 
-        Use the provided context to enhance your analysis. Consider any similar past incidents, known fraud patterns, or relevant information from the knowledge base.
+        Use the provided context to enhance your analysis. Consider any similar past incidents, known fraud patterns, 
+        or relevant information from the knowledge base. Be as detailed as possible.
+        
+        Be as cautious as possible.
+        
+        The fields of every anomaly must be description, supporting_data, potential_implications, confidence_score, 
+        recommended_actions, patterns.
 
         Format your response as a JSON array of anomaly objects.
-        Don't output anything else except the JSON.
+        Ensure that the generated JSONs are well-formed, properly escaped, and follow the specified 
+        structure without any additional text output. Validate the JSONs structure before returning the result.
         """
 
     @async_retry_with_backoff(max_attempts=3, backoff_in_seconds=1)
     async def detect(self, logs, understanding):
         try:
-            combined_logs = self.preprocess_logs(logs)
+            combined_logs = preprocess_logs(logs)
 
             prompt = self.prompt_template.format(
                 incident_understanding=json.dumps(understanding['analysis'], indent=2),
                 log_data=combined_logs
             )
 
+            if self.rag is None:
+                prompt = self.llm_config['context'] + prompt
+
             llm_response = await get_llm_response(prompt, self.llm_config, self.rag)
 
-            anomalies = self.parse_llm_response(llm_response)
+            anomalies = parse_llm_response(llm_response)
 
             filtered_anomalies = self.filter_anomalies(anomalies)
 
@@ -64,29 +101,6 @@ class AnomalyDetectionModule:
         except Exception as e:
             logger.error(f"Error detecting anomalies for incident {understanding['incident_id']}: {str(e)}")
             raise
-
-    def preprocess_logs(self, logs):
-        combined_logs = []
-        for source, entries in logs.items():
-            for entry in entries:
-                combined_logs.append(f"[{source}] {json.dumps(entry)}")
-
-        max_chars = 15000  # Adjust based on LLM token limit
-        combined_logs_str = "\n".join(combined_logs)
-        if len(combined_logs_str) > max_chars:
-            combined_logs_str = combined_logs_str[:max_chars] + "... [truncated]"
-
-        return combined_logs_str
-
-    def parse_llm_response(self, llm_response):
-        try:
-            anomalies = json.loads(llm_response)
-            if not isinstance(anomalies, list):
-                raise ValueError("LLM response is not a JSON array")
-            return anomalies
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse LLM response: {str(e)}")
-            return []
 
     def filter_anomalies(self, anomalies):
         return [
@@ -97,55 +111,7 @@ class AnomalyDetectionModule:
 
 # Example usage
 async def main():
-    config = {
-        'threshold': 0.6
-    }
-
-    llm_config = {
-        'provider': 'generic',
-        "use_fine_tuned": False,
-        'models': {
-            'default': {
-                'name': "gpt-3.5-turbo-0613",
-                'max_tokens': 2000,
-                'temperature': 0.7
-            }
-        }
-    }
-
-    rag = None  # You should initialize this with your actual RAG system
-
-    logs = {
-        'application_logs': [
-            {'timestamp': '2023-07-07T12:00:00Z', 'message': 'User login failed', 'user_id': 'user123',
-             'ip_address': '192.168.1.100'},
-            {'timestamp': '2023-07-07T12:01:00Z', 'message': 'User login successful', 'user_id': 'user123',
-             'ip_address': '10.0.0.1'},
-            {'timestamp': '2023-07-07T12:02:00Z', 'message': 'Large transaction initiated', 'user_id': 'user123',
-             'amount': 50000},
-        ],
-        'network_logs': [
-            {'timestamp': '2023-07-07T12:00:05Z', 'source_ip': '192.168.1.100', 'destination_ip': '10.0.0.50',
-             'port': 443},
-            {'timestamp': '2023-07-07T12:01:30Z', 'source_ip': '10.0.0.1', 'destination_ip': '192.168.1.200',
-             'port': 8080},
-        ]
-    }
-
-    understanding = {
-        'incident_id': 'INC-12345',
-        'analysis': {
-            'summary': 'Potential unauthorized access and suspicious transaction detected for user123.',
-            'severity': 8,
-            'key_elements': ['failed login', 'successful login from different IP', 'large transaction'],
-            'relevant_log_sources': ['application_logs', 'network_logs']
-        }
-    }
-
-    anomaly_detection = AnomalyDetectionModule(config, llm_config, rag)
-    anomalies = await anomaly_detection.detect(logs, understanding)
-
-    print(json.dumps(anomalies, indent=2))
+    return
 
 
 if __name__ == "__main__":

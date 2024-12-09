@@ -2,6 +2,7 @@ import time
 import asyncio
 from collections import deque
 
+
 class RateLimiter:
     def __init__(self, max_calls, period):
         self.max_calls = max_calls
@@ -22,6 +23,7 @@ class RateLimiter:
     async def __aexit__(self, exc_type, exc, tb):
         pass
 
+
 class AsyncRateLimiter:
     def __init__(self, rate_limit, time_period=60):
         self.rate_limit = rate_limit
@@ -40,6 +42,7 @@ class AsyncRateLimiter:
     def close(self):
         self.task.cancel()
 
+
 # Example usage
 async def main():
     rate_limiter = AsyncRateLimiter(rate_limit=5, time_period=10)  # 5 requests per 10 seconds
@@ -52,6 +55,7 @@ async def main():
     await asyncio.gather(*tasks)
 
     rate_limiter.close()
+
 
 if __name__ == "__main__":
     asyncio.run(main())

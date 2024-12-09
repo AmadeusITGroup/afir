@@ -1,0 +1,6 @@
+active_plugins:
+  # - custom_anomaly_detection
+
+plugin_settings:
+  custom_anomaly_detection:
+    threshold: 0.8
