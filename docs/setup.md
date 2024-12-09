@@ -2,16 +2,20 @@
 
 ## Prerequisites
 - Python 3.8+
-- Redis (for caching and message queuing)
+
+## Supported inputs
+- Textual input via API
+- Incident retrieval via Win@proach
+
+## Supported log sources
 - Elasticsearch (for log storage and retrieval)
-- Splunk (for security log analysis)
 
 ## Installation Steps
 
 1. Clone the repository:
    ```
-   git clone https://github.com/your-org/fraud-investigation-system.git
-   cd fraud-investigation-system
+   git clone https://github.com/AmadeusITGroup/afir.git
+   cd afir
    ```
 
 2. Create and activate a virtual environment:
