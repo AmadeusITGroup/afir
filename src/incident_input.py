@@ -13,6 +13,16 @@ from src.utils.performance import AsyncRateLimiter
 logger = logging.getLogger(__name__)
 
 
+def validate_ir_request(request):
+    required_fields = ['id']
+    return all(field in request for field in required_fields)
+
+
+def validate_incident(incident):
+    required_fields = ['id', 'timestamp', 'description']
+    return all(field in incident for field in required_fields)
+
+
 class IncidentInputInterface:
     def __init__(self, config):
         self.config = config
@@ -34,7 +44,7 @@ class IncidentInputInterface:
         await self.rate_limiter.acquire()
         try:
             incident = await request.json()
-            if not self.validate_incident(incident):
+            if not validate_incident(incident):
                 return web.Response(status=400, text="Invalid incident data")
 
             await self.incidents.put(incident)
@@ -51,7 +61,7 @@ class IncidentInputInterface:
         await self.rate_limiter.acquire()
         try:
             incident = await request.json()
-            if not self.validate_ir_request(incident):
+            if not validate_ir_request(incident):
                 return web.Response(status=400, text="Invalid IR data")
 
             url = self.config['win_url'] + '/api/v2/json/records/?rnid=' + incident['id'] + '&with=full'
@@ -72,14 +82,6 @@ class IncidentInputInterface:
         except Exception as e:
             logger.error(f"Error receiving incident: {str(e)}")
             return web.Response(status=400, text="Invalid IR")
-
-    def validate_ir_request(self, request):
-        required_fields = ['id']
-        return all(field in request for field in required_fields)
-
-    def validate_incident(self, incident):
-        required_fields = ['id', 'timestamp', 'description']
-        return all(field in incident for field in required_fields)
 
     async def get_incidents(self, batch_size):
         incidents = []
