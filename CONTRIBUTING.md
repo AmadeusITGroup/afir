@@ -23,35 +23,35 @@ Please follow [pytest good practices](https://docs.pytest.org/en/stable/goodprac
 Make sure you test the syntax before submitting the PR. Run a local build if you can and verify if all the new extra resources are also checked in.
 
 ### Branching conventions
-We are working with a single master branch and one release branch to make is simple.
+We are working with a single master branch and one development branch to make is simple.
 
 ### Commit-message conventions
- * Prefix each commit with the Jira/GitHub Issue ticket number if possible i.e. [ABC-123] New package nnn added to allow running bbb
+ * Prefix each commit with the GitHub Issue ticket number if possible i.e. [ABC-123] New package nnn added to allow running bbb
  * Provide a high level summary of the changes. Try to be concise.
  * Make the commit messages meaningful. Don't skip them. They may be helpful during the code review and act as a passive documentation going forwards.
 
 ### Steps for creating good pull requests
   * State your intent is very clearly
   * If there is a need to provide a thorough explanation or refer to external sources, please do it - it will help in the review
-  * Use the Jira/GitHub Issue ticket as a prefix in the PR title to ensure we get nice cross-references
+  * Use the GitHub Issue ticket as a prefix in the PR title to ensure we get nice cross-references
   * If you are unsure about certain aspects, don't be scared of asking on the available forums ahead of creating the PR.
   * If you are aware of some drawback of the changes introduced be transparent about it, the reviewers will weigh pros and cons and your contribution may still be accepted
-  * To stick to a reasonable number of commits, you  may want to squash your PR using [the git  history rewriting technique](https://git-scm.com/book/en/v2/Git-Tools-Rewriting-History)
-  * You can use the PR as a medium for the conversation between  yourself and the project maintainers. You can prefix the PR with a meaningful tag eg. [IDEA], [SUGGESTION], [REMARK] etc. In such case your PR may never be integrated if what you are proposing is not in line with the general direction the project is going to. However, it would be still a valuable resource to track the discussion that took place and it may save time for somebody who is heading in a similar direction.
+  * To stick to a reasonable number of commits, you may want to squash your PR using [the git  history rewriting technique](https://git-scm.com/book/en/v2/Git-Tools-Rewriting-History)
+  * You can use the PR as a medium for the conversation between yourself and the project maintainers. You can prefix the PR with a meaningful tag eg. [IDEA], [SUGGESTION], [REMARK] etc. In such case your PR may never be integrated if what you are proposing is not in line with the general direction the project is going to. However, it would be still a valuable resource to track the discussion that took place and it may save time for somebody who is heading in a similar direction.
 
 ### Expected timelines(SLAs) for the code review and the integration
  * The PRs should be reviewed within 1 week at least
  * The integration happens immediately after the PR is approved and merged into the target branch 
 
 ### How to submit feature requests
- * You may want to discuss the feature on the teams channel or other forums availabe for the project
- * Use Jra board or GitHub Issues associated to this project
- * Link the PR(when the contribution is planned) with the Jira ticket/GitHub issue if possible - it may give us more context and will make the case for the change stronger
+ * You may want to discuss the feature on the teams channel or other forums available for the project
+ * Use GitHub Issues associated to this project
+ * Link the PR(when the contribution is planned) with the GitHub issue if possible - it may give us more context and will make the case for the change stronger
  * Please be thorough with the description
  * Highlight a reasonable timescale you wish the feature to be integrated within - it is helpful when prioritizing 
 
 ### How to submit bug reports
- * Check carefully the documentaion and by asking on the available forums if the behaviour you are experiencing is expected or if it is a bug
+ * Check carefully the documentation and by asking on the available forums if the behaviour you are experiencing is expected or if it is a bug
  * Use Issues board associated to the project
  * Link the PR(when the contribution is planned) with the bug report request if possible - it may give us more context
  * Please be thorough with the description
@@ -61,7 +61,7 @@ We are working with a single master branch and one release branch to make is sim
 * Engage with project maintainers. Do not publicly disclose anything before the patch is delivered.
 
 ### How to write documentation
-  * README.md and/or GETTINGSTARTED.md are where we describe the overview, the usage and the development practices
+  * README.md is where we describe the overview, the usage and the development practices
   * Use [markdown syntax](https://www.markdownguide.org/basic-syntax/) which is widely supported in the GitHub, BitBucket WebUI as well as in many IDEs
   * Use plain English and check your spelling prior to committing the change
   * Remember that good documentation is essential, so take time to do it properly
@@ -70,7 +70,7 @@ We are working with a single master branch and one release branch to make is sim
 All the development dependencies are incorporated into [requirements.txt](./requirements.txt)
 
 ### Build process schedule
-The deliverable(python wheel) is built as soon as the PR is merged into release branch.
+The deliverable(python wheel) is built as soon as the PR is merged into release branch. #to be implemented
 
 ### Sprint schedule
 There is no specific scrum setup here. All the changes are worked on in a best effort mode.
