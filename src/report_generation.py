@@ -65,19 +65,16 @@ class ReportGenerationModule:
         
         Include relevant statistics, key metrics, and potential business impact where applicable.
         
-        Prefer long and descriptive paragraphs over lists of strings.
-        
-        Ensure that the generated JSONs are well-formed, properly escaped, and follow the specified 
-        structure without any additional text output. Validate the JSONs structure before returning the result."""
+        """
 
     def append_pdf_content(self, story, content, styles):
         if isinstance(content, str) or isinstance(content, int) or isinstance(content, float):
             story.append(Paragraph(str(content), styles['Normal']))
         elif isinstance(content, dict):
             for subsection, subcontent in content.items():
-                if subsection == "section_title" or subsection == "subsection_title":
+                if subsection in ["section_title", "subsection_title"]:
                     story.append(Paragraph(subcontent, styles['Heading2']))
-                elif subsection == "sections" or subsection == "content":
+                elif subsection in ["sections", "section", "subsection", "content"]:
                     self.append_pdf_content(story, subcontent, styles)
                 else:
                     story.append(Paragraph(subsection, styles['Heading2']))

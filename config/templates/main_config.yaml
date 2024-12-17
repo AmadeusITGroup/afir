@@ -2,9 +2,9 @@ incident_input:
   type: "api"
   post_incident_endpoint: "/api/v1/incidents"
   post_ir_endpoint: "/api/v1/ir"
-  win_url: [WIN@PROACH URL]
-  win_username: [WIN@PROACH USERNAME]
-  win_password: [WIN@PROACH PASSWORD]
+  win_url: "win@proach.url"
+  win_username: "username"
+  win_password: "password"
   port: 5000
   max_incidents_per_batch: 100
   rate_limit:
@@ -14,21 +14,22 @@ incident_input:
 log_sources:
   use_ssh_tunnel: true
   tunnel:
-    url: [TUNNEL URL]
-    user: [TUNNEL USER]
-    password: [TUNNEL PASSWORD]
-    remote_bind_url: [REMOTE BIND URL]
-    remote_bind_port: [REMOTE BIND URL]
-    local_bind_url: [LOCAL BIND URL]
-    local_bind_port: [LOCAL BIND URL]
+    url: "tunnel.url"
+    user: "username"
+    password: "password"
+    remote_bind_url: "remote.bind.url"
+    remote_bind_port: 9000
+    local_bind_url: "local.bind.url"
+    local_bind_port: 9000
   names_list:
     - application_logs
   sources:
     - name: "application_logs"
       type: "elasticsearch"
-      url: [ELASTICSEARCH URL]
-      username: [ELASTICSEARCH USERNAME]
-      password: [ELASTICSEARCH PASSWORD]
+      url: "www.elastic.instance"
+      username: "username"
+      password: "password"
+      index: 'my-index'
       timeout: 30
       retry_attempts: 3
       retry_delay: 5

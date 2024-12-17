@@ -13,14 +13,15 @@ def build_elasticsearch_query(api_call):
     query = {
         "bool": {
             "must": [
-                {"term": {"officeId": "AGAMO2301"}},
-                {"term": {"user.userId": "AGALEZA"}}
+                {"wildcard": {"officeId": f"*{api_call["officeId"]}*"}},
+                {"wildcard": {"user.userId": f"{api_call["userId"]}"}}
             ],
             "filter": [
-                {"range": {"date": {"gte": "2024-09-19", "lt": "2024-09-20"}}}
+                {"range": {"date": {"gte": f"{api_call["date_from"]}", "lt": f"{api_call["date_to"]}"}}}
             ]
         }
     }
+
     return query
 
 
@@ -82,8 +83,9 @@ class LogRetrievalEngine:
 
     @async_retry_with_backoff(max_attempts=3, backoff_in_seconds=1)
     async def get_elasticsearch_logs(self, api_call):
+        es_config = next(source for source in self.config["sources"] if source['type'] == 'elasticsearch')
+
         if not self.es_client:
-            es_config = next(source for source in self.config["sources"] if source['type'] == 'elasticsearch')
             self.es_client = AsyncElasticsearch(
                 es_config["url"],
                 http_auth=(es_config["username"], es_config["password"]),
@@ -93,7 +95,7 @@ class LogRetrievalEngine:
         query = build_elasticsearch_query(api_call)
 
         try:
-            result = await self.es_client.search(index='session.azure.ic.2024.09', query=query,
+            result = await self.es_client.search(index=es_config["index"], query=query,
                                                  size=1000)
             return [hit['_source'] for hit in result['hits']['hits']]
         except Exception as e:

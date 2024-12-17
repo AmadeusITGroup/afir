@@ -21,8 +21,8 @@ class ApiCallGenerator:
         1. A field target_log_source (choose the type of the logs from this list: {logs_names_list})
         2. A field officeId, the office ID
         3. A field userId, the ID of the suspected user ("*" if not available)
-        4. A field date_from, the start date from when to retrieve the logs (in the format yyyy-MM-dd) ("*" if not available)
-        5. A field date_to, the end date up to when to retrieve the logs (in the format yyyy-MM-dd) ("*" if not available)
+        4. A field date_from, the start date from when to retrieve the logs (in the format yyyy-MM-dd) (a couple of days before the incident)
+        5. A field date_to, the end date up to when to retrieve the logs (in the format yyyy-MM-dd) (a couple of days after the incident)
 
         Format the output as a list of JSON objects, each representing an API call (even if it will contain just one 
         API call). Ensure that the generated JSONs are well-formed, properly escaped, and follow the specified 
@@ -58,7 +58,7 @@ class ApiCallGenerator:
             return []
 
     def validate_api_call(self, api_call):
-        required_fields = ['target_log_source', 'query_parameters', 'context']
+        required_fields = ['target_log_source', 'officeId', 'userId', 'date_from', 'date_to']
         for field in required_fields:
             if field not in api_call:
                 logger.warning(f"API call missing required field: {field}")
