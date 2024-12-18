@@ -43,21 +43,19 @@ Below is a high-level overview of the Fraud Investigation System architecture:
 
 ## Features
 
-- Automated incident understanding using LLMs
-- Dynamic API call generation for log retrieval
-- Asynchronous log retrieval from multiple sources (Elasticsearch, Splunk)
-- LLM-powered anomaly detection with statistical analysis
-- Automated report generation with visualizations
-- Flexible output interface (email, file, API)
-- Rate limiting and input validation
-- Caching and performance optimization
-- Robust error handling and retrying mechanisms
-- Web interface for monitoring and manual intervention
-- Feedback loop for continuous improvement
-- Plugin system for easy extension of functionality
-- Performance dashboard for visualizing system performance and trends
-- Export of investigation results in various formats (JSON, CSV, XML, Excel)
-- External API for submitting incidents and retrieving results
+- Automated incident understanding using LLMs :white_check_mark:
+- Dynamic API call generation for log retrieval :black_square_button:
+- Asynchronous log retrieval from multiple sources (for now: Elasticsearch) :black_square_button:
+- LLM-powered anomaly detection with statistical analysis :white_check_mark:
+- Automated report generation :white_check_mark:
+- Flexible output interface (email, file, API) :black_square_button:
+- Rate limiting and input validation :white_check_mark:
+- Caching and performance optimization :black_square_button:
+- Robust error handling and retrying mechanisms :white_check_mark:
+- Feedback loop for continuous improvement :black_square_button:
+- Plugin system for easy extension of functionality :white_check_mark:
+- Export of investigation results in various formats (JSON, CSV, XML, Excel) :white_check_mark:
+- External API for submitting incidents :white_check_mark:
 
 ## System Architecture
 
@@ -97,27 +95,11 @@ These components are supported by utility modules for LLM integration, error han
    pip install -r requirements.txt
    ```
 
-4. Set up environment variables for API keys and sensitive information:
-   ```
-   export OPENAI_API_KEY=your_openai_api_key
-   export ANTHROPIC_API_KEY=your_anthropic_api_key
-   export HF_API_KEY=your_huggingface_api_key
-   export ES_USERNAME=your_elasticsearch_username
-   export ES_PASSWORD=your_elasticsearch_password
-   export SPLUNK_TOKEN=your_splunk_token
-   export SMTP_USERNAME=your_smtp_username
-   export SMTP_PASSWORD=your_smtp_password
-   ```
-
-5. Configure the system by editing the YAML files in the `config/` directory:
+4. Configure the system by editing the YAML files in the `config/` directory (you can find some templates in `config/templates/`:
    - `main_config.yaml`: Main system configuration
    - `llm_config.yaml`: LLM provider configuration
-
-6. Set up a Redis server for caching (optional):
-   ```
-   sudo apt-get install redis-server
-   sudo systemctl start redis-server
-   ```
+   - `logging_config.yaml`: Logging configuration
+   - `plugin_config.yaml`: Plugin configuration
 
 ## Usage
 
@@ -126,20 +108,7 @@ These components are supported by utility modules for LLM integration, error han
    python src/main.py
    ```
 
-2. Run the web interface:
-   ```
-   python src/web_interface.py
-   ```
-
-3. Start the performance dashboard:
-   ```
-   python src/dashboard.py
-   ```
-
-4. Run the external API:
-   ```
-   python src/api.py
-   ```
+2. Contact the system using API calls as descripted in `docs/user_guide.md`.
 
 ## Extending the System
 
@@ -147,36 +116,8 @@ These components are supported by utility modules for LLM integration, error han
 
 1. Create a new Python file in the `plugins/` directory.
 2. Implement your plugin logic and a `register_plugin()` function.
-3. The plugin will be automatically loaded by the PluginManager.
-
-### Customizing the Feedback Loop
-
-Modify the `process_feedback()` method in `src/feedback_loop.py` to implement custom logic for applying insights and improving the system.
-
-### Adding New Export Formats
-
-Extend the `ResultExporter` class in `src/export_results.py` to add new export formats.
-
-## API Documentation
-
-### Submit Incident
-
-- Endpoint: `/api/submit_incident`
-- Method: POST
-- Payload: JSON object with incident details
-- Response: Confirmation message with incident ID
-
-### Get Result
-
-- Endpoint: `/api/get_result/<incident_id>`
-- Method: GET
-- Response: Investigation result for the specified incident
-
-### System Status
-
-- Endpoint: `/api/system_status`
-- Method: GET
-- Response: Current status of the fraud investigation system
+3. Configure the plugin in the plugin configuration file.
+4. The plugin will be automatically loaded by the PluginManager.
 
 ## Testing
 
