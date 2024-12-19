@@ -17,12 +17,12 @@ Below is a high-level overview of the Fraud Investigation System architecture:
 
 ```
 +-------------------+      +------------------------+
-|   Incident Input  |----->|  Incident Understanding|
+|  Incident Input   |----->| Incident Understanding |
 +-------------------+      +------------------------+
                                        |
                                        v
 +-------------------+      +------------------------+
-|    Knowledge Base |<---->|     RAG Processing     |
+|  Knowledge Base   |<---->|     RAG Processing     |
 +-------------------+      +------------------------+
                                        |
                                        v
