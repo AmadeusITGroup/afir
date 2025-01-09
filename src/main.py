@@ -1,20 +1,21 @@
 import asyncio
-import yaml
 import logging
 from concurrent.futures import ProcessPoolExecutor
+
+import yaml
+
+from anomaly_detection import AnomalyDetectionModule
+from api_call_generator import ApiCallGenerator
+from export_results import ResultExporter
+from feedback_loop import FeedbackLoop
 from incident_input import IncidentInputInterface
 from incident_understanding import IncidentUnderstandingModule
-from api_call_generator import ApiCallGenerator
 from log_retrieval import LogRetrievalEngine
-from anomaly_detection import AnomalyDetectionModule
-from report_generation import ReportGenerationModule
-from output_interface import OutputInterface
-from utils.error_handling import async_retry_with_backoff
-from utils.performance import batch_process
-from plugin_system import PluginManager
-from feedback_loop import FeedbackLoop
-from export_results import ResultExporter
 from notifications import NotificationSystem, send_notification
+from output_interface import OutputInterface
+from plugin_system import PluginManager
+from report_generation import ReportGenerationModule
+from utils.error_handling import async_retry_with_backoff
 from utils.llm_utils import RAG
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -33,35 +34,42 @@ async def process_incident(incident, modules):
 
         understanding = await modules['understanding'].process(incident)
         logger.info(f"Incident {incident['id']} understanding complete")
+        print(understanding)
 
         api_calls = await modules['api_call'].generate(understanding)
         logger.info(f"Generated {len(api_calls)} API calls for incident {incident['id']}")
+        print(api_calls)
 
-        logs = await modules['log_retrieval'].retrieve(api_calls)
+        if modules['log_retrieval'].config['use_ssh_tunnel']:
+            logs = await modules['log_retrieval'].retrieve_with_tunnel(api_calls)
+        else:
+            logs = await modules['log_retrieval'].retrieve(api_calls)
         logger.info(f"Retrieved logs from {len(logs)} sources for incident {incident['id']}")
+        print(logs)
 
         anomalies = await modules['anomaly_detection'].detect(logs, understanding)
         logger.info(f"Detected {len(anomalies)} anomalies for incident {incident['id']}")
+        print(anomalies)
 
         # Use plugins for additional processing
         for plugin in modules['plugins'].get_active_plugins():
             plugin_result = await modules['plugins'].execute_plugin(plugin, incident, understanding, logs, anomalies)
-            logger.info(f"Executed plugin {plugin} for incident {incident['id']}")
+            logger.info(f"Executed plugin {plugin} for incident {incident['id']} with result: {plugin_result}")
 
         report = await modules['report_generation'].generate(incident, understanding, logs, anomalies)
         logger.info(f"Generated investigation report for incident {incident['id']}")
 
-        await modules['output'].send(report, incident['id'])
-        logger.info(f"Sent investigation report for incident {incident['id']}")
+        # await modules['output'].send(report, incident['id']) # TO BE IMPLEMENTED
+        # logger.info(f"Sent investigation report for incident {incident['id']}")
 
         # Export results
         exporter = ResultExporter({'incident': incident, 'understanding': understanding, 'anomalies': anomalies})
-        exporter.export_json(f"exports/incident_{incident['id']}.json")
-        exporter.export_csv(f"exports/incident_{incident['id']}.csv")
+        exporter.export_json(f"../exports/incident_{incident['id']}.json")
+        exporter.export_csv(f"../exports/incident_{incident['id']}.csv")
         logger.info(f"Exported results for incident {incident['id']}")
 
-        # Collect feedback (this would typically be done after human review)
-        await modules['feedback'].collect_feedback(incident['id'], {'anomalies': anomalies}, {'accuracy': 0.9})
+        # Collect feedback (this would typically be done after human review) # TO BE IMPLEMENTED
+        # await modules['feedback'].collect_feedback(incident['id'], {'anomalies': anomalies}, {'accuracy': 0.9})
 
         send_notification(incident['id'], 'completed', 'Incident processing completed')
         return report
@@ -72,32 +80,39 @@ async def process_incident(incident, modules):
 
 
 async def main():
-    main_config = load_config('config/main_config.yaml')
-    llm_config = load_config('config/llm_config.yaml')
+    main_config = load_config('../config/main_config.yaml')
+    llm_config = load_config('../config/llm_config.yaml')
 
     # Initialize RAG
-    rag = RAG(
-        knowledge_base_path=main_config['knowledge_base']['path'],
-        sentence_transformer_model=main_config['rag']['sentence_transformer_model'],
-        max_retrieved_documents=main_config['rag']['max_retrieved_documents'],
-        similarity_threshold=main_config['rag']['similarity_threshold']
-    )
+    use_rag = main_config['rag']['use_rag']
+    if use_rag:
+        rag = RAG(
+            knowledge_base_path=main_config['knowledge_base']['path'],
+            sentence_transformer_model=main_config['rag']['sentence_transformer_model'],
+            max_retrieved_documents=main_config['rag']['max_retrieved_documents'],
+            similarity_threshold=main_config['rag']['similarity_threshold']
+        )
+    else:
+        rag = None
 
     # Initialize notification system
     notification_system = NotificationSystem()
-    await notification_system.start_server()
+    await notification_system.start_notification_server()
 
     modules = {
         'input': IncidentInputInterface(main_config['incident_input']),
         'understanding': IncidentUnderstandingModule(llm_config, rag),
-        'api_call': ApiCallGenerator(llm_config, rag),
+        'api_call': ApiCallGenerator(main_config['log_sources'], llm_config),
         'log_retrieval': LogRetrievalEngine(main_config['log_sources']),
         'anomaly_detection': AnomalyDetectionModule(main_config['anomaly_detection'], llm_config, rag),
-        'report_generation': ReportGenerationModule(main_config['report_generation'], llm_config, rag),
+        'report_generation': ReportGenerationModule(main_config['report_generation'], llm_config),
         'output': OutputInterface(main_config['output_interface']),
         'plugins': PluginManager(main_config['plugin_dir']),
-        'feedback': FeedbackLoop(llm_config, rag)
+        'feedback': FeedbackLoop(llm_config)  # RAG feedback loop TO BE IMPLEMENTED
     }
+
+    # Load the plugins
+    modules['plugins'].load_plugins()
 
     # Start the incident input server
     await modules['input'].start_server()
@@ -128,7 +143,7 @@ async def main():
                     logger.info(f"Successfully processed incident {incident['id']}")
 
             # Process feedback periodically
-            await modules['feedback'].process_feedback()
+            # await modules['feedback'].process_feedback() # TO IMPLEMENT
 
 
 if __name__ == "__main__":

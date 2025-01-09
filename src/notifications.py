@@ -45,6 +45,15 @@ class NotificationSystem:
 
         return ws
 
+    async def start_notification_server(self):
+        app = web.Application()
+        app.router.add_get('/ws', self.ws_handler)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, 'localhost', 8080)
+        await site.start()
+        logger.info("Notification server started on ws://localhost:8080/ws")
+
 
 notification_system = NotificationSystem()
 
@@ -53,24 +62,13 @@ def send_notification(incident_id, status, message):
     asyncio.create_task(notification_system.send_notification(incident_id, status, message))
 
 
-# Example of how to set up the WebSocket server
-async def start_notification_server():
-    app = web.Application()
-    app.router.add_get('/ws', notification_system.ws_handler)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, 'localhost', 8080)
-    await site.start()
-    logger.info("Notification server started on ws://localhost:8080/ws")
-
-
 # Example usage
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
 
 
     async def main():
-        await start_notification_server()
+        await notification_system.start_notification_server()
 
         # Simulate sending notifications
         while True:

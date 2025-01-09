@@ -1,6 +1,10 @@
 incident_input:
   type: "api"
-  endpoint: "/api/v1/incidents"
+  post_incident_endpoint: "/api/v1/incidents"
+  post_ir_endpoint: "/api/v1/ir"
+  win_url: "win@proach.url"
+  win_username: "username"
+  win_password: "password"
   port: 5000
   max_incidents_per_batch: 100
   rate_limit:
@@ -8,22 +12,28 @@ incident_input:
     per_seconds: 3600
 
 log_sources:
-  - name: "application_logs"
-    type: "elasticsearch"
-    url: "http://elasticsearch:9200"
-    index: "app_logs_*"
-    username: "${ES_USERNAME}"
-    password: "${ES_PASSWORD}"
-    timeout: 30
-    retry_attempts: 3
-    retry_delay: 5
-  - name: "security_logs"
-    type: "splunk"
-    url: "https://splunk.example.com:8089"
-    token: "${SPLUNK_TOKEN}"
-    timeout: 30
-    retry_attempts: 3
-    retry_delay: 5
+  use_ssh_tunnel: true
+  tunnel:
+    url: "tunnel.url"
+    user: "username"
+    password: "password"
+    remote_bind_url: "remote.bind.url"
+    remote_bind_port: 9000
+    local_bind_url: "local.bind.url"
+    local_bind_port: 9000
+  names_list:
+    - application_logs
+  sources:
+    - name: "application_logs"
+      type: "elasticsearch"
+      url: "www.elastic.instance"
+      username: "username"
+      password: "password"
+      index: 'my-index'
+      timeout: 30
+      retry_attempts: 3
+      retry_delay: 5
+
 
 anomaly_detection:
   use_llm: true
@@ -34,10 +44,10 @@ anomaly_detection:
 
 report_generation:
   template: "standard_report"
-  output_format: "pdf"
-  logo_path: "/path/to/company_logo.png"
+  output_path: '../exports'
+  output_format: 'pdf'
+  logo_path: '../assets/company_logo.jfif'
   max_report_size_mb: 10
-  include_visualizations: true
 
 output_interface:
   type: "email"
@@ -52,13 +62,15 @@ output_interface:
   cc:
     - "management@example.com"
   attachment_size_limit_mb: 25
-  
-  
+
+plugin_dir: "../plugins"
+
 knowledge_base:
   path: "/path/to/your/knowledge_base"
   update_frequency: "daily"
 
 rag:
+  use_rag: false
   sentence_transformer_model: "all-MiniLM-L6-v2"
   max_retrieved_documents: 5
   similarity_threshold: 0.7  

@@ -1,10 +1,19 @@
 import asyncio
-from utils.llm_utils import get_llm_response
-from utils.error_handling import async_retry_with_backoff
-import logging
 import json
+import logging
+
+from utils.error_handling import async_retry_with_backoff
+from utils.llm_utils import get_llm_response
 
 logger = logging.getLogger(__name__)
+
+
+def structure_understanding(raw_understanding):
+    try:
+        return json.loads(raw_understanding)
+    except json.JSONDecodeError:
+        logger.warning("Failed to parse LLM response as JSON. Returning raw output.")
+        return {"raw_output": raw_understanding}
 
 
 class IncidentUnderstandingModule:
@@ -12,24 +21,36 @@ class IncidentUnderstandingModule:
         self.llm_config = llm_config
         self.rag = rag
         self.prompt_template = """
-        Analyze the following incident and provide a detailed understanding:
+
+        **Analyze the provided incident details and generate a structured analysis with actionable insights:**
         
-        Incident ID: {incident_id}
-        Timestamp: {timestamp}
-        Description: {description}
+        **Incident Information:**  
+        - **Incident ID:** {incident_id}  
+        - **Timestamp:** {timestamp}  
+        - **Description:** {description}  
         
-        Please provide:
-        1. A summary of the incident
-        2. Potential impact and severity (on a scale of 1-10)
-        3. Key elements to investigate
-        4. Relevant log sources to check
-        5. Any initial hypotheses about the nature of the incident (e.g., potential fraud patterns, suspicious activities)
-        6. Recommended immediate actions
-        7. Potential stakeholders to be notified
+        **Your analysis must include all the following sections:**  
+        1. **Incident Summary:** A concise but thorough overview of the incident (be sure to include the timestamps).
+        2. **Impact Assessment:** Evaluate the potential impact and assign a severity score on a scale of 1-10, with reasoning for the score.  
+        3. **Key Investigation Areas:** Highlight the critical elements or anomalies that require immediate attention.  
+        4. **Log Sources to Review:** Identify specific logs or systems (e.g., application logs, network traffic, user access logs) that may provide relevant insights.  
+        5. **Initial Hypotheses:** Propose potential explanations for the incident, such as possible fraud patterns, system vulnerabilities, or suspicious activities.  
+        6. **Recommended Actions:** Outline immediate steps to contain or mitigate the issue, including specific tasks or changes.  
+        7. **Stakeholder Notification:** List the stakeholders (e.g., departments, individuals) who should be informed and explain their relevance to the incident.  
         
-        Use the provided context to enhance your analysis. Consider any similar past incidents or known fraud patterns.
+        **Contextual Considerations:**  
+        - Use the provided details and relate them to any similar past incidents or known fraud patterns.  
+        - Highlight any trends or correlations that could aid in understanding the incident further.  
         
-        Format your response as a JSON object with clearly labeled sections.
+        **Output Format:**  
+        Provide your response as a JSON object.  
+        
+        **Additional Requirements:**  
+        - Ensure all special characters, particularly those that may conflict with APIs (e.g., quotation marks, slashes, newlines), are properly escaped.  
+        - Use concise and clear language to maximize readability and accuracy.  
+        
+        **Objective:** Provide a comprehensive and actionable analysis of the incident based on the given data and context.  
+        
         """
 
     @async_retry_with_backoff(max_attempts=3, backoff_in_seconds=1)
@@ -41,8 +62,11 @@ class IncidentUnderstandingModule:
                 description=incident['description']
             )
 
+            if self.rag is None:
+                prompt = self.llm_config['context'] + prompt
+
             understanding = await get_llm_response(prompt, self.llm_config, self.rag)
-            structured_understanding = self.structure_understanding(understanding)
+            structured_understanding = structure_understanding(understanding)
 
             logger.info(f"Processed understanding for incident {incident['id']}")
             return {
@@ -53,37 +77,10 @@ class IncidentUnderstandingModule:
             logger.error(f"Error processing incident {incident['id']}: {str(e)}")
             raise
 
-    def structure_understanding(self, raw_understanding):
-        try:
-            return json.loads(raw_understanding)
-        except json.JSONDecodeError:
-            logger.warning("Failed to parse LLM response as JSON. Returning raw output.")
-            return {"raw_output": raw_understanding}
-
 
 # Example usage
 async def main():
-    llm_config = {
-        'provider': 'openai',
-        'models': {
-            'default': {
-                'name': 'gpt-4',
-                'api_key': 'your_api_key_here',
-                'max_tokens': 2000,
-                'temperature': 0.7
-            }
-        }
-    }
-
-    incident = {
-        'id': 'INC-12345',
-        'timestamp': '2023-07-07T12:00:00Z',
-        'description': 'Multiple failed login attempts followed by a large transaction from a new IP address.'
-    }
-
-    understanding_module = IncidentUnderstandingModule(llm_config)
-    result = await understanding_module.process(incident)
-    print(json.dumps(result, indent=2))
+    return
 
 
 if __name__ == "__main__":

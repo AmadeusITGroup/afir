@@ -1,6 +1,6 @@
 # Example plugin: Custom Anomaly Detection
 # plugins/custom_anomaly_detection.py
-def custom_anomaly_detection(logs):
+def custom_anomaly_detection(incident, understanding, logs, anomalies):
     # Implement custom anomaly detection logic
     anomalies = []
     for log in logs:

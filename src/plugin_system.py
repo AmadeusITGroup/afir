@@ -18,8 +18,11 @@ class PluginManager:
         for filename in os.listdir(self.plugin_dir):
             if filename.endswith('.py') and filename != '__init__.py':
                 module_name = filename[:-3]
+                if module_name not in self.active_plugins:
+                    continue
+                path = self.plugin_dir[3:] + '.' + module_name
                 try:
-                    module = importlib.import_module(f'{self.plugin_dir}.{module_name}')
+                    module = importlib.import_module(path)
                     if hasattr(module, 'register_plugin'):
                         plugin_info = module.register_plugin()
                         self.plugins[plugin_info['name']] = plugin_info
@@ -50,43 +53,3 @@ class PluginManager:
         except Exception as e:
             logger.error(f"Error executing plugin '{plugin_name}': {str(e)}")
             raise
-
-
-# Example plugin file (plugins/example_plugin.py)
-"""
-def analyze_data(incident, understanding, logs, anomalies):
-    # Perform some analysis
-    result = "Example plugin analysis result"
-    return result
-
-def register_plugin():
-    return {
-        'name': 'example_plugin',
-        'description': 'An example plugin that performs additional analysis',
-        'execute': analyze_data
-    }
-"""
-
-# Example usage
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    plugin_manager = PluginManager('plugins')
-    print("Active plugins:", plugin_manager.get_active_plugins())
-
-    # Simulate executing a plugin
-    import asyncio
-
-
-    async def test_plugin():
-        try:
-            result = await plugin_manager.execute_plugin('example_plugin',
-                                                         incident={},
-                                                         understanding={},
-                                                         logs={},
-                                                         anomalies=[])
-            print("Plugin result:", result)
-        except ValueError as e:
-            print(str(e))
-
-
-    asyncio.run(test_plugin())

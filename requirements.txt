@@ -1,84 +1,87 @@
 # Core dependencies
-Flask==2.3.2
-PyYAML==6.0.1
-aiohttp==3.8.5
-asyncio==3.4.3
-pydantic==2.1.1
+Flask~=3.0.3
+PyYAML~=6.0.1
+aiohttp~=3.9.5
+asyncio~=3.4.3
+pydantic~=2.8.2
 
 # Database and logging
-elasticsearch==8.9.0
-splunk-sdk==1.7.3
-redis==4.6.0
+elasticsearch~=8.14.0
+splunk-sdk
+redis
 
 # LLM and NLP
-openai==0.27.8
-anthropic==0.3.6
-transformers==4.31.0
-torch==2.0.1
-sentence-transformers==2.2.2
+openai~=1.35.12
+anthropic~=0.30.1
+transformers~=4.42.3
+torch
+sentence-transformers
 
 # RAG and vector search
-faiss-cpu==1.7.4  # Use faiss-gpu if you have CUDA support
+faiss-cpu  # Use faiss-gpu if you have CUDA support
 
 # Async email
-aiosmtplib==2.0.1
+aiosmtplib~=3.0.1
 
 # Data processing and visualization
-pandas==2.0.3
-matplotlib==3.7.2
-plotly==5.15.0
+pandas~=2.2.2
+matplotlib
+plotly
 
 # PDF generation
-reportlab==4.0.4
+reportlab~=4.2.2
 
 # Error handling and retrying
-tenacity==8.2.2
+tenacity~=8.5.0
 
 # Testing
-pytest==7.4.0
-pytest-asyncio==0.21.1
-pytest-cov==4.1.0
+pytest~=8.2.2
+pytest-asyncio
+pytest-cov
 
 # Code quality and formatting
-black==23.7.0
-flake8==6.1.0
-isort==5.12.0
+black
+flake8
+isort
 
 # Async file operations
-aiofiles==23.1.0
+aiofiles~=24.1.0
 
 # Environment variable management
-python-dotenv==1.0.0
+python-dotenv
 
 # Web framework for API
-fastapi==0.100.1
-uvicorn==0.23.1
+fastapi
+uvicorn
 
 # Background tasks
-celery==5.3.1
+celery
 
 # Markdown support (for documentation in plugins)
-markdown==3.4.4
+markdown
 
 # Security
-bcrypt==4.0.1
-cryptography==41.0.3
+bcrypt
+cryptography
 
 # Caching
-cachetools==5.3.1
+cachetools
 
 # Parsing
-beautifulsoup4==4.12.2
+beautifulsoup4
 
 # Date and time handling
-python-dateutil==2.8.2
+python-dateutil
 
 # Progress bars (for long-running tasks)
-tqdm==4.65.0
+tqdm
 
 # Networking
-requests==2.31.0
+requests~=2.32.3
 
 # Development tools
-ipython==8.14.0
-jupyter==1.0.0
+ipython
+jupyter
+
+sshtunnel~=0.4.0
+openpyxl~=3.1.5

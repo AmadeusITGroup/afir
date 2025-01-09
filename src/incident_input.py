@@ -1,18 +1,34 @@
-from aiohttp import web
 import asyncio
-from asyncio import Queue
-import logging
-from src.utils.performance import AsyncRateLimiter
-from src.utils.error_handling import async_retry_with_backoff
 import json
+import logging
+from asyncio import Queue
+
+import requests
+from aiohttp import web
+from requests.auth import HTTPBasicAuth
+
+from src.utils.error_handling import async_retry_with_backoff
+from src.utils.performance import AsyncRateLimiter
 
 logger = logging.getLogger(__name__)
+
+
+def validate_ir_request(request):
+    required_fields = ['id']
+    return all(field in request for field in required_fields)
+
+
+def validate_incident(incident):
+    required_fields = ['id', 'timestamp', 'description']
+    return all(field in incident for field in required_fields)
+
 
 class IncidentInputInterface:
     def __init__(self, config):
         self.config = config
         self.app = web.Application()
-        self.app.router.add_post(config['endpoint'], self.receive_incident)
+        self.app.router.add_post(config['post_incident_endpoint'], self.receive_incident)
+        self.app.router.add_post(config['post_ir_endpoint'], self.get_ir)
         self.incidents = Queue()
         self.rate_limiter = AsyncRateLimiter(config['rate_limit']['requests'], config['rate_limit']['per_seconds'])
 
@@ -28,7 +44,7 @@ class IncidentInputInterface:
         await self.rate_limiter.acquire()
         try:
             incident = await request.json()
-            if not self.validate_incident(incident):
+            if not validate_incident(incident):
                 return web.Response(status=400, text="Invalid incident data")
 
             await self.incidents.put(incident)
@@ -40,9 +56,32 @@ class IncidentInputInterface:
             logger.error(f"Error receiving incident: {str(e)}")
             return web.Response(status=500, text="Internal server error")
 
-    def validate_incident(self, incident):
-        required_fields = ['id', 'timestamp', 'description']
-        return all(field in incident for field in required_fields)
+    @async_retry_with_backoff(max_attempts=3, backoff_in_seconds=1)
+    async def get_ir(self, request):
+        await self.rate_limiter.acquire()
+        try:
+            incident = await request.json()
+            if not validate_ir_request(incident):
+                return web.Response(status=400, text="Invalid IR data")
+
+            url = self.config['win_url'] + '/api/v2/json/records/?rnid=' + incident['id'] + '&with=full'
+            response = requests.get(url, auth=HTTPBasicAuth(self.config['win_username'], self.config['win_password']))
+
+            if response.status_code == 200:
+                incident = response.json()
+                ir = {'id': incident['records'][0]['ffts'][0]['rnid'],
+                      'timestamp': incident['records'][0]['ffts'][0]['update_date'],
+                      'description': incident['records'][0]['ffts'][0]['fft']}
+                await self.incidents.put(ir)
+                logger.info(f"Received incident: {ir['id']}")
+                return web.Response(status=201, text=f"Received incident: {ir['id']}")
+            else:
+                return web.Response(status=400, text=f"Could not get IR")
+        except json.JSONDecodeError:
+            return web.Response(status=400, text="Invalid JSON")
+        except Exception as e:
+            logger.error(f"Error receiving incident: {str(e)}")
+            return web.Response(status=400, text="Invalid IR")
 
     async def get_incidents(self, batch_size):
         incidents = []
@@ -53,39 +92,11 @@ class IncidentInputInterface:
             pass
         return incidents
 
+
 # Example usage
 async def main():
-    config = {
-        'endpoint': '/api/v1/incidents',
-        'port': 5000,
-        'rate_limit': {
-            'requests': 100,
-            'per_seconds': 60
-        }
-    }
-    incident_input = IncidentInputInterface(config)
-    await incident_input.start_server()
+    return
 
-    # Simulate incoming incidents
-    async def submit_incident(incident_id):
-        async with aiohttp.ClientSession() as session:
-            incident_data = {
-                'id': f'INC-{incident_id}',
-                'timestamp': '2023-07-07T12:00:00Z',
-                'description': f'Test incident {incident_id}'
-            }
-            async with session.post('http://localhost:5000/api/v1/incidents', json=incident_data) as response:
-                print(f"Submitted incident {incident_id}, status: {response.status}")
-
-    tasks = [submit_incident(i) for i in range(1000)]
-    await asyncio.gather(*tasks)
-
-    # Process incidents
-    while True:
-        incidents = await incident_input.get_incidents(batch_size=10)
-        if not incidents:
-            break
-        print(f"Processing {len(incidents)} incidents")
 
 if __name__ == "__main__":
     asyncio.run(main())

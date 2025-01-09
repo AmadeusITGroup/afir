@@ -22,12 +22,12 @@ class ResultExporter:
                 self.result['incident']['description'],
                 self.result['incident'].get('severity', 'N/A')
             ])
-            writer.writerow(['Anomaly Description', 'Confidence Score', 'Implications', 'Recommended Actions'])
+            writer.writerow(['Anomaly Description', 'Confidence Score', 'Potential Implications', 'Recommended Actions'])
             for anomaly in self.result['anomalies']:
                 writer.writerow([
                     anomaly['description'],
                     anomaly['confidence_score'],
-                    anomaly['implications'],
+                    anomaly['potential_implications'],
                     anomaly['recommended_actions']
                 ])
 
@@ -47,7 +47,7 @@ class ResultExporter:
             anomaly_elem = ET.SubElement(anomalies, "anomaly")
             ET.SubElement(anomaly_elem, "description").text = anomaly['description']
             ET.SubElement(anomaly_elem, "confidence_score").text = str(anomaly['confidence_score'])
-            ET.SubElement(anomaly_elem, "implications").text = anomaly['implications']
+            ET.SubElement(anomaly_elem, "potential_implications").text = anomaly['potential_implications']
             ET.SubElement(anomaly_elem, "recommended_actions").text = anomaly['recommended_actions']
 
         tree = ET.ElementTree(root)
@@ -73,13 +73,13 @@ class ResultExporter:
 
         ws['A6'] = 'Anomaly Description'
         ws['B6'] = 'Confidence Score'
-        ws['C6'] = 'Implications'
+        ws['C6'] = 'Potential Implications'
         ws['D6'] = 'Recommended Actions'
 
         for i, anomaly in enumerate(self.result['anomalies'], start=7):
             ws[f'A{i}'] = anomaly['description']
             ws[f'B{i}'] = anomaly['confidence_score']
-            ws[f'C{i}'] = anomaly['implications']
+            ws[f'C{i}'] = anomaly['potential_implications']
             ws[f'D{i}'] = anomaly['recommended_actions']
 
         wb.save(filename)
@@ -101,13 +101,13 @@ if __name__ == "__main__":
             {
                 "description": "Multiple failed login attempts from various IP addresses",
                 "confidence_score": 0.95,
-                "implications": "Possible brute force attack attempt",
+                "potential_implications": "Possible brute force attack attempt",
                 "recommended_actions": "Implement IP-based rate limiting and notify the account owner"
             },
             {
                 "description": "Successful login from an unrecognized IP address after failed attempts",
                 "confidence_score": 0.85,
-                "implications": "Potential account compromise",
+                "potential_implications": "Potential account compromise",
                 "recommended_actions": "Force password reset and enable two-factor authentication"
             }
         ]

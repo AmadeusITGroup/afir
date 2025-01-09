@@ -1,38 +1,42 @@
 import asyncio
-from src.utils.llm_utils import get_llm_response
-from src.utils.error_handling import async_retry_with_backoff
-import logging
 import json
+import logging
+
+from src.utils.error_handling import async_retry_with_backoff
+from src.utils.llm_utils import get_llm_response
 
 logger = logging.getLogger(__name__)
 
+
 class ApiCallGenerator:
-    def __init__(self, llm_config):
+    def __init__(self, config, llm_config):
+        self.config = config
         self.llm_config = llm_config
-        self.prompt_template = """
-        Based on the following incident understanding, generate a list of API calls to retrieve relevant logs:
+        self.prompt_template = """Based on the following incident understanding, generate a list of API calls 
+        containing only a single API call to retrieve relevant logs:
         
         {understanding}
         
-        For each API call, provide:
-        1. The target log source (e.g., "application_logs", "security_logs")
-        2. The query parameters (e.g., time range, filters, search terms)
-        3. Any additional context or justification for this API call
-        
-        Consider various log sources that might be relevant, such as:
-        - Application logs
-        - Security logs
-        - Network traffic logs
-        - Database transaction logs
-        - User activity logs
-        
-        Format the output as a list of JSON objects, each representing an API call.
-        """
+        For the API call, provide only:
+        1. A field target_log_source (choose the type of the logs from this list: {logs_names_list})
+        2. A field officeId, the office ID
+        3. A field userId, the ID of the suspected user ("*" if not available)
+        4. A field date_from, the start date from when to retrieve the logs (in the format yyyy-MM-dd) (a couple of days before the incident)
+        5. A field date_to, the end date up to when to retrieve the logs (in the format yyyy-MM-dd) (a couple of days after the incident)
+
+        Format the output as a list of JSON objects, each representing an API call (even if it will contain just one 
+        API call). Ensure that the generated JSONs are well-formed, properly escaped, and follow the specified 
+        structure without any additional text output. Validate the JSON structure before returning the result."""
 
     @async_retry_with_backoff(max_attempts=3, backoff_in_seconds=1)
     async def generate(self, understanding):
         try:
-            prompt = self.prompt_template.format(understanding=json.dumps(understanding['analysis'], indent=2))
+            log_types = ', '.join(self.config['names_list'])
+
+            prompt = self.prompt_template.format(
+                understanding=json.dumps(understanding['analysis'], indent=2),
+                logs_names_list=log_types
+            )
 
             api_calls_str = await get_llm_response(prompt, self.llm_config)
             api_calls = self.parse_api_calls(api_calls_str)
@@ -54,40 +58,18 @@ class ApiCallGenerator:
             return []
 
     def validate_api_call(self, api_call):
-        required_fields = ['target_log_source', 'query_parameters', 'context']
+        required_fields = ['target_log_source', 'officeId', 'userId', 'date_from', 'date_to']
         for field in required_fields:
             if field not in api_call:
                 logger.warning(f"API call missing required field: {field}")
                 api_call[field] = "Not provided"
         return api_call
 
+
 # Example usage
 async def main():
-    llm_config = {
-        'provider': 'openai',
-        'models': {
-            'default': {
-                'name': 'gpt-4',
-                'api_key': 'your_api_key_here',
-                'max_tokens': 2000,
-                'temperature': 0.7
-            }
-        }
-    }
+    return
 
-    understanding = {
-        'incident_id': 'INC-12345',
-        'analysis': {
-            'summary': 'Multiple failed login attempts followed by a large transaction from a new IP address.',
-            'severity': 8,
-            'key_elements': ['login attempts', 'large transaction', 'new IP address'],
-            'relevant_log_sources': ['authentication logs', 'transaction logs', 'network logs']
-        }
-    }
-
-    api_call_generator = ApiCallGenerator(llm_config)
-    api_calls = await api_call_generator.generate(understanding)
-    print(json.dumps(api_calls, indent=2))
 
 if __name__ == "__main__":
     asyncio.run(main())
