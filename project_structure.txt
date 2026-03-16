@@ -1,7 +1,7 @@
 fraud_investigation_system/
 ├── assets/
 │   ├── company_logo.jfif
-│   ├── fraud_investigation_system.png
+│   ├── BMWE2025_NextGenEU_gef_en_RGB.svg
 ├── src/
 │   ├── __init__.py
 │   ├── main.py
