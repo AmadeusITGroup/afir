@@ -1,0 +1,45 @@
+# =============================================================================
+# PACK TEMPLATE — use_cases/<name>/reporting.yaml — ONE PROCEDURE'S VOCABULARY.
+#
+# THE SCOPED HALF of the reporting mechanism. The pack-root `reporting.yaml` is the
+# domain-wide base; this file overrides it PER SLOT for this use case only, and the
+# root supplies every slot this file omits. So the normal content of this file is
+# SHORT: only the phrases where this procedure's own language differs.
+#
+# WHY THE SCOPE EXISTS: a clause number belongs to ONE procedure. Declared at the
+# pack root, "§4.1.1" is cited in every other use case's report too — authoritative
+# -looking, unverifiable from the engine, and wrong. Declared here it appears only
+# where it applies. That is the whole reason `reporting.yaml` is resolved
+# most-specific-first rather than merged flat.
+#
+# Same rules as the root file: every slot optional, the engine's default is a
+# complete procedure-free sentence, and placeholders substitute with
+# `str.replace` — never `.format`, because procedure prose contains braces.
+#
+# LIVE and deliberately minimal: two slots, to demonstrate the override without
+# putting invented procedure language into a template.
+# =============================================================================
+
+phrases:
+  # OVERRIDES the root's `containment_target`. This is the slot most worth scoping, because it
+  # is where a procedure's own definition of *which* identity to act on lives — and that
+  # definition is frequently counter-intuitive (the identity the alert names need not be the
+  # one the procedure holds responsible). Cite the clause HERE, where it is true.
+  #
+  # {target} — rendered by the engine from the ruleset's `lock_target` role words.
+  containment_target: >
+    CONTAINMENT TARGET (§X.Y — cite the clause that DEFINES which identity is nominated, and
+    state plainly if it is not the one the alert named): {target}
+
+  # OVERRIDES the root's `reconstruction_shape`: the timeline a reviewer of THIS procedure
+  # needs, in the order they think about it — not the order the sources happened to return.
+  #
+  # {subject_label} — the subject entity type as the engine knows it.
+  reconstruction_shape: >
+    For this procedure the chronology a reviewer needs is: creation of each {subject_label}, the
+    activity recorded against it, any review or approval, then the alert firing.
+
+  # Every other slot — containment_action, containment_action_unknown, indicator_driven_fraud,
+  # categorical_exclusion, the two notification headings, narration_concepts, selling_platform,
+  # wider_evidence_framing — is inherited from ../../reporting.yaml. Add one here only when this
+  # procedure genuinely says it differently; a copied slot is a second place to keep in sync.

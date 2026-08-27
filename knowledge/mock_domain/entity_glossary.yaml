@@ -1,0 +1,115 @@
+# =============================================================================
+# MOCK-DOMAIN PACK — entity glossary.
+#
+# Domain: parcel-courier refund fraud. INVENTED. No real company, system, table
+# or field name appears anywhere in this pack; every value is synthetic. It is
+# small on purpose (3 sources, 2 use cases, 8 conditions) and it WORKS — the
+# generic engine tests in tests/test_mock_domain_pack.py run against it, so a
+# change that breaks the pack contract fails a test here rather than in
+# production against a domain pack nobody on the branch can load.
+#
+# This file is pure VOCABULARY: what to recognise in incident text, and
+# candidate field names as a PRIOR for mapping. It holds no query logic and no
+# investigation logic. See ../../docs/knowledge-pack-template/entity_glossary.yaml for the full,
+# commented list of every key this file may carry.
+# =============================================================================
+
+# Abbreviations, injected into the understanding prompt as a CLOSED list. An LLM asked to
+# summarise an incident expands an unfamiliar acronym rather than leaving it alone, and a
+# plausible wrong expansion reads exactly like a right one. Declaring costs one line;
+# detecting the invention afterwards is not possible from the output alone.
+abbreviations:
+  SHP: "Shipment — one parcel movement, identified by a 10-character tracking code"
+  COD: "Cash On Delivery — the recipient pays the courier at handover"
+  POD: "Proof Of Delivery — the signature/scan captured at handover"
+  RTS: "Return To Sender"
+  DEPOT: "A sorting facility; a courier is assigned to exactly one depot per shift"
+
+# `field-name token -> entity type`, used only to LABEL a join key that layer-3 discovery found
+# by comparing value sets. Declared rather than derived from the aliases below (deriving it drops
+# the ambiguous tokens, which are the ones that matter). Values must be types declared under
+# `entities:`.
+field_name_hints:
+  tracking: shipment
+  shipment: shipment
+  parcel: shipment
+  courier: courier
+  depot: depot
+  claim: refund_claim
+  refund: refund_claim
+
+entities:
+  - type: shipment
+    description: >
+      One parcel movement. The subject of a refund-fraud investigation: a refund is
+      claimed against a shipment, so the shipment is what a verdict is rendered for.
+    recognition_hints: >
+      A 10-character code, two uppercase letters then eight digits (e.g. RT48192043).
+      Often written after "tracking", "shipment", "parcel" or "SHP".
+    field_aliases: [tracking_code, shipment_id, parcel_ref]
+    value_pattern: "^[A-Z]{2}[0-9]{8}$"
+    cardinality: one-per-refund-claim
+    examples: [RT48192043, QQ00771265]
+    used_by: [PB-REFUND-001, PB-COURIER-002]
+
+  - type: courier
+    # INVESTIGATION ROLE: the WHO. Evidence attribution tries the pack's `role: actor` types
+    # before its own generic list (`user`, `actor`, `account`, ...), none of which appear in this
+    # domain — without the declaration every event here would be attributed to nobody.
+    role: actor
+    description: >
+      The person who handled the parcel. Named by an EMPLOYEE BADGE, and separately by a
+      HANDHELD DEVICE LOGIN — see value_forms: they identify the same person and are not
+      interchangeable in a query.
+    recognition_hints: >
+      A badge is 4 digits then a letter (0192C); a device login is 6 lowercase letters
+      (jdunne). An alert routinely carries both.
+    field_aliases: [courier_badge, handler_id, device_login]
+    # TWO SURFACE FORMS OF ONE ENTITY TYPE. This is the mechanism that stops a query
+    # binding a badge to the login column and returning zero rows — the form is classified
+    # in the engine from these regexes, stamped on the extracted entity, and each source
+    # binds fields PER FORM (see source_catalog.yaml entity_bindings). Prose could not fix
+    # this: by the time a query is generated both values are typed plain `courier` and the
+    # difference no longer exists in the data. Order most-specific-first; first match wins.
+    value_forms:
+      - name: badge
+        pattern: "^[0-9]{4}[A-Z]$"
+        description: "Employee badge — the HR identifier, on scan and payroll records."
+      - name: device_login
+        pattern: "^[a-z]{6}$"
+        description: "Handheld device login — the identifier on device/session records."
+    value_pattern: "^([0-9]{4}[A-Z]|[a-z]{6})$"
+    cardinality: many-per-depot
+    examples: [0192C, jdunne]
+    used_by: [PB-REFUND-001, PB-COURIER-002]
+
+  - type: depot
+    # INVESTIGATION ROLE: a POPULATION. A depot holds dozens of couriers, so flagging an actor
+    # because they share the alerted depot would make every courier on shift a suspect. UNIONed
+    # with the engine's generic broad set (`organization`, `alert_id`, a time window, ...).
+    role: scope
+    description: >
+      A sorting facility. The scope unit for a burst: the refund detector fires on several
+      claims in ONE depot within a window, so the depot bounds a cohort comparison.
+    recognition_hints: "Three uppercase letters then two digits (LDS04)."
+    field_aliases: [depot_code, facility_id]
+    value_pattern: "^[A-Z]{3}[0-9]{2}$"
+    cardinality: one-per-courier-shift
+    examples: [LDS04, BHM11]
+    used_by: [PB-REFUND-001, PB-COURIER-002]
+
+  - type: refund_claim
+    description: "A refund request raised against a shipment. Carries the amount and reason code."
+    recognition_hints: "'RC-' then six digits (RC-004417)."
+    field_aliases: [claim_id, refund_ref]
+    value_pattern: "^RC-[0-9]{6}$"
+    examples: [RC-004417]
+    used_by: [PB-REFUND-001]
+
+  - type: incident_ref
+    role: scope  # the case handle, not a who — see `depot` above
+    description: "The case-tracking reference for the alert itself. Not a domain fact — the case handle."
+    recognition_hints: "'INC' then eight digits."
+    field_aliases: [incident_id, alert_ref]
+    value_pattern: "^INC[0-9]{8}$"
+    examples: [INC10044219]

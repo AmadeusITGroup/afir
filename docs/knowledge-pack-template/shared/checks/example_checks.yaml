@@ -1,0 +1,70 @@
+# =============================================================================
+# PACK TEMPLATE — shared/checks/<namespace>.yaml — THE IMPORTABLE CHECK LIBRARY.
+#
+# WHY THIS FOLDER EXISTS. A check has two halves that belong to different owners:
+#
+#   MECHANICS  — which `kind` of evaluator, which logical source, which field
+#                paths, what the fact is called. This is a statement about WHERE
+#                A FACT LIVES, so it is a property of the DATA and identical for
+#                every procedure that reads that fact.
+#   WEIGHTING  — `decisive`, `decisive_on`, `polarity`, `exclusion_kind`,
+#                `order`, `report_group`, `gate`. This is one procedure's
+#                JUDGEMENT about what the fact means, and two procedures may
+#                legitimately disagree about it.
+#
+# Copy a check between rulesets and you copy both halves, so the field paths
+# drift apart the first time a column moves and nobody remembers the second copy.
+# Declared here and imported, the mechanics exist once and the importer supplies
+# only its own weighting:
+#
+#     # in use_cases/some_case/rules.yaml
+#     - use: example_checks/example_shared_check
+#       report_group: validation
+#       decisive: true
+#       decisive_on: [fail]
+#
+# THE FILE STEM IS THE NAMESPACE. This file is `example_checks.yaml`, so its keys
+# are addressed `example_checks/<id>`. Namespacing is not decoration: a bare id
+# would collide the moment two subject areas both wanted a check called
+# `velocity`, and the loser would be silently overwritten.
+#
+# THE OVERRIDE IS A ONE-LEVEL MERGE, AND A LIST REPLACES. Re-declaring `fields:`
+# in the importer replaces the library's list rather than extending it — right
+# for a source-specific path, a trap if you meant to add one. `lookup` is the
+# single exception, merged per sub-key, because its `data` and `from_entity` are
+# two independent facts.
+#
+# AN UNRESOLVABLE `use:` IS FATAL AT LOAD, on purpose and eagerly over every
+# ruleset in the pack — not lazily when a run happens to select one. A silently
+# dropped condition is a check that was never evaluated, and a report cannot tell
+# that apart from a check whose source returned no rows. A pack loads once at
+# startup, so a misspelled import must be a startup failure.
+#
+# WHAT TO PUT HERE vs LEAVE IN A RULESET: promote a check the moment a SECOND
+# procedure would ask the same question of the same data. One-off checks are fine
+# inline — this library is not a style rule, it is a de-duplication mechanism.
+# =============================================================================
+
+# A neutral example, live so tests/test_pack_template.py can prove the library
+# loads and this key is addressable as `example_checks/example_shared_check`.
+#
+# Note what is and is NOT here: no `decisive`, no `polarity`, no `report_group`,
+# no `order`. Declaring those would hand every importer one procedure's opinion
+# and quietly make the library the place weighting decisions get made.
+example_shared_check:
+  kind: field_flag
+  source: record
+  flag_fields: [example_review_flag]
+  expected: false
+  # THE REQUIREMENT, not the finding — the engine assembles the printed note from the
+  # `*_detail` keys below, because for an exclusion a FAIL negates this sentence.
+  label: "Record was not manually reviewed"
+  # NEUTRAL wording, stated as what was OBSERVED rather than as what it implies. An importer
+  # re-weighting this check as a fraud indicator inverts which way a FAIL argues, but not what
+  # the FAIL saw — so an observation-phrased note stays correct under both weightings and a
+  # conclusion-phrased one ("the claim is fraudulent") does not.
+  pass_detail: "no manual review is recorded against this record"
+  fail_detail: "a manual review is recorded against this record"
+  unknown_detail: >
+    the manual-review flag was not returned, so a reviewed record cannot be distinguished
+    from an unreviewed one

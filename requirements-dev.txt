@@ -1,0 +1,30 @@
+# DEVELOPMENT dependencies: the runtime set plus what it takes to test and format.
+#
+#     pip install -r requirements-dev.txt
+#
+# Split out because `requirements.txt` is what a Databricks App container installs on
+# every start, and the platform reads that filename with no override — so a test-only
+# package left in it is a package built on the deployment's critical path.
+-r requirements.txt
+
+# The suite
+pytest~=8.2.2
+pytest-asyncio
+pytest-cov
+
+# Formatting and linting. Never run repo-wide: there is no setup.cfg/pyproject, so flake8
+# defaults to 79 columns against black's 88 and reports ~13.6k pre-existing findings. See
+# the top of CLAUDE.md.
+black
+flake8
+isort
+
+# The local embedding provider. Not a runtime dependency (the default provider is a
+# serving endpoint), but the suite covers that provider and an air-gapped deployment
+# needs it — so it is installed here and the tests exercise it against the HF cache.
+sentence-transformers>=2.7,<3.0
+torch>=2.3,<3.0
+
+# Notebooks, for probe scripts and ad-hoc analysis
+ipython
+jupyter

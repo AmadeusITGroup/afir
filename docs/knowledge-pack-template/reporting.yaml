@@ -1,0 +1,136 @@
+# =============================================================================
+# PACK TEMPLATE — reporting.yaml — THE REPORT'S VOCABULARY.
+#
+# WHY THIS FILE EXISTS AT ALL. A procedure's own language — its clause numbers,
+# its phase names, its term for the identity it recommends action against — is a
+# fact about that PROCEDURE, not about reporting. Left inline in
+# `src/report_generation.py` it mis-cites every other use case's report, and a
+# clause number is the worst kind of leak: it reads as authoritative and cannot be
+# checked from the engine.
+#
+# EVERYTHING HERE IS OPTIONAL. For every slot the engine writes a complete,
+# procedure-free sentence and asks the pack whether the domain has a better one.
+# A pack shipping no `reporting.yaml` still produces a correct report — just a less
+# procedure-specific one. That is the property that lets a new domain start with
+# nothing here and fill slots in as its language settles.
+#
+# TWO SCOPES, AND THE CHOICE MATTERS:
+#   this file (pack root)                 — the DOMAIN-WIDE base. Right for language
+#                                           every procedure in the domain shares.
+#   use_cases/<name>/reporting.yaml       — ONE procedure's language. Wins per slot.
+# A clause number belongs in the SECOND. Hoisting one procedure's "§4.1.1" to the
+# root cites it in every other use case's report, which is exactly the defect
+# moving these strings out of `src/` was meant to fix. Resolution is
+# most-specific-first, per slot — so a use case may override one phrase and
+# inherit the rest.
+#
+# PLACEHOLDERS SUBSTITUTE WITH `str.replace`, NEVER `.format`. Procedure prose
+# contains braces (clause references, JSON fragments, field templates) and a
+# `.format` call on it raises. Only the placeholders documented per slot below are
+# filled; an unknown one is left in the text verbatim, which is visible in the
+# artifact and therefore self-correcting.
+#
+# THIS FILE IS LIVE and its values are deliberately GENERIC, so a template-derived
+# pack reads correctly before anybody edits it.
+# =============================================================================
+
+# ---- CHRONOLOGY PHASE LABELS -------------------------------------------------
+# How one chronology event is classified into an incident phase.
+#
+# CHECKED IN ORDER, FIRST HIT WINS, matched against "<source> <action>" lower-cased. So the
+# ORDERING IS A DOMAIN JUDGEMENT, not a cosmetic list: an event in a source whose NAME contains
+# "alert" but whose action is the thing under investigation must be classified by the action,
+# which means the specific rule goes ABOVE the source-name rule. Get this backwards and the
+# report's timeline puts the incident's core event under "Alert and detection".
+#
+# An entry with no keywords or no label can never match anything and is dropped silently
+# (rendering an empty header would be worse than omitting it).
+phases:
+  - keywords: [example_action, example_event]
+    label: "Example subject activity"
+  - keywords: [session, login, device]
+    label: "Session and device activity"
+  - keywords: [alert, detector, notification]
+    label: "Alert and detection"
+
+# ---- WORDING FOR NAMED REPORT SLOTS -----------------------------------------
+# Eleven slots exist. Declare only the ones whose engine default is wrong for your domain;
+# each is shown here with its placeholders and the failure its default guards against.
+phrases:
+
+  # {target} — already rendered by the engine as "<scope-label>=<x> <identity-label>=<y>",
+  # using the role words the ruleset's `lock_target` declared.
+  #
+  # THE SLOT MOST WORTH DECLARING, because it names a real person or account for action and it
+  # is where a reader's assumption is most likely to be wrong. If the identity to act on is not
+  # the one the alert named, SAY SO HERE — that single sentence is the difference between
+  # containing the actor and containing a bystander.
+  containment_target: "CONTAINMENT TARGET: {target}"
+
+  # {action} — the verb resolved from `lock_target.actions` for the detected platform/class.
+  containment_action: "ACTION: {action}"
+
+  # No placeholders. Emitted when the action set could NOT be determined.
+  #
+  # There is deliberately NO DEFAULT ACTION anywhere in the engine: two platforms' action sets
+  # are rarely interchangeable, so a guessed verb is an operational error rather than a
+  # cosmetic one. This sentence's job is to make the gap explicit and hand the choice to a
+  # human, instead of letting a plausible-looking default be executed.
+  containment_action_unknown: >
+    ACTION: NOT DETERMINED — the platform could not be established, and the available action
+    sets are not interchangeable. A human must select the action set.
+
+  # {names} — the labels of the indicators that fired.
+  #
+  # Says the verdict rests on POSITIVE evidence rather than on a failed exclusion, and states
+  # who must confirm before anything irreversible happens. Worth being explicit about the
+  # confirmation step: an indicator-driven positive is the shape most likely to be atypical,
+  # which is precisely when a human should look before an account is suspended.
+  indicator_driven_fraud: >
+    POSITIVE INDICATOR(S) — this verdict rests on positive evidence: {names}. A HUMAN MUST
+    CONFIRM before any irreversible action.
+
+  # {detail} — the engine's own note for the exclusion that settled the case.
+  #
+  # A CATEGORICAL exclusion rests on an ATTRIBUTED FACT (who acted, and when) and cannot be
+  # outvoted by indicators — once such a fact is on the record the indicators lose their
+  # MEANING, not merely their weight. Labelling it as categorical in the report is what stops a
+  # reader re-litigating a settled case against the indicator table sitting below it.
+  categorical_exclusion: "EXCLUSION, CATEGORICAL — {detail}"
+
+  # No placeholders. AFIR DRAFTS; AFIR NEVER SENDS. Both headings exist so that is unmissable
+  # on the artifact itself, not only in the documentation.
+  notification_draft_heading: "Draft notification — NOT SENT by AFIR; for human review"
+  notification_closure_heading: >
+    Draft case-closure note — NOT SENT by AFIR; no action is recommended
+
+  # No placeholders. Injected into the NARRATION PROMPT so the LLM cites the domain's concepts
+  # by their real names instead of inventing an expansion for an abbreviation it half-recognises.
+  # Pair it with the CLOSED `abbreviations:` map in entity_glossary.yaml, which forbids guessing:
+  # the two together are a vocabulary plus a prohibition, and the prohibition is the load-bearing
+  # half.
+  narration_concepts: >
+    Where it clarifies WHY a condition passed or failed, cite the concept by its knowledge-base
+    name. Do not expand an abbreviation that is not in the glossary.
+
+  # {subject_label} — the subject entity type as the engine knows it.
+  #
+  # The chronology a reviewer of THIS procedure needs, in order. Declaring it is how a report
+  # reconstructs the incident the way the procedure's readers think about it, rather than in
+  # whatever order the sources happened to return.
+  reconstruction_shape: >
+    For this procedure the chronology a reviewer needs is: creation of each {subject_label} (by
+    WHICH unit and identity), then the activity recorded against it, then the alert firing.
+
+  # {platform} — the detected platform/class value.
+  selling_platform: "Platform: {platform}"
+
+  # No placeholders. Frames the wider sweep that looks beyond the assets the alert named.
+  #
+  # THE FRAMING IS THE POINT: the sweep exists to make the evidence base COMPLETE, so further
+  # activity by the same identity is not itself an anomaly. Without this sentence a reader reads
+  # the sweep's row count as a finding, and a busy legitimate actor looks like a prolific one.
+  wider_evidence_framing: >
+    This is EVIDENCE GATHERING, not a finding. The sweep widens the search beyond the assets
+    the alert named, for the same acting identity, so that the evidence base is complete;
+    further activity by the same identity is not itself an anomaly.

@@ -1,0 +1,381 @@
+# =============================================================================
+# MOCK-DOMAIN PACK — refund-fraud verdict ruleset.
+#
+# INVENTED domain (parcel-courier refund fraud). Read this file to see how a
+# procedure is encoded as data, and ../../../../docs/knowledge-pack-template/use_cases/example_use_case/rules.yaml
+# for the fully commented list of every available key and condition kind.
+#
+# THE ENGINE HOLDS NO PROCEDURE. src/correlation.py dispatches on the generic
+# `kind` values below and rolls up by `polarity` / `decisive` / `exclusion_kind`.
+# Delete this file and the verdict stage simply produces no verdict; write a
+# different one and the same engine adjudicates a different domain.
+#
+# THE STORY THIS RULESET ENCODES: a refund claim is fraudulent when a BARE
+# shipment — no insurance, no signature requirement, no scan chain — is refunded
+# without a human review, by the courier who supposedly carried it, on a route
+# the depot serves. Each of those has a check below. `decisive: true` means a
+# FAIL alone settles the outcome.
+# =============================================================================
+
+verdicts:
+  refund_fraud:
+    label_scheme: refund_fraud
+    # One verdict is rendered per value of this entity type.
+    subject_entity: shipment
+
+    # WHERE THE SUBJECTS ARE WHEN THE INCIDENT NAMED NONE. Subjects normally come from the
+    # entities the understanding stage extracted, and that stage runs BEFORE retrieval — so an
+    # alert whose handle carries only a claim reference yields no subject at all, and the
+    # engine adjudicates one degenerate subject over every retrieved row. Every check that has
+    # to know WHICH record is being judged then reads `unknown`, which prints as INSUFFICIENT
+    # DATA under a run whose every stage succeeded. The identities were in the rows.
+    #
+    # This declaration is consulted ONLY in that case: where the incident did name a shipment,
+    # that naming stays authoritative and this is inert. It is what makes the alert document
+    # readable as a LIST of subjects rather than as one thing.
+    #
+    # `path` NAMES THE REPEATED NODE AND THE GROUPING IS PER ELEMENT, which is the whole
+    # reason `entities:` is here rather than being read off the row. One alert carries several
+    # claim lines, each with its own handler; read off the row, every shipment would be
+    # adjudicated against every handler in the alert, and a reference lookup belonging to one
+    # line would answer another line's question. Each subject is given the values from ITS OWN
+    # element or none at all.
+    subject_discovery:
+      source: alert
+      path: alert.claim_lines
+      # A candidate LIST: the first path that resolves wins, so one logical field arriving
+      # under two spellings is a spelling choice and not a doubled subject.
+      subject: [shipment_code]
+      entities:
+        courier: [handler_badge]
+
+    # The engine emits these strings verbatim. `out_of_scope` is not a fifth verdict: the
+    # scope gate is answered BEFORE the procedure applies, so it is the engine declining to
+    # adjudicate rather than a finding about the shipment. Spelling it out matters — without
+    # it an out-of-scope shipment fails an ordinary exclusion and is reported as an
+    # adjudicated NOT FRAUD, which claims the case was examined and cleared.
+    labels:
+      fraud: "REFUND FRAUD"
+      false_positive: "NOT FRAUD"
+      insufficient: "INSUFFICIENT DATA"
+      out_of_scope: "OUT OF SCOPE — PROCEDURE DOES NOT APPLY"
+
+    # What actually makes this an alert, recorded so the report states the real trigger
+    # rather than inferring one from whichever field looked suspicious.
+    trigger:
+      description: >
+        The detector fires on a BURST OF REFUNDS: at least 3 refund claims raised within 24
+        hours in a single depot. It is not amount-based — a large refund alone is not a
+        trigger, and a small one is not exculpatory.
+      min_assets: 3
+      window: "24h"
+      scope: depot
+
+    # Logical name -> the real source (a `source_catalog.yaml` name). Conditions reference
+    # the logical names, so the ruleset stays readable and one source swap is one line here.
+    #
+    # THIS MAP IS A HARD DATA DEPENDENCY: every source listed is retrieved on every run of
+    # this playbook. That is the right mechanism for a source some condition READS — an
+    # unevaluable condition is not the planner's call. For a source whose relevance is
+    # incident-dependent, use `selection_guidance` in the catalog instead and leave the
+    # decision with the planner. The two are not interchangeable.
+    sources:
+      ledger: shipment_ledger
+      sessions: device_sessions
+      alert: refund_alerts
+
+    # ---- §1 THE ALERT IS AUTHORITATIVE ------------------------------------------
+    # The one input the pipeline did not derive: the detector emitted it with this
+    # incident's values already in it. So a fact the alert STATES is ground truth to be
+    # REPRODUCED, and a divergence is a finding (wrong record selected, stale index),
+    # never a reason to quietly prefer the logs.
+    alert_record:
+      source: alert
+      label_fields: [alert.incident_id]
+      identify:
+        - from_entity: incident_ref
+          fields: [alert.incident_id]
+        # `required`: two refund alerts in one window are two different incidents and the
+        # depot is what separates them. An alert for another depot must never be selected as
+        # this incident's, however well the rest matches.
+        - from_entity: depot
+          fields: [alert.depot_code]
+          required: true
+      declares:
+        - field: depot
+          from_entity: depot
+          fields: [alert.depot_code]
+          confirm_in: [ledger]
+          confirm_fields: [depot_code]
+        - field: courier
+          from_entity: courier
+          fields: [alert.courier_badge, alert.device_login]
+          confirm_in: [ledger, sessions]
+          confirm_fields: [handler.badge, handler.device_login, badge, login]
+        # EVERY shipment the alert names. Listing one "primary" shipment is how the rest of
+        # the impact goes unstated.
+        - field: shipment
+          from_entity: shipment
+          fields: [alert.claimed_shipments]
+          confirm_in: [ledger]
+          confirm_fields: [tracking_code]
+
+    # ---- REPORTING GROUPS -------------------------------------------------------
+    # PRESENTATIONAL ONLY — a group decides which table a check prints in. `decisive`,
+    # `polarity` and `exclusion_kind` decide what it MEANS. Printed flat, a scope gate and
+    # an exculpatory hint read as equally mandatory validation steps.
+    condition_groups:
+      - id: scope_gate
+        title: "Scope — does this procedure apply?"
+        note: "Answered first. A FAIL exits the case; the remaining checks are not weighed."
+      - id: validation
+        title: "Mandatory validation"
+      - id: fraud_indicators
+        title: "Positive fraud indicators"
+
+    # Non-decisive indicator FAILs needed to corroborate fraud on their own.
+    indicator_threshold: 2
+
+    conditions:
+
+      # ---- SCOPE GATE ---------------------------------------------------------
+      # Asked FIRST, and it is a different question from whether the shipment is
+      # fraudulent: it asks whether this procedure has an opinion at all. A gate FAIL
+      # therefore exits with `out_of_scope`, not with an adjudicated NOT FRAUD.
+      - id: served_route
+        kind: route_membership
+        source: ledger
+        point_fields: [route.origin, route.destination]
+        # THE SHAPE OF THIS DOMAIN'S SCOPE POINT. The engine's default is a bare 3-letter
+        # location code (`^[A-Z]{3}$`) — the shape used by the domain route_membership was
+        # first written for — and it is used to recognise a point in a WHOLE-ROW scan, which
+        # is what makes the check work when a nested route scatters the codes under paths a
+        # ruleset cannot name in advance.
+        # A depot code is five characters, so without this the scan recognises nothing and the
+        # gate reports `unknown`. That is the expensive direction of wrong: the gate is
+        # answered FIRST, so an unrecognised code shape suppresses the jurisdiction question
+        # for the entire procedure rather than failing one row of a table.
+        point_pattern: "^[A-Z]{3}[0-9]{2}$"
+        label: "Shipment moved on a depot-served route"
+        # THE GATE'S OWN WORDING. The engine's fallbacks state only the arithmetic it
+        # performed ("both endpoints of an in-scope pair are present") — correct for any
+        # domain and therefore specific to none, which on a gate is the wrong trade: it is the
+        # first line of the report and it says whether the rest of the table means anything.
+        # Every note the engine prints can be replaced this way; a check that declares none
+        # still reads truthfully, just plainly.
+        pass_detail: "the shipment moved between two points the depot network serves"
+        fail_detail: >
+          neither endpoint pair is served by this depot network — the shipment is outside
+          what this procedure adjudicates
+        unknown_detail: >
+          no depot-shaped point code was found in the retrieved rows, so jurisdiction cannot
+          be established either way
+        report_group: scope_gate
+        gate: scope
+        order: 10
+
+      # ---- MANDATORY VALIDATION ------------------------------------------------
+      # IMPORTED MECHANICS, LOCAL WEIGHTING. The field paths live once in
+      # ../../shared/checks/shipment_elements.yaml; what a FAIL means here is this
+      # procedure's judgement. The courier-collusion ruleset imports the same checks and
+      # weighs two of them differently — neither restates a path.
+
+      - use: shipment_elements/manually_reviewed
+        report_group: validation
+        # A reviewed refund was adjudicated by a person, so a FAIL settles the case.
+        decisive: true
+        # ASYMMETRIC. `decisive: true` alone would also make an `unknown` force INSUFFICIENT
+        # DATA — wrong for a check whose FAIL is conclusive but whose absence of evidence is
+        # ordinary. `decisive_on` names the results the flag applies to.
+        decisive_on: [fail]
+        # CATEGORICAL, not heuristic: an approver's name and date is an ATTRIBUTED FACT about
+        # who acted, and once such a fact is on the record the behavioural indicators lose
+        # their MEANING rather than their weight. A heuristic exclusion (an inference about
+        # the shipment's shape) can rightly be outvoted by indicators; this cannot.
+        exclusion_kind: categorical
+        order: 20
+        fail_detail: "the refund was manually reviewed and approved by a named person"
+
+      - use: shipment_elements/no_servicing_elements
+        report_group: validation
+        # Decisive, but HEURISTIC — an inference about the shipment's shape, not an
+        # attributed action. Positive indicators may rightly outweigh it.
+        decisive: true
+        decisive_on: [fail]
+        order: 30
+
+      - use: shipment_elements/signature_captured
+        report_group: validation
+        decisive: false
+        order: 40
+
+      # A LOCAL condition: nothing else asks it, so it is not worth a library entry. Mixing
+      # imported and local conditions in one list is normal and needs no marker.
+      - id: refund_within_window
+        kind: time_gap
+        source: ledger
+        start:
+          source: ledger
+          field: created_at
+        end:
+          source: ledger
+          field: refund.claimed_at
+        max: "24h"
+        label: "Refund claimed within 24h of shipment creation"
+        # `time_gap` measures an interval and cannot know what either side IS, so the engine's
+        # fallbacks state the arithmetic only ("the two events are 7:00:00 apart, within 24h").
+        # Naming the two events is the ruleset's job, because it is the ruleset that chose them.
+        pass_detail: "the refund was claimed within a day of the shipment being created"
+        fail_detail: "the refund was claimed more than a day after the shipment was created"
+        unknown_detail: >
+          either the creation or the claim timestamp is missing, so the interval cannot be
+          measured
+        report_group: validation
+        decisive: false
+        order: 50
+
+      # ---- POSITIVE FRAUD INDICATORS ------------------------------------------
+      # `polarity: fraud_indicator` INVERTS the reading: a FAIL is positive evidence OF
+      # fraud, not an argument against it. Without this the engine can only ever reach
+      # FALSE POSITIVE or the textbook-fingerprint path — a non-textbook fraud (elements
+      # present, gap > 24h) would be unreachable.
+      #
+      # Note that an indicator's `label` already states its finding, so a FAIL affirms it
+      # and the report prints it unchanged. An exclusion's label states its REQUIREMENT, so
+      # a FAIL negates it and the note comes from `fail_detail`. The asymmetry is the
+      # condition's polarity, not an inconsistency.
+
+      - use: shipment_elements/single_handler
+        report_group: fraud_indicators
+        polarity: fraud_indicator
+        decisive: false
+        order: 60
+
+      - id: refund_reason_is_generic
+        kind: value_matches_pattern
+        source: ledger
+        fields: [refund.reason_code]
+        # `allowed`: a value NOT on the list is the suspicious one.
+        match_mode: allowed
+        patterns: ["^(DAMAGE|LOST|RTS|DELAY)$"]
+        expected: "a specific, documented refund reason"
+        label: "Refund reason code is non-specific"
+        report_group: fraud_indicators
+        polarity: fraud_indicator
+        decisive: false
+        order: 70
+        fail_detail: "refund reason is outside the documented vocabulary"
+
+      - id: refund_burst
+        kind: velocity_count
+        source: ledger
+        subject_field: tracking_code
+        actor_field: handler.badge
+        max: 2
+        label: "Burst of refunds by one courier"
+        report_group: fraud_indicators
+        polarity: fraud_indicator
+        decisive: false
+        order: 80
+        fail_detail: "one courier claimed refunds on several shipments in the window"
+
+    # ---- The scope gate's own reference data -------------------------------------
+    # ORIGIN-DESTINATION pairs the depot network serves, read by `served_route` above. A
+    # shipment is in scope when its point set contains BOTH endpoints of any pair
+    # (direction-agnostic — a return leg counts). Declaring no routes at all is not the same
+    # as declaring every route: the gate then finds no pair to match and FAILS, taking every
+    # case out of scope, so a ruleset with a `gate: scope` condition must supply this list.
+    routes:
+      - [LDS04, BHM11]
+      - [LDS04, GLA07]
+      - [BHM11, BRS02]
+
+    # ---- What the report says about impact --------------------------------------
+    asset_notes:
+      source: ledger
+      asset_label: shipment
+      # The plural noun for the "multiple acting X" note. The COUNT rides under the engine's
+      # own stable `asset_count=` key with `asset_label=` beside it, so renaming this noun
+      # cannot make a consumer lose the line.
+      actor_label: couriers
+      asset_id_fields: [tracking_code]
+      actor_fields: [handling_courier]
+
+    # ---- The case builder's own inputs ------------------------------------------
+    case_builder:
+      # Concept docs injected into the InvestigationBrief so the report narrates from the
+      # domain's own definitions instead of from the verdict label alone.
+      #
+      # SHARED AND SPECIFIC IDS SIT IN ONE FLAT LIST. `concepts_for` unions this use case's
+      # own concepts with every untagged shared concept, the specific one winning on an id
+      # collision — so a shared id is nameable here exactly like a local one, and no author
+      # has to know which folder a concept lives in. RAG retrieval is separate and wider: it
+      # can surface any shared concept by similarity without it being listed here.
+      concepts:
+        - shipment_elements          # shared/concepts/
+        - actor_identity_forms       # shared/concepts/
+        - bare_shipment_is_suspicious  # this use case's own
+      expected_joins: [join_shipment, join_courier]
+
+      # THE ENGINE PICKS THE BRANCH; THE PACK SUPPLIES THE PROSE.
+      #
+      # `derive_action_backbone` decides WHICH next step a verdict earns — contain, close,
+      # preserve, insufficient, and the three scope outcomes. It used to f-string the
+      # WORDING too, in one domain's vocabulary, which every other domain then rendered
+      # verbatim. So the engine now keeps only neutral defaults (`_ACTION_TEMPLATES` in
+      # `src/usecases/base.py`) and any pack may override each one by key.
+      #
+      # Only the keys a domain actually phrases differently need declaring — an omitted key
+      # falls back to the neutral default, so this is a partial override, not a full set.
+      # `{placeholders}` are filled by the engine; an unknown one is left literal rather
+      # than raising, because a template typo must not fail the report.
+      action_templates:
+        subject_label: "shipment {subject}"
+        target_fallback: "(claim raiser)"
+        contain: "{subject_label}: {verb} Target: {target} — the CLAIM RAISER, not the handling courier."
+        preserve: "{subject_label}: raise a claims-review case and preserve device session + refund evidence."
+        close: "{subject_label}: CLOSE the claim as {fp_label}{reason}. No hold required."
+        insufficient: "{subject_label}: pull the full scan chain + refund ledger for the window{gap} and re-run before deciding."
+        scope_wider: "{subject_label}: SCOPE IS WIDER THAN THE ALERT — the courier-scoped sweep also returned {subjects}."
+        scope_wider_actionable: "Treat these as in-scope: check each one's refund and HOLD any unsettled payout before closing."
+        scope_wider_no_document: "The sweep also returned {count} shipment(s) by the same courier with no refund raised in the window ({subjects}) — review them, but there is no payout to hold."
+        scope_wider_none_with_asset: "no further shipment holding a refund"
+        scope_clean: "{subject_label}: the courier-scoped sweep ran and found no shipment beyond those already in the alert — the impact scope is bounded as reported."
+        scope_not_run: "{subject_label}: the scope sweep did NOT run ({status}), so this courier's wider impact is UNKNOWN, not clean. Sweep the courier over a MULTI-DAY window (not the alert day alone) before closing."
+
+      # A decisive check reading a leaf the projection dropped returns `unknown`, which is
+      # indistinguishable from "the elements really are absent". So the analyzer verifies
+      # that the leaves the decisive checks depend on actually ARRIVED.
+      projection_guard:
+        source: ledger
+        probe_paths:
+          - path: element_counters.INS
+            note: >
+              element_counters.INS missing from the returned rows — the projection did not
+              surface the element counters, so the bare-shipment check may be UNKNOWN for a
+              data reason rather than because the elements are absent.
+          - path: refund.manually_reviewed
+            note: >
+              refund.manually_reviewed missing from the returned rows — the review exclusion
+              is UNKNOWN for a data reason. It is decisive-on-fail and exculpatory, so this
+              gap can only make a case read as LESS explained than it is.
+        empty_note: >
+          No rows returned for the ledger source ({source}); every verdict condition over
+          the shipment is UNKNOWN.
+
+    notification:
+      subject: "[REFUND] Refund-fraud review — {verdict} — shipment {subject} / depot {lock_scope}"
+      distribution:
+        - "Depot operations manager"
+        - "Claims adjudication team"
+      template: |
+        To: {distribution}
+
+        A refund-fraud alert has been reviewed against the reference refund procedure.
+        Outcome for shipment {subject}: {verdict}.
+
+        Shipments impacted: {asset_count}
+        Handling couriers observed: {actors}
+
+        Condition summary:
+        {condition_summary}

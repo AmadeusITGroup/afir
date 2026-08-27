@@ -1,0 +1,84 @@
+# =============================================================================
+# MOCK-DOMAIN PACK — report vocabulary for the refund_fraud use case.
+#
+# WHY THIS FILE EXISTS AT ALL. A procedure's own language — its clause numbers,
+# its phase names, the words it uses for its own concepts — is a fact about that
+# procedure, not about reporting. Left inline in src/report_generation.py it
+# mis-cites every OTHER use case's report, and a clause number is the worst kind
+# of leak: it reads as authoritative and cannot be checked from the engine.
+#
+# EVERYTHING HERE IS OPTIONAL. The engine writes a complete, procedure-free
+# sentence for each slot and asks the pack whether the domain has a better one.
+# A pack shipping no reporting.yaml still produces a correct report.
+#
+# Placeholders substitute with `str.replace`, NEVER `.format` — procedure prose
+# contains braces and a `.format` call on it raises.
+# =============================================================================
+
+# ---- Chronology phase labels ------------------------------------------------
+# How one chronology event is classified into an incident phase. Checked IN ORDER, first hit
+# wins, matched against "<source> <action>" lower-cased — so the more specific rule goes
+# first. The ordering is a domain judgement: a refund event in `refund_alerts` must read as
+# the refund phase, not as "Alert and detection" because the source name contains "alert".
+phases:
+  - keywords: [refund, claim, reimburse]
+    label: "Refund claim activity"
+  - keywords: [pod, signature, handover, delivered]
+    label: "Delivery and proof of delivery"
+  - keywords: [scan, depot, sort, transit]
+    label: "Shipment movement"
+  - keywords: [session, signin, device, login]
+    label: "Device session activity"
+  - keywords: [alert, detector, notification]
+    label: "Alert and detection"
+
+# ---- Procedure wording for named report slots -------------------------------
+phrases:
+  # Placeholders: {target} — already rendered by the engine as "depot=<x> courier=<y>".
+  # The point most often got wrong by a reader skimming the alert: the alert names the
+  # CLAIMING courier, and the identity to suspend is the HANDLING one on the ledger, which
+  # need not be the same person.
+  containment_target: >
+    CONTAINMENT TARGET — the HANDLING courier on the ledger, not the claimant named in the
+    alert: {target}
+
+  # Placeholders: {action}.
+  containment_action: "ACTION: {action}"
+
+  # No placeholders. Emitted when the action set cannot be determined. There is deliberately
+  # no default: suspending a badge and revoking a device login are not interchangeable, so a
+  # guess here is an operational error rather than a cosmetic one.
+  containment_action_unknown: >
+    ACTION: NOT DETERMINED — the courier's employment status is unknown, and badge
+    suspension and device-login revocation are not interchangeable. A human must select the
+    action set.
+
+  # Placeholders: {names} — the indicator labels that fired.
+  indicator_driven_fraud: >
+    POSITIVE FRAUD INDICATOR(S) — this verdict rests on positive evidence of fraud:
+    {names}. A CLAIMS ADJUDICATOR MUST CONFIRM before any suspension; pull the depot's full
+    refund ledger for other claims by the same courier.
+
+  # Placeholders: {detail} — the engine's categorical-exclusion note.
+  categorical_exclusion: "EXCLUSION, CATEGORICAL — {detail}"
+
+  # No placeholders. AFIR drafts; AFIR never sends.
+  notification_draft_heading: >
+    Draft notification — NOT SENT by AFIR; for human review
+  notification_closure_heading: >
+    Draft case-closure note — NOT SENT by AFIR; no suspension is recommended
+
+  # No placeholders. Injected into the narration prompt so the LLM cites the domain's
+  # concepts by their real names instead of inventing an expansion. Paired with the closed
+  # `abbreviations:` list in entity_glossary.yaml, which forbids guessing.
+  narration_concepts: >
+    Where it clarifies WHY a condition passed or failed, cite the concept by its
+    knowledge-base name: bare shipment, servicing element, proof of delivery (POD), manual
+    review, automated depot-terminal session, refund reason code.
+
+  # Placeholders: {subject_label} — the subject entity type as the engine knows it.
+  reconstruction_shape: >
+    For this procedure the chronology a reviewer needs is: creation of each {subject_label}
+    (by WHICH depot and courier), then its scan chain, then the proof-of-delivery capture (by
+    WHICH courier, and whether that is the handler), then the refund claim and any review,
+    then the alert firing.

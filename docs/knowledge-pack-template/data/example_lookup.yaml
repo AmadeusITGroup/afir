@@ -1,0 +1,48 @@
+# =============================================================================
+# PACK TEMPLATE — data/<name>.yaml — A REFERENCE LOOKUP TABLE.
+#
+# WHAT THIS FOLDER IS. Every `*.yaml` under a `data/` folder is loaded as one
+# entry of `pack_data`, KEYED BY THE FILE STEM. So this file is reachable as
+# `pack_data['example_lookup']` and a condition names it by that stem:
+#
+#     kind: value_mismatch
+#     lookup:
+#       data: example_lookup
+#       from_entity: example_entity
+#
+# WHAT BELONGS HERE: a closed mapping the procedure needs in order to say two
+# values DISAGREE — code to category, prefix to owner, unit to region. Facts that
+# are stable, small, and not worth a query.
+#
+# WHAT DOES NOT: anything large (query it), anything volatile (it will be stale
+# and nobody will notice, because a stale lookup produces a confident wrong
+# finding rather than an error), and anything derivable from a source you already
+# retrieve.
+#
+# WHERE TO PUT IT — pack root vs `use_cases/<name>/data/`. Mechanically it makes
+# NO difference to reachability: the loader flattens the pack-root `data/` and
+# every `use_cases/*/data/` into ONE global dict (use_cases win on a name
+# collision), so a table under one use case is already globally addressable.
+# Choose on MEANING, therefore, and not on access:
+#   - pack root      — the mapping is a fact about the DATA's vocabulary, true for
+#                      every procedure that reads the code.
+#   - under a use case — the mapping encodes one procedure's own categories.
+# Put it where the next author will look for it. Note the flattening also means
+# two `data/` files with the same stem silently shadow one another: keep stems
+# unique across the whole pack.
+#
+# OMISSION IS THE SAFE FAILURE. An absent key yields `unknown` for the lookup,
+# which the report prints as unanswered. A WRONG key invents a finding on a
+# legitimate record. When unsure about an entry, leave it out.
+#
+# The map may be nested under a `map:` key (as here) or written as a bare
+# top-level mapping — the engine accepts both.
+# =============================================================================
+
+map:
+  EXAMPLE_CODE_A: category_one
+  EXAMPLE_CODE_B: category_one
+  EXAMPLE_CODE_C: category_two
+  # Deliberately absent: every code outside this list. Say so explicitly — a reader cannot
+  # otherwise tell an intentionally closed list from an incomplete one, and the two call for
+  # opposite actions when an unmapped code shows up.

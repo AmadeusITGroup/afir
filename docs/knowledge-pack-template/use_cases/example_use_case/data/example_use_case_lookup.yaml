@@ -1,0 +1,30 @@
+# =============================================================================
+# PACK TEMPLATE — use_cases/<name>/data/*.yaml — A USE-CASE-SCOPED LOOKUP.
+#
+# THE SAME MECHANISM as the pack-root `data/` folder (see ../../../data/
+# example_lookup.yaml for the full documentation): every `*.yaml` becomes one entry
+# of `pack_data`, keyed by the FILE STEM, and a condition names it by that stem.
+#
+# AND MECHANICALLY THE SCOPE IS AN ILLUSION — worth stating plainly, because the
+# folder layout implies otherwise. The loader FLATTENS the pack-root `data/` and
+# every `use_cases/*/data/` into ONE GLOBAL DICT (use_cases win on a name
+# collision), so this table is already addressable from any ruleset in the pack.
+# Two consequences:
+#
+#   1. THE LOCATION IS DOCUMENTATION, NOT ACCESS CONTROL. Choose it on MEANING —
+#      root when the mapping is a fact about the data's vocabulary, here when it
+#      encodes THIS procedure's own categories. Put it where the next author will
+#      look for it, since reachability will not stop them.
+#   2. STEMS MUST BE UNIQUE ACROSS THE WHOLE PACK. Two files sharing a stem
+#      silently shadow one another with no warning — hence the redundant-looking
+#      `example_use_case_` prefix on this filename. Prefixing a scoped table with
+#      its use case is the cheap way to guarantee it.
+#
+# Omission remains the safe failure: an absent key yields `unknown` (printed as
+# unanswered), a WRONG key invents a finding on a legitimate record.
+# =============================================================================
+
+map:
+  EXAMPLE_LOCAL_A: this_procedures_category_one
+  EXAMPLE_LOCAL_B: this_procedures_category_two
+  # Closed list. Anything outside it resolves to `unknown` rather than to a default.

@@ -1,0 +1,251 @@
+# =============================================================================
+# PACK TEMPLATE — source_catalog.yaml
+#
+# WHAT THIS FILE IS FOR: WHICH data exists, WHAT it can and cannot answer, and
+# the guarantees a query against it must satisfy. It is the file the query planner
+# chooses from and the file the query guards are read out of.
+#
+# WHAT IT MUST NEVER CONTAIN: a URL, a hostname, a username or a token. A source
+# here names COORDINATES (index pattern, catalog/schema/table, service nickname);
+# the credentials live in config/main_config.yaml under `log_sources.backends`,
+# referenced by ENV-VAR NAME. The pack says which data; the config says only how
+# to reach the backend. This split is what lets a pack be committed.
+#
+# The `endpoints` block below must key to a `log_sources.backends.<kind>.<name>`
+# entry in the config, or the source cannot be reached at runtime.
+#
+# EVERY KEY EXCEPT `name` IS OPTIONAL. A source with only a name, a description
+# and an `endpoints` block works — the guarantees below are how you make it
+# CORRECT, and each one exists because its absence produced a specific silent
+# failure in production. Read the WHY comments before deleting one.
+# =============================================================================
+
+sources:
+  - name: example_source
+    # ── status: `active` (default) or `planned`/`deprecated`. A non-active source is loaded
+    #    and shown but not offered to the planner, so you can document a source you cannot
+    #    yet reach without it failing every run.
+    status: active
+
+    # ── description: what ONE ROW is, and which facts live on it. This is the primary text
+    #    the planner selects on, so lead with the row grain ("one row per session", "one row
+    #    per envelope version") — that single sentence prevents most wrong joins.
+    description: >
+      What one row of this source IS, and which decisive facts are on it. Name the columns
+      that matter by their real paths, including nesting.
+
+    # ── entities: which entity types can be used to FILTER this source.
+    entities: [example_entity]
+
+    # ── entity_bindings: entity type -> the column(s) that hold it, on THIS source. This is
+    #    the authoritative mapping (the glossary's `field_aliases` are only a prior).
+    #
+    #    PER-FORM FORM: when an entity declares `value_forms`, bind per form — a nested map
+    #    instead of a list. A form this source has no column for is simply omitted, and the
+    #    engine then DROPS values of that form rather than sending them to the wrong column.
+    entity_bindings:
+      example_entity: [example_id]
+      # actor:
+      #   badge: [handler_badge]
+      #   login: [session_login]
+
+    # ── endpoints: the coordinates. `kind` selects the retriever:
+    #    elasticsearch | databricks_uc | snowflake | rest
+    endpoints:
+      kind: databricks_uc
+      catalog: example_catalog
+      schema: example_schema
+      tables: [example_table]
+      # elasticsearch:  cluster: <backends key>, indices: ["pattern-*"]
+      # snowflake:      account/warehouse via the config; database, schema, tables here
+      # rest:           service: <backends key>, path: /api/v1/things
+
+    # ── projection: the columns to SELECT. Omit for `SELECT *` where that is affordable.
+    #    On a wide nested table this is the difference between a query that returns and one
+    #    that times out — and a timeout on a decisive source does not degrade the answer, it
+    #    DECIDES it (every condition goes `unknown` while retrieval reports success).
+    #
+    #    Include every leaf a condition reads. A condition reading a leaf the projection
+    #    dropped returns `unknown`, which in a report is indistinguishable from "the fact is
+    #    genuinely absent" — declare those leaves in the ruleset's `projection_guard` so the
+    #    gap is at least stated.
+    #
+    #    ALIAS EVERY NESTED ENTRY AS ITS OWN PATH WITH `.` REPLACED BY `_`
+    #    (`a.b.leaf AS a_b_leaf`): a backend names a projected struct leaf after its LAST
+    #    segment only, and a row is dict(zip(columns, values)), so two entries ending in the
+    #    same segment arrive as ONE column and one value is served under the other's name.
+    #    Measured on one live source: 10 entries came back as 7 row keys. Path resolution
+    #    already tries that exact spelling, so the alias changes nothing a condition reads.
+    #    Project the LEAF and not its parent struct — a bare select of a wide struct is how a
+    #    query stops returning at all.
+    projection:
+      - example_id
+      - example_timestamp
+
+    # ── query_hints: free-text SQL/DSL guidance handed to the query generator. The right
+    #    content is what a person had to LEARN the hard way about this source: an array that
+    #    must be exploded, a struct leaf whose absence fails the whole query rather than that
+    #    leaf, a column that looks filterable and is not.
+    #
+    #    NEVER WRITE A CONCRETE DATE OR EPOCH LITERAL HERE. It goes stale, the generator
+    #    copies the era rather than the format, and the source returns zero rows with its
+    #    documents sitting in the index. One such example was off by exactly a year. Time is
+    #    declared structurally below (`epoch_time_columns`) and COMPUTED per incident.
+    query_hints: >
+      What a query author must know that the schema does not say. Avoid ORDER BY on large
+      tables. State array/struct shapes.
+
+    # ── default_filters: ALWAYS AND-ed into the query, whatever the LLM generated. For a
+    #    shared multi-tenant index or a table holding several event kinds, this is the slice
+    #    that makes the source answer about YOUR domain. Enforced post-generation, not
+    #    prompted — a prompt instruction cannot be relied on to beat another prompt
+    #    instruction, and this one has to win every time.
+    # default_filters:
+    #   event_type: example_event
+
+    # ── retrieval_class: `primary` when the investigation CANNOT BE CONCLUDED without this
+    #    source. It grants the config's `primary_source_timeout_seconds` (default 3000s)
+    #    instead of the backend's ordinary cap, resolved onto all three coupled budgets at
+    #    once because the lowest silently wins.
+    #
+    #    WHY A LONG CAP IS SAFE: lost contact is detected in ~25s by the consecutive-poll-error
+    #    limit, so elapsed time is not the liveness signal — a statement still RUNNING is
+    #    working. Strictly a BUDGET signal: it changes neither source selection nor zero-row
+    #    scoring. Mark at most one or two sources; marking everything primary means nothing.
+    # retrieval_class: primary
+
+    # ── require_all_entities: AND these entity types instead of OR-ing them.
+    #
+    #    THE RULE, ONCE, FOR EVERY KEY IN THIS SECTION: **OR within ONE entity, AND between
+    #    DIFFERENT entities.** One entity may be OR-ed over its several VALUES and over the
+    #    several COLUMNS that may hold one value (`identity_synonyms` below); two different
+    #    dimensions — a location and an actor, an organization and a user — are AND-ed, always.
+    #    An OR between two dimensions does not loosen the filter, it CHANGES THE QUESTION to
+    #    "anything matching either", and the failure is a FULL result that no "did the source
+    #    answer" check can see.
+    #
+    #    WHY THIS KEY: retrievers OR the entities they were handed by default, which is only
+    #    ever right within one entity and is wrong for a COMPOSITE-KEY lookup where no single
+    #    member is selective. OR-ing a (location, actor) pair asks for most of the table, hits
+    #    the row cap, and returns rows belonging to OTHER keys — so a presence test "finds" an
+    #    identity in a list it is absent from, which is a false negative on an exclusion check.
+    #    Enforced post-generation on every backend.
+    # require_all_entities: [example_location, example_actor]
+
+    # ── identity_keys: PRIORITY-ORDERED candidate keys, most reliable first.
+    #
+    #    Use this instead of `require_all_entities` when SEVERAL combinations name the same
+    #    actor and which one is available varies per incident. The engine picks the first
+    #    candidate whose EVERY member the incident actually carries; a partially-satisfiable
+    #    candidate is SKIPPED, never half-applied — a half-applied guard is worse than none,
+    #    because the declaration reads as a guarantee. MEASURE the order against real column
+    #    nullability rather than assuming it.
+    # identity_keys:
+    #   - [example_location, example_actor]
+    #   - [example_org, example_actor]
+    #   - [example_actor]
+
+    # ── identity_synonyms / identity_scopes: THE SHAPE AN EVENT LOG HAS INSTEAD OF A KEY.
+    #
+    #    An event log cannot declare a fixed tuple: which identity facts a given document
+    #    carries varies document to document. It still must not OR two DIFFERENT dimensions,
+    #    so the two halves are declared separately and the engine ANDs the scopes onto the
+    #    OR-ed synonyms (`enforce_subject_anchor`).
+    #
+    #    `identity_synonyms` — several columns that may hold ONE value, under whichever the
+    #    producer populated. OR them or the row is missed: measured on one auth-event table,
+    #    the login column is null on 32.0% of rows and the userId column on 0.3%, so ANDing
+    #    the two drops a third of the population. Accepts a LIST OF LISTS — OR inside each
+    #    family, AND between them — because two INDEPENDENT identifiers each spread over
+    #    several columns, flattened into one group, leave the second arm unbounded by the
+    #    first: measured 500 rows (the cap) holding 33 actors, of which 17 were the subject's;
+    #    the declared families took the same data to 17 rows inside the UNCHANGED cap.
+    #
+    #    `identity_scopes` — SEPARATE identity facts on the same document (the unit it belongs
+    #    to, the role it acted under). AND-ed. OR-ing these changes the question to "anyone
+    #    sharing either": measured, a flat OR of the four identity columns returned exactly
+    #    the 500-row cap for ONE account over three days — the unit's whole population.
+    # identity_synonyms:
+    #   - [example_actor_login, example_actor_userid]
+    #   - [example_episode_id, example_episode_ref]
+    # identity_scopes: [example_location, example_role]
+
+    # ── never_filter: EVIDENCE FIELDS. Returnable, never filterable.
+    #
+    #    THE FAILURE THIS PREVENTS: a flag like `manually_reviewed` or `is_automated` reads to
+    #    a query generator like a noise reducer ("drop the reviewed ones"), but that flag IS
+    #    the fact a decisive exclusion tests. `AND manually_reviewed = false` deletes exactly
+    #    the rows that decide the verdict; the check then reports "flag absent" and goes inert
+    #    while the query looks reasonable. Stripped post-generation on every backend.
+    #    List every column a verdict condition READS as evidence.
+    # never_filter:
+    #   - example_review_flag
+
+    # ── partition_columns: THE OVERRIDE ONLY FOR WHAT BACKEND METADATA CANNOT SAY.
+    #
+    #    Partition layout is DISCOVERED (Databricks `partition_index`, Snowflake
+    #    `clustering_key`) during the schema round-trip the engine already makes, and a
+    #    discovered fact cannot go stale the way a hand-written one does. Declare here only:
+    #    a VIEW (which reports no partitions), and `role`/`pad_days`, which no catalog carries.
+    #
+    #    `pad_days` widens the incident window on BOTH sides before the bound is applied, for
+    #    a record created before the window and updated inside it. CAUTION: a pad on a
+    #    partition column that is ALSO the cohort's time axis overrides the cohort window —
+    #    measured once as a 30-day cohort of 167 rows collapsing to 15.
+    #
+    #    Getting this wrong is invisible in stages: an unbounded partition column looks like
+    #    slowness, then like an empty source, then like INSUFFICIENT DATA.
+    # partition_columns:
+    #   - name: example_date
+    #     role: date          # date | timestamp | string_date
+    #     type: DATE
+    #     pad_days: 2
+
+    # ── epoch_time_columns: declare the column and the UNIT only.
+    #
+    #    The unit and the ERA of an epoch integer are not visible in the value, so a wrong
+    #    conversion is a plausible number that matches nothing at all. The engine converts
+    #    THIS incident's window, injects it already converted, and repairs a non-intersecting
+    #    bound afterwards. Units: seconds | milliseconds | microseconds.
+    # epoch_time_columns:
+    #   - name: example_epoch_ms
+    #     unit: milliseconds
+
+    # ── zero_rows: WHAT AN EMPTY RESULT MEANS, when empty is an ANSWER.
+    #
+    #    Some sources answer by being empty: no row on an automation-account list means the
+    #    actor is a person, which is a finding the investigation needs. The health scorer's
+    #    pro-rata empty-source penalty would treat that as a defect and invert the evidence.
+    #    `health_weight: 0.0` fires nothing; the discount and its reason are printed, because
+    #    a silently smaller number cannot be checked. The arithmetic is the engine's; WHICH
+    #    sources qualify is a pack judgement — do NOT set this on a system of record, where an
+    #    empty result is a real gap.
+    # zero_rows:
+    #   health_weight: 0.0
+    #   meaning: >
+    #     Why an empty result here is a finding rather than a retrieval failure.
+
+    # ── not_answered_by: what this source CANNOT answer, and who can.
+    #
+    #    A `description` answers neither question the planner actually has. This one stops the
+    #    planner reaching for a plausible-looking source and concluding "no evidence" from a
+    #    source that structurally cannot hold it. Name the alternative source.
+    # not_answered_by:
+    #   - question: "who VIEWED a record without modifying it"
+    #     ask_instead: example_access_log
+
+    # ── selection_guidance: WHEN this source is worth asking at all.
+    #
+    #    The decision stays with the planner, which is right when relevance is genuinely
+    #    incident-dependent. NOT interchangeable with a ruleset's `sources:` map: that is a
+    #    HARD dependency retrieved on every run, which is right when a condition READS the
+    #    source (an unevaluable condition is not the planner's call). Use the ruleset for a
+    #    source a check depends on; use this for a source that is sometimes relevant.
+    # selection_guidance:
+    #   choose_when:
+    #     - "the incident asks whether the action was automated"
+    #   skip_when:
+    #     - "the question is entirely about amounts"
+
+    # ── used_by: playbook ids referencing this source. Documentation only.
+    used_by: [PB-EXAMPLE-001]

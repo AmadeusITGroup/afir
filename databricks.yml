@@ -1,0 +1,256 @@
+# Databricks Asset Bundle: AFIR as a Databricks App.
+#
+#   databricks bundle validate -t dev
+#   databricks bundle deploy -t dev
+#   databricks bundle run afir -t dev     # deploy alone does NOT restart the app
+#
+# Validated and deployed with CLI v1.11.0. Every block below that carries a shouting comment
+# is there because `validate` corrected an assumption — and three of the four were WARNINGS,
+# so the deploy would have succeeded and dropped them. See
+# docs/architecture/databricks-deployment.md.
+#
+# THE SYNC HONOURS .gitignore AS WELL AS `sync.exclude`, which is not a detail: `config/*.yaml`
+# are gitignored, so the deployed tree has no config files at all — only `config/templates/`,
+# which `seed_working_copies()` flattens into the working copy at boot. That is the App's ONLY
+# source of a config file, and before it existed the first boot died in `open()`.
+#
+# WHAT THIS FILE OWNS, AND WHAT IT DOES NOT. The bundle owns *deployment*: which files are
+# synced, which resources must exist, who may use the app. It does not own AFIR's
+# behaviour — that stays in `config/*.yaml` and the knowledge pack, both of which the
+# operator edits through the UI at runtime and both of which are mirrored to the Volume, so
+# a redeploy must not silently replace an operator's edit with the shipped default. That is
+# why nothing here templates a value into a config file.
+#
+# ONE REPLICA, and it is a correctness constraint rather than a cost one: gates are
+# `asyncio.Event`s, the SSE queues and `JobManager._jobs` are per-process, and the storage
+# backend serialises writes on a single thread whose read-modify-write append a second
+# replica would race. Apps run one instance per app, so this is satisfied by not deploying
+# the same app twice.
+
+bundle:
+  name: afir
+
+variables:
+  app_name:
+    description: >-
+      The app's name in the workspace, and therefore half its URL. Set per target rather
+      than derived from `bundle.name`, so dev and prod are two apps that cannot be
+      mistaken for one another in the App list.
+    default: afir
+  # THE THREE BELOW ARE NOT WIRED INTO THE APP, and cannot be: a bundle variable is
+  # substituted into this file, and the app reads its environment from `app.yaml` in the
+  # synced source. The app's actual values are `AFIR_UC_CATALOG` / `AFIR_UC_SCHEMA` /
+  # `AFIR_UC_VOLUME` there, read through `${VAR:-default}` by the shipped config template —
+  # which is how they get decided at all, since where durable state lives cannot be
+  # configured from the UI in a container (the applying restart discards the disk the switch
+  # was written to). So these three are the GRANT target and the record of what was verified;
+  # **they must be kept in step with `app.yaml` by hand.** A mismatch is not caught by
+  # `validate`: the grants land on one Volume, the app writes to another, and every write
+  # 404s into a store that answers `storage_ok: false` — visible, but only on
+  # `/health?deep=1` and only after the deploy.
+  catalog:
+    description: >-
+      Unity Catalog catalog holding AFIR's state Volume. The app's service principal needs
+      USE CATALOG + USE SCHEMA on it and READ/WRITE VOLUME on the volume below — without
+      WRITE, every job doc, export and gate is lost on restart while the app still reports
+      healthy. Must equal `AFIR_UC_CATALOG` in app.yaml.
+    # Set this to the deployment workspace's own catalog. The seam was verified against a
+    # real managed Volume — 29/29 checks in a local probe plus a full App-mode boot with all
+    # durable state on it. The default below is deliberately NOT a resolvable name, because
+    # a placeholder that resolves is worse than one that does not: the deploy succeeds and
+    # the Volume writes 404 into a degraded store. `main` was the original mistake here.
+    default: <uc-catalog>
+  schema_name:
+    description: Schema inside ${var.catalog} holding the state volume.
+    default: afir
+  volume_name:
+    description: >-
+      Volume for durable state: job docs + their evidence sidecars, exports, the feedback
+      log, and the mirrored copies of config/ and the knowledge pack.
+    default: state
+  warehouse_id:
+    description: >-
+      SQL warehouse for log retrieval and schema discovery (the app needs CAN USE). Left
+      empty on purpose — it belongs to `log_sources.backends.databricks.*` in
+      main_config.yaml, and duplicating it here would give two places to change it.
+    default: ""
+
+resources:
+  apps:
+    afir:
+      name: ${var.app_name}
+      description: >-
+        Automated Fraud Investigation and Reporting. UI at /, API under /api/v1/.
+        Investigations run as background tasks; submit with POST /api/v1/jobs.
+      # `.`, not `../`. This file sits AT the repo root, so the bundle root already is the
+      # repo — and `../` is outside the sync root, which `bundle validate` rejects rather
+      # than resolving. It read as "the directory above databricks.yml" and there is no such
+      # directory in the bundle's world.
+      source_code_path: .
+      # `app.yaml` in the synced source supplies `command` and the environment. Kept there
+      # rather than inlined here so a local run and the App read the same file — a second
+      # copy of the env is a second thing to forget.
+      resources:
+        # NO `volume:` RESOURCE EXISTS. An app resource is one of exactly four kinds — `job`,
+        # `secret`, `serving_endpoint`, `sql_warehouse` — and a Volume is not among them: UC
+        # access is a *grant* to the app's service principal, not a binding declared here.
+        # `bundle validate` reported the invented block as `Warning: unknown field: volume`,
+        # a WARNING, so a deploy would have succeeded and dropped it — the app would come up
+        # with no Volume permission and every write would 404 into a store reporting itself
+        # degraded. Grant it out of band, once, against the catalog in `var.catalog`:
+        #
+        #   GRANT USE CATALOG ON CATALOG <catalog> TO `<app service principal>`;
+        #   GRANT USE SCHEMA  ON SCHEMA  <catalog>.<schema> TO `<app service principal>`;
+        #   GRANT READ VOLUME, WRITE VOLUME
+        #     ON VOLUME <catalog>.<schema>.<volume> TO `<app service principal>`;
+        #
+        # The principal's name is in the app's page after the first deploy. WRITE is the one
+        # that matters: without it every job doc, export and gate is lost on restart while
+        # the app still reports healthy — which is why `/health?deep=1` answers `storage_ok`.
+        #
+        # THE TWO SERVING ENDPOINTS THIS DEPLOYMENT USES, both in the App's own workspace,
+        # which is why the OAuth service principal can reach them with no injected token.
+        # The names must equal `model` in llm_config.yaml and `rag.embedding_model` in
+        # main_config.yaml — a resource block naming an endpoint that does not exist fails
+        # the deploy, which is the loud direction.
+        - name: llm-endpoint
+          serving_endpoint:
+            name: databricks-claude-opus-5
+            permission: CAN_QUERY
+        # An unreachable embedding endpoint does NOT fail the boot — retrieval degrades to
+        # the deterministic keyword `PlaybookFallback`, which is a quieter and worse outcome
+        # than a failed deploy, so the grant is declared here rather than left to chance.
+        - name: embedding-endpoint
+          serving_endpoint:
+            name: databricks-qwen3-embedding-0-6b
+            permission: CAN_QUERY
+        # NO `sql_warehouse:` RESOURCE, and it is not an omission. Where the warehouses a
+        # deployment queries live in OTHER workspaces — which is the case AFIR was built
+        # for — an app resource cannot bind them: it can only bind one in the app's own
+        # workspace. They are reached with the per-workspace PATs below, which is why
+        # `var.warehouse_id` stays empty.
+        #
+        # FOREIGN-WORKSPACE PATS AND THE LOG-SOURCE CREDENTIALS. Secrets, never literals,
+        # surfaced to the process under the env var names `app.yaml` maps them to — which
+        # are the names `log_sources.backends.*.api_key_env` / `.password` point at.
+        # Create the scope and the keys first (see app.yaml for the env-var mapping and for
+        # why none of them may be called `DATABRICKS_TOKEN`):
+        #
+        #   databricks secrets create-scope afir
+        #   databricks secrets put-secret afir warehouse_a_token
+        #   databricks secrets put-secret afir warehouse_b_token
+        #   databricks secrets put-secret afir elk_user
+        #   databricks secrets put-secret afir elk_pass
+        #
+        # Kept commented because a resource naming a secret that does not exist fails the
+        # deploy: uncomment (and rename to your own workspaces) once the scope is populated.
+        # - name: warehouse-a-token
+        #   secret:
+        #     scope: afir
+        #     key: warehouse_a_token
+        #     permission: READ
+        # - name: warehouse-b-token
+        #   secret:
+        #     scope: afir
+        #     key: warehouse_b_token
+        #     permission: READ
+        # - name: elk-user
+        #   secret:
+        #     scope: afir
+        #     key: elk_user
+        #     permission: READ
+        # - name: elk-pass
+        #   secret:
+        #     scope: afir
+        #     key: elk_pass
+        #     permission: READ
+
+sync:
+  # DENY-BY-CONTENT, not by convenience. Each line below is either real operational data or
+  # a credential, and the reason the list is explicit rather than left to .gitignore is
+  # that `bundle deploy` syncs the working TREE — an untracked `config/main_config.yaml`
+  # with live tokens in it is exactly what a developer has on disk.
+  exclude:
+    # Unredacted credentials. `config_store` writes one of these beside every file it
+    # patches, holding the pre-redaction content.
+    - config/*.bak
+    - config/certs/**
+    - .afir_env
+    - .databrickscfg
+    # Real operational data: every incident processed, with subject identifiers, document
+    # numbers and contact details in the evidence sidecars.
+    - jobs/**
+    - exports/**
+    - feedback_*.jsonl
+    - feedback_*.json
+    # Real subject identifiers seeded as RAG precedent, and the editor's undo store, which
+    # holds prior versions of those same files.
+    - knowledge/*/use_cases/*/cases/**
+    - knowledge/*/.history/**
+    # Local-only bulk. model_cache is ~3.6 GB and the App uses a serving endpoint;
+    # knowledge_base/ is a rebuilt index.
+    - model_cache/**
+    - knowledge_base/**
+    - .venv/**
+    - .git/**
+    - __pycache__/**
+    - "**/*.pyc"
+    # Probe output holds live rows. The probe scripts are not tracked either — they are
+    # local authoring instruments, and what ships is the measured RESULT, recorded in the
+    # pack beside the value it justifies.
+    - scripts/out/**
+    - probe_*.json
+    - probe_*.txt
+    # Not needed at runtime, and the suite's own dependencies are not installed in the App.
+    - tests/**
+    - .pytest_cache/**
+
+targets:
+  dev:
+    mode: development
+    default: true
+    variables:
+      app_name: afir-dev
+    # `mode: development` already prefixes and marks resources as dev-owned. No
+    # `permissions:` block: in development the deploying user is the only one who should
+    # reach it, and they have it implicitly.
+
+  prod:
+    mode: production
+    variables:
+      app_name: afir
+    workspace:
+      # A FIXED path, not the deploying user's home, and for AFIR this is a correctness
+      # constraint rather than tidiness. Without it prod lands under whoever ran the deploy,
+      # so two operators produce two copies — and the second copy is a second replica, which
+      # this deployment cannot have: gates are `asyncio.Event`s, `JobManager._jobs` and the
+      # SSE queues are per-process, and the storage backend's `append_text` is a
+      # read-modify-write serialised by one thread. Two of them lose one analyst's review
+      # into a feedback log that still parses cleanly.
+      # NOT /Workspace/Shared: the CLI warns that it is read/write for every workspace user,
+      # and this root holds the deployed config and the knowledge pack. So a restricted
+      # folder — which is a PREREQUISITE, not something the deploy creates. Measured: with
+      # `/Workspace/Applications` absent, `bundle validate -t prod` answers
+      # `403 PERMISSION_DENIED ... does not have View permissions`, which is the right way
+      # round; an ACL is an admin decision and a deploy that quietly relocated itself
+      # somewhere writable would be the defect. Create it once, grant the deploying
+      # principal CAN_MANAGE, then this validates clean — confirmed by pointing the same
+      # block at a path that does exist.
+      root_path: /Workspace/Applications/afir/.bundle/${bundle.name}/${bundle.target}
+    resources:
+      apps:
+        afir:
+          # ON THE APP, not on the target. A target-level `permissions:` block accepts only
+          # [CAN_MANAGE, CAN_VIEW, CAN_RUN] — it governs the *bundle*, and `CAN_USE` there is
+          # a hard `bundle validate` error. The level AFIR needs is app-scoped, so it is
+          # declared where the app is.
+          permissions:
+            # CAN_USE is the WHOLE authorization model. AFIR's own API has no authentication
+            # — accepted deliberately — so anyone here can approve another analyst's gate,
+            # repoint a backend URL, or write to the knowledge pack, and `actor` stays
+            # self-asserted free text. Grant it narrowly, to a group you would trust with
+            # all three.
+            - level: CAN_USE
+              group_name: afir-analysts
+            - level: CAN_MANAGE
+              group_name: afir-admins

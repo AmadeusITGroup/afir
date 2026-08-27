@@ -1,0 +1,126 @@
+# =============================================================================
+# MOCK-DOMAIN PACK — the pack's own VOCABULARY BOUNDARY.
+#
+# Read by no pipeline code. Read by `validate_pack`, which scans `src/` and
+# `config/templates/` for these words and reports a hit as a
+# `neutrality-collision` error.
+#
+# `confidential_vocabulary:` at the bottom is the narrower list — what may not
+# be named in a file that ships publicly. For THIS pack it is empty, and
+# deliberately so; see the block there before copying this file for a new pack.
+#
+# WHY THIS LIVES IN THE PACK AND NOT IN THE SCANNER
+# =================================================
+# A list of one domain's nouns IS domain knowledge, so the structural rule that
+# put every other domain literal in `knowledge/<domain>/` applies to it too.
+# When the list was a regex literal inside the checker, the checker itself named
+# a domain — the exact leak it exists to catch, in the one file nobody thinks to
+# scan. It also meant a checkout carrying a different pack was running a scan
+# tuned to somebody else's vocabulary.
+#
+# With the list here, the scanner is a fixed, domain-free program: it reads the
+# pack in front of it and enforces that pack's boundary. Installing a pack
+# installs its neutrality guarantee, and there is no private version of the
+# check anywhere.
+#
+# WHY IT IS CURATED AND NOT DERIVED FROM entity_glossary.yaml
+# ==========================================================
+# Deriving it was tried and is wrong in both directions. Measured on this pack:
+# of 29 structurally-derivable tokens, SIX appear legitimately in `src/` —
+# `badge` (a UI pill), `claim` (the verb, "the note claims"), `tracking`,
+# `incident_id`, and `depot`/`refund` used deliberately as CROSS-DOMAIN
+# ILLUSTRATIONS of a generic key ("a pack whose scope unit is a depot"). Those
+# illustrations are the clearest evidence the engine is generic; a derived list
+# would demand their deletion. In the other direction a derived list misses the
+# words that actually leak, because a leak is prose ("the parcel was
+# undelivered") and prose uses nouns no glossary key spells.
+#
+# So: the words a HUMAN would recognise as this domain's, listed by the pack
+# author who knows them. Add one whenever a leak is found.
+# =============================================================================
+
+# Matched case-insensitively. `_`, `.` and `-` end a word here (the boundary
+# rejects only adjacent letters and digits), so a stem catches its compounds:
+# `parcel` catches `parcel_ref`. Include the inflections you
+# expect in prose (singular AND plural) — the scan does no stemming, because a
+# stemmer folding `holder` to `hold` would flag all 118 ordinary-English uses of
+# "hold" in `src/`, and a suppression list is how these scans die.
+domain_vocabulary:
+  # The unit of work and its identifiers.
+  - parcel
+  - parcels
+  - shipment
+  - shipments
+  - consignment
+  - consignments
+  - waybill
+  - waybills
+  # The actor.
+  - courier
+  - couriers
+  - haulier
+  - hauliers
+  # The domain's own jargon.
+  - undelivered
+  - redelivery
+  - doorstep
+
+# THE OMISSIONS ARE THE INTERESTING PART, so they are recorded rather than left
+# to be rediscovered. Measured against the current `src/`, these words of this
+# domain are deliberately absent from the list above:
+#
+#   * `refund`, `claim`, `badge`, `tracking` — ordinary English the engine
+#     legitimately speaks. A refund IS a generic containment action, a badge IS
+#     a UI pill, and "the note claims" is the verb. Listing them buys nothing
+#     and costs a permanent stream of false hits, and the first response to a
+#     noisy check is always to weaken it.
+#
+#   * `manifest` — a shipping document in this domain AND the name of a field in
+#     Databricks' SQL Statement Execution response (`data["manifest"]["schema"]`,
+#     read in `_rows_from_statement`). A backend's own wire format is not
+#     negotiable vocabulary: the engine must spell the key the API sends. This is
+#     the same exemption `_ENGINE_OWNS` grants `kibana` and `servicenow`, applied
+#     one level down to a field name rather than a product name.
+#
+#   * `depot` — a harder and more useful case. `src/correlation.py` says it four
+#     times, always in a list naming other domains too ("a pack whose scope unit
+#     is a depot, a site, a tenant"). That sentence is EVIDENCE the engine is
+#     generic: it exists to stop the next author assuming the scope unit is one
+#     particular thing. Listing `depot` would demand deleting the best available
+#     demonstration of genericity in order to satisfy a genericity check.
+#
+#     The alternative considered and rejected was a scanner exemption for "a
+#     word in a list alongside other domains' equivalents". It would work today
+#     and it is unfalsifiable — any leak can be dressed as an illustration by
+#     appending two nouns — so it is precisely the plausible-looking exemption
+#     these scans die of. Omitting the word states the same decision where a
+#     reader can see it.
+#
+# THE RULE: list a word when finding it in `src/` would mean the engine had
+# learned this domain. Do not list a word the engine needs for its own job.
+
+# =============================================================================
+# THE CONFIDENTIAL SUBSET — EMPTY HERE, AND THAT IS THE POINT OF THIS PACK.
+#
+# The list above answers "would the ENGINE have learned this domain?", which is
+# the right question for `src/` and the wrong one for `docs/` and `tests/`: those
+# two roots exist in order to talk about a domain. A test needs a subject and a
+# worked example needs a worked example, so the list above would forbid exactly
+# what those files are for. The narrower question is "does this DISCLOSE
+# anything?", and this key is where a pack answers it.
+#
+# For this pack the answer is nothing. It is the engine's own fixture — an
+# invented courier domain, no real rows and no real identifiers, which is
+# precisely why the shared docs and the shared suite are allowed to name it.
+# `parcel` and `waybill` in a test are the intended state, not a leak.
+#
+# DECLARED EMPTY RATHER THAN OMITTED, because this is the file a new pack author
+# copies: an absent key reads as an oversight, while `[]` plus this paragraph
+# reads as a decision. A pack describing a real business should NOT copy the
+# `[]` — list the private spellings (internal system names, procedure codes,
+# column names, the organisation's own name) and leave out the ordinary business
+# English any competitor would also use. A word listed here must also appear
+# above; the subset is what makes the narrow list a weakening of the broad one
+# rather than a second, unrelated ban-list.
+# =============================================================================
+confidential_vocabulary: []
