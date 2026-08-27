@@ -1,0 +1,3448 @@
+openapi: 3.1.0
+
+info:
+  title: AFIR API
+  description: >
+    AFIR (Automated Fraud Investigation and Reporting) is an LLM-driven
+    incident-processing pipeline developed under the RESCUE (Resilient Cloud
+    for Europe) project. It processes security incidents through the stages:
+    understand the incident, generate log-retrieval API calls, retrieve logs,
+    correlate, detect anomalies, run plugins, generate a report, export, and
+    deliver. All stateful work is tracked as a Job. Three legacy blocking
+    endpoints remain for backward compatibility but answer 501 in deployment
+    modes where the request cannot wait for the pipeline to finish.
+  version: "1.0.0"
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+
+servers:
+  - url: "http://localhost:5000"
+    description: Local development server (default port from main_config.yaml)
+  - url: "https://{host}"
+    description: Databricks App deployment
+    variables:
+      host:
+        default: your-workspace.azuredatabricks.net/apps/afir
+        description: >
+          The fully qualified hostname and app path for a Databricks App
+          deployment. In a Databricks App the server listens on the port
+          given by DATABRICKS_APP_PORT, which the platform maps to HTTPS.
+
+tags:
+  - name: UI
+    description: Web interface and API discovery endpoints.
+  - name: Health
+    description: Liveness and readiness check.
+  - name: Incidents
+    description: >
+      Classic blocking incident-submission endpoints. These answer 501 when
+      the server is running in a Databricks App (blocking_endpoints=auto or
+      on). Use POST /api/v1/jobs instead.
+  - name: Jobs
+    description: >
+      Controllable pipeline jobs. A job runs the full incident-processing
+      pipeline asynchronously and supports human-in-the-loop controls.
+  - name: Batches
+    description: >
+      Bulk submission. A batch is a label shared by its jobs, so every Jobs
+      endpoint works on each member unchanged; the run queue drains them at
+      the configured concurrency.
+  - name: Gates
+    description: >
+      Approval gates. In semi_auto or supervised run modes a job pauses at
+      configured stages and waits for an operator decision before continuing.
+  - name: Retrieval Plan
+    description: >
+      Per-job retrieval plan editor. Lets an operator inspect, add, or remove
+      log-source queries before or during retrieval.
+  - name: Links
+    description: >
+      Cross-procedure advisory links. A job may hold link findings that
+      suggest related procedures; operators can refer a link or set link modes.
+  - name: Artifacts
+    description: >
+      Report and evidence artifacts. Reports are available in multiple formats;
+      evidence is available as raw or transformed data.
+  - name: Feedback
+    description: >
+      Analyst feedback loop. Analysts submit structured reviews; the server
+      distils them and tunes anomaly-detection thresholds.
+  - name: Configuration
+    description: >
+      Live configuration management. Reads and patches main_config.yaml and
+      llm_config.yaml. Literal credential values are redacted in all responses;
+      the config uses api_key_env (an environment-variable name) rather than
+      a literal api_key.
+  - name: Knowledge
+    description: >
+      Knowledge-pack management. Lists packs, reads and writes individual
+      files, validates packs, manages file history, and runs the LLM-driven
+      pack assistant.
+
+paths:
+
+  /:
+    get:
+      operationId: index
+      tags: [UI]
+      summary: Serve the single-page web UI
+      description: >
+        Returns the single-page HTML application. The document is assembled
+        inline from src/ui/* with no external CDN dependencies so that it
+        works offline in a Databricks App.
+      responses:
+        "200":
+          description: HTML document
+          content:
+            text/html:
+              schema:
+                type: string
+
+  /health:
+    get:
+      operationId: health
+      tags: [Health]
+      summary: Liveness and optional deep health check
+      description: >
+        Without ?deep=1 returns a minimal status object. With ?deep=1 probes
+        the LLM credential, knowledge pack, job store, pipeline, and storage
+        backend and reports per-component detail. Used by the UI status dot
+        and monitoring integrations.
+      parameters:
+        - name: deep
+          in: query
+          required: false
+          schema:
+            type: integer
+            enum: [1]
+          description: Pass 1 to include per-component health probes.
+      responses:
+        "200":
+          description: Health report
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/ShallowHealth"
+                  - $ref: "#/components/schemas/DeepHealth"
+
+  /openapi.json:
+    get:
+      operationId: get_openapi_json
+      tags: [UI]
+      summary: Return this specification as JSON
+      description: >
+        Returns the OpenAPI 3.1.0 specification for this API as an
+        application/json document. Useful for programmatic clients that cannot
+        consume YAML.
+      responses:
+        "200":
+          description: OpenAPI specification
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+
+  /docs:
+    get:
+      operationId: get_docs
+      tags: [UI]
+      summary: Serve a self-contained HTML rendering of the API specification
+      description: >
+        Returns a self-contained HTML page that renders the OpenAPI
+        specification. No external assets or CDN dependencies are required;
+        the document works offline inside a Databricks App.
+      responses:
+        "200":
+          description: HTML API reference
+          content:
+            text/html:
+              schema:
+                type: string
+
+  /api/v1/incidents:
+    post:
+      operationId: receive_incident
+      tags: [Incidents]
+      deprecated: true
+      summary: Submit an incident and wait for the report (blocking, deprecated)
+      description: >
+        Blocking endpoint: submits an incident, runs the full pipeline inline,
+        and returns the finished report in the response body. When
+        blocking_endpoints is auto (the default) this endpoint answers 501 on
+        a Databricks App deployment because the platform's ingress timeout
+        (60-120 s) is shorter than the median pipeline duration (approx. 38
+        min). Use POST /api/v1/jobs instead. The 501 body names the
+        replacement endpoint.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/IncidentInput"
+      responses:
+        "200":
+          description: Investigation report
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InvestigationReport"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "501":
+          $ref: "#/components/responses/BlockingRetired"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+    get:
+      operationId: list_finished_incidents
+      tags: [Incidents]
+      summary: List completed incident reports
+      description: >
+        Returns metadata for all completed incidents that have a stored report.
+      responses:
+        "200":
+          description: List of incident summaries
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/IncidentSummary"
+
+  /api/v1/incidents/freetext:
+    post:
+      operationId: receive_freetext_incident
+      tags: [Incidents]
+      deprecated: true
+      summary: Submit a free-text incident description (blocking, deprecated)
+      description: >
+        Blocking endpoint accepting unstructured free-text as the incident
+        description. Subject to the same 501 behaviour as POST /api/v1/incidents
+        when blocking_endpoints is auto or on. Use POST /api/v1/jobs with
+        freetext=true instead.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FreetextIncidentInput"
+      responses:
+        "200":
+          description: Investigation report
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InvestigationReport"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "501":
+          $ref: "#/components/responses/BlockingRetired"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /api/v1/ir:
+    post:
+      operationId: get_ir
+      tags: [Incidents]
+      deprecated: true
+      summary: Submit an incident via the IR endpoint (blocking, deprecated)
+      description: >
+        Alternate blocking endpoint for incident submission used by some
+        legacy integrations. Subject to the same 501 behaviour when
+        blocking_endpoints is auto or on. Use POST /api/v1/jobs instead.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/IncidentInput"
+      responses:
+        "200":
+          description: Investigation report
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InvestigationReport"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "501":
+          $ref: "#/components/responses/BlockingRetired"
+
+  /api/v1/jobs:
+    post:
+      operationId: create_job
+      tags: [Jobs]
+      summary: Create and start a pipeline job
+      description: >
+        Creates a new job, starts the incident-processing pipeline
+        asynchronously, and returns the job record immediately. The caller
+        polls GET /api/v1/jobs/{job_id} or streams GET
+        /api/v1/jobs/{job_id}/events for progress.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateJobRequest"
+      responses:
+        "201":
+          description: Job created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "429":
+          $ref: "#/components/responses/QueueFull"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+    get:
+      operationId: list_jobs
+      tags: [Jobs]
+      summary: List all jobs
+      description: >
+        Returns all jobs stored in the job store, most recent first. Completed,
+        in-progress, and paused jobs are all included. Each row carries its
+        live queue_position (0 once the run has started), and the run queue's
+        own counters ride beside the rows so one request answers both what is
+        waiting and what it is waiting for.
+      responses:
+        "200":
+          description: List of jobs plus the run queue's counters
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  jobs:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Job"
+                  queue:
+                    $ref: "#/components/schemas/RunQueueStats"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /api/v1/batches:
+    post:
+      operationId: create_batch
+      tags: [Batches]
+      summary: Submit many incidents as one batch
+      description: >
+        Creates one job per incident under a shared batch id and submits each
+        to the run queue. Admission is per job and partial by design: a batch
+        whose last incidents exceed the backlog bound keeps the ones already
+        accepted and names the refused ones. Malformed entries are reported in
+        `rejected` alongside what was accepted, never in place of it. A request
+        carrying more than 500 incidents is refused whole rather than
+        truncated.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateBatchRequest"
+      responses:
+        "201":
+          description: Batch submitted (possibly in part)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchSubmission"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "413":
+          description: The batch exceeds the per-request incident limit.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+    get:
+      operationId: list_batches
+      tags: [Batches]
+      summary: List batches with at least one live job
+      description: >
+        A batch is exactly as durable as its jobs, so a batch whose jobs have
+        all aged out of memory is absent here rather than reported as empty.
+      responses:
+        "200":
+          description: Batches and the run queue's counters
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  batches:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/BatchStatus"
+                  queue:
+                    $ref: "#/components/schemas/RunQueueStats"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /api/v1/batches/{batch_id}:
+    get:
+      operationId: get_batch
+      tags: [Batches]
+      summary: Get one batch's progress
+      description: >
+        Derived from the batch's jobs and nothing else, so the counts can never
+        disagree with the runs. `done` is a floor rather than a total: finished
+        jobs are pruned from memory after their TTL.
+      parameters:
+        - name: batch_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Batch progress
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchStatus"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /api/v1/batches/{batch_id}/cancel:
+    post:
+      operationId: cancel_batch
+      tags: [Batches]
+      summary: Cancel every unfinished job in a batch
+      description: >
+        Each job is cancelled through the same control path an operator uses,
+        so every cancel lands on its own audit trail. A job that ended between
+        the read and the cancel is counted as already finished rather than as a
+        failure — one race must not refuse the rest of the batch.
+      parameters:
+        - name: batch_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: What was cancelled and what had already ended
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  batch_id:
+                    type: string
+                  cancelled:
+                    type: array
+                    items:
+                      type: string
+                  already_finished:
+                    type: array
+                    items:
+                      type: string
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /api/v1/jobs/import:
+    post:
+      operationId: import_job
+      tags: [Jobs]
+      summary: Import a previously exported job
+      description: >
+        Accepts a job export bundle (the body produced by GET
+        /api/v1/jobs/{job_id}/export) and stores it as a new job. The imported
+        job is not re-run; it is stored for review and artifact access.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+              description: Job export bundle as produced by the export endpoint.
+      responses:
+        "201":
+          description: Job imported
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /api/v1/jobs/{job_id}:
+    get:
+      operationId: get_job
+      tags: [Jobs]
+      summary: Get a job by ID
+      description: Returns the full job record including stage outputs and status.
+      parameters:
+        - $ref: "#/components/parameters/job_id"
+      responses:
+        "200":
+          description: Job record
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/jobs/{job_id}/events:
+    get:
+      operationId: job_events
+      tags: [Jobs]
+      summary: Stream job events as Server-Sent Events
+      description: >
+        Opens a Server-Sent Event stream for the job. The server replays the
+        full event history on connection, then streams live events until the
+        job completes or the client disconnects. Each event carries a JSON
+        payload. Event types include stage_started, stage_completed,
+        stage_failed, job_completed, gate_opened, and gate_resolved.
+      parameters:
+        - $ref: "#/components/parameters/job_id"
+      responses:
+        "200":
+          description: SSE stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: >
+                  Newline-delimited Server-Sent Events. Each event is a JSON
+                  object with at minimum a type field and a ts (ISO-8601
+                  timestamp) field.
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /api/v1/jobs/{job_id}/export:
+    get:
+      operationId: export_job
+      tags: [Jobs]
+      summary: Export a job as a portable bundle
+      description: >
+        Returns the complete job state as a JSON bundle that can be imported
+        into another AFIR instance via POST /api/v1/jobs/import or stored for
+        audit purposes.
+      parameters:
+        - $ref: "#/components/parameters/job_id"
+      responses:
+        "200":
+          description: Job export bundle
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /api/v1/jobs/{job_id}/control:
+    post:
+      operationId: control_job
+      tags: [Jobs]
+      summary: Send a control action to a running job
+      description: >
+        Sends one of the supported control actions to the job. Valid actions
+        are: pause, resume, step, cancel_stage, cancel_all, retry_stage,
+        retry_all, skip_stage, release_gate. Some actions require additional
+        fields (e.g. stage name for cancel_stage, retry_stage, skip_stage).
+        Returns a conflict (409) if the action is not valid in the job's
+        current state.
+      parameters:
+        - $ref: "#/components/parameters/job_id"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ControlRequest"
+      responses:
+        "200":
+          description: Action accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /api/v1/jobs/{job_id}/gate:
+    get:
+      operationId: get_job_gate
+      tags: [Gates]
+      summary: Get the current gate state for a job
+      description: >
+        Returns the gate record if the job is currently paused at a gate,
+        including the stage name, the stage output, and any guidance submitted
+        by previous reviewers.
+      parameters:
+        - $ref: "#/components/parameters/job_id"
+      responses:
+        "200":
+          description: Gate record
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GateState"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    post:
+      operationId: resolve_job_gate
+      tags: [Gates]
+      summary: Resolve an open gate
+      description: >
+        Submits an operator decision for the current open gate. Valid actions
+        are approve (proceed with the stage output as-is), reject (re-run the
+        stage with the submitted guidance injected into the prompt), and
+        override (proceed with a hand-supplied replacement output). Returns
+        409 if no gate is currently open for the job.
+      parameters:
+        - $ref: "#/components/parameters/job_id"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GateResolution"
+      responses:
+        "200":
+          description: Gate resolved; updated job record
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /api/v1/gates:
+    get:
+      operationId: list_gates
+      tags: [Gates]
+      summary: List all currently open gates
+      description: >
+        Returns gate records for every job that is currently paused at a
+        gate, across all jobs. Useful for an operator dashboard that monitors
+        all pending approvals.
+      responses:
+        "200":
+          description: List of open gate records
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/GateState"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /api/v1/jobs/{job_id}/outputs/{stage}:
+    post:
+      operationId: override_stage_output
+      tags: [Jobs]
+      summary: Replace a stage output mid-run
+      description: >
+        Replaces the stored output for the named stage with the supplied body,
+        decoded through the same output codecs used by export/import. The
+        replacement is recorded in Job.interventions. This endpoint is the
+        mid-run override path for human-in-the-loop corrections.
+      parameters:
+        - $ref: "#/components/parameters/job_id"
+        - name: stage
+          in: path
+          required: true
+          schema:
+            type: string
+          description: >
+            Pipeline stage name whose output is being replaced. Examples:
+            understanding, api_call_generation, log_retrieval, correlation,
+            anomaly_detection, report_generation.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+              description: Replacement stage output, in the stage's native schema.
+      responses:
+        "200":
+          description: Output replaced; updated job record
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /api/v1/jobs/{job_id}/queries:
+    get:
+      operationId: get_job_queries
+      tags: [Retrieval Plan]
+      summary: Get the retrieval plan for a job
+      description: >
+        Returns the list of log-source queries that have been planned or
+        executed for the job, keyed by source name and retrieval pass. Each
+        query includes the natural-language question, resolved entity
+        predicates, and date window. Returns 409 if the understanding stage
+        has not completed yet (no plan exists).
+      parameters:
+        - $ref: "#/components/parameters/job_id"
+      responses:
+        "200":
+          description: Retrieval plan
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QueryPlan"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+    post:
+      operationId: edit_job_queries
+      tags: [Retrieval Plan]
+      summary: Add or remove queries from the retrieval plan
+      description: >
+        Applies a list of edits to the retrieval plan. Each edit is either an
+        addition (source + question; the server builds the full query through
+        the same enrichment pipeline as a planned query) or a removal by
+        index. All-or-nothing: indices are resolved before any change is
+        applied so that a removal and an addition in the same request cannot
+        target each other. Returns 409 if retrieval has already completed or
+        if the understanding stage has not run yet.
+      parameters:
+        - $ref: "#/components/parameters/job_id"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QueryPlanEdit"
+      responses:
+        "200":
+          description: Updated retrieval plan
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QueryPlan"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /api/v1/jobs/{job_id}/links:
+    get:
+      operationId: get_job_links
+      tags: [Links]
+      summary: Get the escalation budgets and mode settings for a job's links
+      description: >
+        A link points at a second procedure whose own entry signals are
+        recognised in the evidence this job already retrieved. The findings
+        themselves ride in the correlation stage output; this endpoint answers
+        the three things a finding cannot state — how much this deployment lets
+        the lane spend, which procedure names the mode endpoint accepts, and
+        which modes this job currently holds. It answers before correlation has
+        run, because all three are knowable from the config and the pack.
+      parameters:
+        - $ref: "#/components/parameters/job_id"
+      responses:
+        "200":
+          description: Escalation budgets, the procedure menu, and per-job modes
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LinkOverview"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /api/v1/jobs/{job_id}/links/{index}/refer:
+    post:
+      operationId: refer_job_link
+      tags: [Links]
+      summary: Compose a referral for one link finding
+      description: >
+        Composes the full request body a child run of the linked procedure would
+        need — the scope derived from the link's causal direction and the parent's
+        retrieval plan — and records the composition in the parent's audit trail.
+        Nothing is launched: `launched` is always false, and the caller submits
+        `request` verbatim to POST /api/v1/jobs to start the child. Supply
+        `launched_job_id` to record a child launched separately; the id is
+        verified against the job registry.
+      parameters:
+        - $ref: "#/components/parameters/job_id"
+        - name: index
+          in: path
+          required: true
+          schema:
+            type: integer
+            minimum: 0
+          description: Zero-based index of the link finding.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LinkReferral"
+      responses:
+        "200":
+          description: The composed referral; no child run started
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LinkReferralComposition"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /api/v1/jobs/{job_id}/links/mode:
+    post:
+      operationId: set_job_link_modes
+      tags: [Links]
+      summary: Set the escalation mode per target procedure
+      description: >
+        Sets how this run handles one or more target procedures: compose a
+        referral for a human to execute (planned), escalate automatically at or
+        above the configured link score (semi_auto), or escalate whenever the
+        rung-1 gate permits (auto). All-or-nothing, with every target resolved
+        against the pack before anything is written. The response reports the
+        mode that took EFFECT per target, which a rung-1 gate that did not hold
+        clamps to planned — read `mode`, not `asked`.
+      parameters:
+        - $ref: "#/components/parameters/job_id"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LinkModeUpdate"
+      responses:
+        "200":
+          description: The effective mode per target
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LinkModeResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /api/v1/jobs/{job_id}/report:
+    get:
+      operationId: get_job_report
+      tags: [Artifacts]
+      summary: Get the report for a job
+      description: >
+        Returns the investigation report for the job in one of several formats.
+        The default format is JSON. The pdf and html formats are rendered
+        locally; md is the Markdown source. The view format returns a
+        browser-renderable HTML fragment. Returns 400 if the format is not
+        recognized and 404 if the job has no stored report yet.
+      parameters:
+        - $ref: "#/components/parameters/job_id"
+        - $ref: "#/components/parameters/report_format"
+      responses:
+        "200":
+          description: Report in the requested format
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InvestigationReport"
+            text/html:
+              schema:
+                type: string
+            text/markdown:
+              schema:
+                type: string
+            application/pdf:
+              schema:
+                type: string
+                format: binary
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/jobs/{job_id}/evidence:
+    get:
+      operationId: get_job_evidence
+      tags: [Artifacts]
+      summary: Get the evidence sidecar for a job
+      description: >
+        Returns the evidence artifact for the job. Without ?download=1 or
+        ?full=1 the response is a bounded outline. With ?kind=raw the raw
+        retrieved log rows are returned; with ?kind=transformed the
+        post-correlation transformed rows are returned.
+      parameters:
+        - $ref: "#/components/parameters/job_id"
+        - $ref: "#/components/parameters/evidence_kind"
+        - $ref: "#/components/parameters/evidence_download"
+        - $ref: "#/components/parameters/evidence_full"
+      responses:
+        "200":
+          description: Evidence data
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/jobs/{job_id}/artifacts:
+    get:
+      operationId: get_job_artifacts
+      tags: [Artifacts]
+      summary: List available artifacts for a job
+      description: >
+        Returns the list of artifact keys (report formats, evidence files)
+        available for the job and whether each is present.
+      parameters:
+        - $ref: "#/components/parameters/job_id"
+      responses:
+        "200":
+          description: Artifact listing
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ArtifactListing"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/incidents/{incident_id}/report:
+    get:
+      operationId: get_incident_report
+      tags: [Artifacts]
+      summary: Get a report by incident ID
+      description: >
+        Looks up the most recent completed job for the given incident_id and
+        returns its report. Accepts the same format parameter as
+        GET /api/v1/jobs/{job_id}/report.
+      parameters:
+        - $ref: "#/components/parameters/incident_id"
+        - $ref: "#/components/parameters/report_format"
+      responses:
+        "200":
+          description: Report in the requested format
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InvestigationReport"
+            text/html:
+              schema:
+                type: string
+            text/markdown:
+              schema:
+                type: string
+            application/pdf:
+              schema:
+                type: string
+                format: binary
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/incidents/{incident_id}/evidence:
+    get:
+      operationId: get_incident_evidence
+      tags: [Artifacts]
+      summary: Get evidence for an incident by incident ID
+      description: >
+        Looks up the most recent completed job for the given incident_id and
+        returns its evidence. Accepts the same kind, download, and full
+        parameters as GET /api/v1/jobs/{job_id}/evidence.
+      parameters:
+        - $ref: "#/components/parameters/incident_id"
+        - $ref: "#/components/parameters/evidence_kind"
+        - $ref: "#/components/parameters/evidence_download"
+        - $ref: "#/components/parameters/evidence_full"
+      responses:
+        "200":
+          description: Evidence data
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/incidents/{incident_id}/artifacts:
+    get:
+      operationId: get_incident_artifacts
+      tags: [Artifacts]
+      summary: List artifacts for an incident by incident ID
+      description: >
+        Looks up the most recent completed job for the given incident_id and
+        returns the artifact listing.
+      parameters:
+        - $ref: "#/components/parameters/incident_id"
+      responses:
+        "200":
+          description: Artifact listing
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ArtifactListing"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/v1/feedback:
+    post:
+      operationId: receive_feedback
+      tags: [Feedback]
+      summary: Submit analyst feedback for a job
+      description: >
+        Accepts structured analyst feedback for a completed job. The feedback
+        is stored and later processed (either on schedule or via POST
+        /api/v1/feedback/process) to distil guidance and tune the
+        anomaly-detection threshold. The threshold is bounded against the
+        configured baseline so drift cannot compound.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FeedbackSubmission"
+      responses:
+        "200":
+          description: Feedback accepted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+    get:
+      operationId: get_feedback
+      tags: [Feedback]
+      summary: List stored feedback entries
+      description: Returns all stored feedback submissions, most recent first.
+      responses:
+        "200":
+          description: Feedback list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/FeedbackEntry"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /api/v1/feedback/guidance:
+    get:
+      operationId: get_feedback_guidance
+      tags: [Feedback]
+      summary: Get distilled feedback guidance
+      description: >
+        Returns the current distilled guidance that is injected into the
+        understanding and anomaly-detection prompts. Guidance is distilled
+        from stored feedback by the feedback processing step.
+      responses:
+        "200":
+          description: Distilled guidance
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FeedbackGuidance"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /api/v1/feedback/process:
+    post:
+      operationId: process_feedback_now
+      tags: [Feedback]
+      summary: Trigger immediate feedback processing
+      description: >
+        Triggers feedback distillation and threshold tuning immediately rather
+        than waiting for the scheduled processing cycle. Returns 409 if
+        processing is already in progress.
+      responses:
+        "200":
+          description: Processing complete
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                  guidance_updated:
+                    type: boolean
+                  threshold_updated:
+                    type: boolean
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "502":
+          description: Processing failed due to an upstream error (e.g. LLM failure)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /api/v1/feedback/threshold:
+    get:
+      operationId: get_feedback_threshold
+      tags: [Feedback]
+      summary: Get the current anomaly-detection threshold
+      description: >
+        Returns the current effective anomaly-detection threshold and the
+        baseline from the configuration. The effective value is tuned from
+        feedback but always bounded against the configured baseline.
+      parameters:
+        - name: domain
+          in: query
+          required: false
+          schema:
+            type: string
+          description: >
+            If supplied, return the threshold for the named domain. If absent,
+            return the default threshold.
+      responses:
+        "200":
+          description: Threshold values
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ThresholdInfo"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /api/v1/feedback/threshold/reset:
+    post:
+      operationId: reset_feedback_threshold
+      tags: [Feedback]
+      summary: Reset the anomaly-detection threshold to the configured baseline
+      description: >
+        Discards the feedback-tuned threshold and restores the value from the
+        configuration file.
+      responses:
+        "200":
+          description: Threshold reset
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ThresholdInfo"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /api/v1/config:
+    get:
+      operationId: get_config
+      tags: [Configuration]
+      summary: Read the current configuration
+      description: >
+        Returns the merged live configuration. Literal credential values are
+        replaced with the string __redacted__. The api_key fields in LLM
+        configuration are not returned; only api_key_env (the name of the
+        environment variable that holds the key) is exposed.
+      responses:
+        "200":
+          description: Configuration object (secrets redacted)
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                description: >
+                  The full configuration tree. All literal secret values are
+                  replaced with the string __redacted__. The api_key_env field
+                  holds an environment-variable name, never a literal token.
+        "500":
+          $ref: "#/components/responses/InternalError"
+    put:
+      operationId: patch_config
+      tags: [Configuration]
+      summary: Patch live configuration fields
+      description: >
+        Applies a partial configuration update to the running server and
+        persists it via the storage mirror. Only fields declared as live=true
+        in the configuration schema are applied without a restart; other fields
+        are validated and stored but take effect on the next startup. A patch
+        is all-or-nothing; it applies only to the direct child at each dotted
+        path segment. Returns the updated configuration with secrets redacted.
+        Submitting __redacted__ for a credential field restores the placeholder
+        and does not overwrite the stored value.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+              description: >
+                Partial configuration object. Dotted-path keys are expanded.
+                Submit __redacted__ for any secret field to leave it unchanged.
+      responses:
+        "200":
+          description: Updated configuration (secrets redacted)
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/config/{name}:
+    get:
+      operationId: export_config_file
+      tags: [Configuration]
+      summary: Download a configuration file by name
+      description: >
+        Returns the raw YAML text of the named configuration file (e.g.
+        main_config.yaml or llm_config.yaml). Secrets are redacted in the
+        returned text.
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Configuration file name, e.g. main_config.yaml.
+      responses:
+        "200":
+          description: Configuration file content (secrets redacted)
+          content:
+            text/plain:
+              schema:
+                type: string
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    put:
+      operationId: replace_config_file
+      tags: [Configuration]
+      summary: Replace a configuration file
+      description: >
+        Replaces the named configuration file with the supplied YAML text.
+        Validates the content before writing. The file is written to the
+        working copy and mirrored to the storage backend.
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Configuration file name to replace.
+      requestBody:
+        required: true
+        content:
+          text/plain:
+            schema:
+              type: string
+              description: Complete YAML text of the new configuration file.
+      responses:
+        "200":
+          description: File replaced
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                  durable:
+                    type: boolean
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/config/import:
+    post:
+      operationId: import_config
+      tags: [Configuration]
+      summary: Import a configuration bundle
+      description: >
+        Accepts a configuration bundle (a zip or JSON object containing one
+        or more configuration files) and applies them. Used to restore a
+        configuration from an export or to bulk-update multiple files.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200":
+          description: Import complete
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                  files_written:
+                    type: integer
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/knowledge:
+    get:
+      operationId: list_knowledge_packs
+      tags: [Knowledge]
+      summary: List available knowledge packs
+      description: >
+        Returns the names and basic metadata of all knowledge packs found
+        under the configured knowledge.pack_dir.
+      responses:
+        "200":
+          description: List of knowledge pack summaries
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/KnowledgePackSummary"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/knowledge/scaffold:
+    post:
+      operationId: scaffold_knowledge_pack
+      tags: [Knowledge]
+      summary: Create a new knowledge pack from the template
+      description: >
+        Scaffolds a new knowledge pack directory under knowledge.pack_dir
+        using the built-in template. Returns 409 if a pack with the given
+        name already exists.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name:
+                  type: string
+                  description: Name for the new pack. Must be a valid directory name.
+      responses:
+        "200":
+          description: Pack created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/KnowledgePackSummary"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/knowledge/{pack}:
+    get:
+      operationId: get_knowledge_pack
+      tags: [Knowledge]
+      summary: Get knowledge pack metadata
+      description: >
+        Returns metadata and top-level structure information for the named
+        knowledge pack.
+      parameters:
+        - $ref: "#/components/parameters/pack"
+      responses:
+        "200":
+          description: Knowledge pack metadata
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/KnowledgePackDetail"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/knowledge/{pack}/tree:
+    get:
+      operationId: get_knowledge_tree
+      tags: [Knowledge]
+      summary: Get the file tree of a knowledge pack
+      description: >
+        Returns the full directory tree of the named knowledge pack as a
+        nested structure, suitable for rendering a file browser.
+      parameters:
+        - $ref: "#/components/parameters/pack"
+      responses:
+        "200":
+          description: Directory tree
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FileTree"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/knowledge/{pack}/file:
+    get:
+      operationId: get_knowledge_file
+      tags: [Knowledge]
+      summary: Read a file from a knowledge pack
+      description: >
+        Returns the text content of the named file within the pack. The path
+        is supplied as a query parameter. Returns 413 if the file exceeds the
+        configured read-size limit.
+      parameters:
+        - $ref: "#/components/parameters/pack"
+        - name: path
+          in: query
+          required: true
+          schema:
+            type: string
+          description: >
+            Relative path within the pack, e.g.
+            use_cases/{use_case}/rules.yaml.
+      responses:
+        "200":
+          description: File content
+          content:
+            text/plain:
+              schema:
+                type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "413":
+          description: File exceeds the configured read-size limit.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    put:
+      operationId: save_knowledge_file
+      tags: [Knowledge]
+      summary: Save (overwrite) a file in a knowledge pack
+      description: >
+        Writes the request body as the new content of the named file within
+        the pack. Creates the file if it does not exist. Returns 409 if the
+        file is locked by an in-progress assist session. Returns 413 if the
+        content exceeds the configured write-size limit.
+      parameters:
+        - $ref: "#/components/parameters/pack"
+        - name: path
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Relative path within the pack.
+      requestBody:
+        required: true
+        content:
+          text/plain:
+            schema:
+              type: string
+      responses:
+        "200":
+          description: File saved
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                  durable:
+                    type: boolean
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "413":
+          description: Content exceeds the configured write-size limit.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    post:
+      operationId: create_knowledge_file
+      tags: [Knowledge]
+      summary: Create a new file in a knowledge pack
+      description: >
+        Creates a new file at the given path within the pack. Returns 409 if
+        a file already exists at that path.
+      parameters:
+        - $ref: "#/components/parameters/pack"
+        - name: path
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Relative path within the pack for the new file.
+      requestBody:
+        required: true
+        content:
+          text/plain:
+            schema:
+              type: string
+      responses:
+        "200":
+          description: File created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                  durable:
+                    type: boolean
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    delete:
+      operationId: delete_knowledge_file
+      tags: [Knowledge]
+      summary: Delete a file from a knowledge pack
+      description: >
+        Deletes the named file from the pack. The deletion is recorded as a
+        tombstone in the storage mirror so that a subsequent sync does not
+        re-seed it. Returns 409 if the file is locked by an assist session.
+      parameters:
+        - $ref: "#/components/parameters/pack"
+        - name: path
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Relative path within the pack.
+      responses:
+        "200":
+          description: File deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                  durable:
+                    type: boolean
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/knowledge/{pack}/validate:
+    get:
+      operationId: validate_knowledge_pack
+      tags: [Knowledge]
+      summary: Validate a knowledge pack
+      description: >
+        Runs pack_validate over the named pack and returns a diagnostics
+        report. A 200 is returned even when the pack has validation errors;
+        the report body indicates whether the pack passed. With ?strict=1 a
+        pack that fails validation returns 422 instead. The validator checks
+        field paths against source schemas where available and is silent where
+        no schema inventory exists, reporting how many path lists it could
+        check.
+      parameters:
+        - $ref: "#/components/parameters/pack"
+        - name: strict
+          in: query
+          required: false
+          schema:
+            type: integer
+            enum: [1]
+          description: If 1, return 422 when the pack fails validation.
+      responses:
+        "200":
+          description: Validation report (may indicate errors)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ValidationReport"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          description: >
+            Pack failed validation and ?strict=1 was supplied. Body is the
+            same validation report schema.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ValidationReport"
+
+  /api/v1/knowledge/{pack}/history:
+    get:
+      operationId: get_knowledge_history
+      tags: [Knowledge]
+      summary: Get the edit history for a knowledge pack file
+      description: >
+        Returns the list of historical versions of the given file, ordered
+        from most recent to oldest. The path query parameter identifies the
+        file.
+      parameters:
+        - $ref: "#/components/parameters/pack"
+        - name: path
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Relative path within the pack.
+      responses:
+        "200":
+          description: List of historical versions
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/FileHistoryEntry"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/knowledge/{pack}/history/restore:
+    post:
+      operationId: restore_knowledge_file
+      tags: [Knowledge]
+      summary: Restore a file to a historical version
+      description: >
+        Restores the named file to a specific historical version identified by
+        version ID. Returns 409 if the file is locked by an assist session.
+      parameters:
+        - $ref: "#/components/parameters/pack"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [path, version_id]
+              properties:
+                path:
+                  type: string
+                  description: Relative path within the pack.
+                version_id:
+                  type: string
+                  description: Version identifier from the history listing.
+      responses:
+        "200":
+          description: File restored
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                  durable:
+                    type: boolean
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/knowledge/{pack}/import:
+    post:
+      operationId: import_knowledge_files
+      tags: [Knowledge]
+      summary: Import files into a knowledge pack
+      description: >
+        Accepts a bundle of files (multipart/form-data or a JSON map of
+        path to content) and writes them into the named pack. Existing files
+        are overwritten.
+      parameters:
+        - $ref: "#/components/parameters/pack"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties:
+                type: string
+              description: Map of relative file path to file content.
+          multipart/form-data:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200":
+          description: Import complete
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                  files_written:
+                    type: integer
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/knowledge/{pack}/assist:
+    get:
+      operationId: list_knowledge_assists
+      tags: [Knowledge]
+      summary: List pack assistant sessions
+      description: >
+        Returns the list of pack assistant sessions for the named pack, most
+        recent first.
+      parameters:
+        - $ref: "#/components/parameters/pack"
+      responses:
+        "200":
+          description: List of assist sessions
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/AssistSession"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+    post:
+      operationId: start_knowledge_assist
+      tags: [Knowledge]
+      summary: Start a new pack assistant session
+      description: >
+        Starts an LLM-driven pack assistant session. The assistant analyses
+        the current pack state and the supplied prompt, then proposes file
+        changes. The session streams progress via SSE at
+        GET /api/v1/knowledge/{pack}/assist/{session}/events. Returns 202
+        (Accepted) immediately; the session completes asynchronously. Returns
+        413 if the pack context exceeds the LLM input limit.
+      parameters:
+        - $ref: "#/components/parameters/pack"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AssistRequest"
+      responses:
+        "202":
+          description: Session started
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AssistSession"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "413":
+          description: Pack context exceeds the LLM input limit.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /api/v1/knowledge/{pack}/assist/{session}:
+    get:
+      operationId: get_knowledge_assist
+      tags: [Knowledge]
+      summary: Get a pack assistant session
+      description: >
+        Returns the current state of the named assist session, including any
+        proposed file changes. Returns 409 if the session is still in
+        progress and no result is available yet.
+      parameters:
+        - $ref: "#/components/parameters/pack"
+        - $ref: "#/components/parameters/session"
+      responses:
+        "200":
+          description: Assist session record
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AssistSession"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /api/v1/knowledge/{pack}/assist/{session}/events:
+    get:
+      operationId: stream_knowledge_assist
+      tags: [Knowledge]
+      summary: Stream pack assistant progress as Server-Sent Events
+      description: >
+        Opens an SSE stream for the named assist session. Events are emitted
+        as the LLM produces proposed changes. The stream closes when the
+        session completes or fails. Returns 409 if the session is already
+        complete.
+      parameters:
+        - $ref: "#/components/parameters/pack"
+        - $ref: "#/components/parameters/session"
+      responses:
+        "200":
+          description: SSE stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /api/v1/knowledge/{pack}/assist/{session}/apply:
+    post:
+      operationId: apply_knowledge_assist
+      tags: [Knowledge]
+      summary: Apply the changes proposed by an assist session
+      description: >
+        Writes the file changes proposed by the assist session into the pack.
+        The operator may supply a subset of the proposed changes to apply
+        selectively. All or nothing: a validation error the plan INTRODUCES
+        refuses the whole write and nothing is written, since a pack left
+        failing validation loads as an empty pack on the next run. Errors the
+        pack already had do not block, or the first fix would be unappliable.
+        Returns 409 if the session is still in progress. Returns 503 if the
+        storage write fails.
+      parameters:
+        - $ref: "#/components/parameters/pack"
+        - $ref: "#/components/parameters/session"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                paths:
+                  type: array
+                  items:
+                    type: string
+                  description: >
+                    Subset of proposed file paths to apply. If absent, all
+                    proposed changes are applied.
+      responses:
+        "200":
+          description: Changes applied
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                  files_written:
+                    type: integer
+                  durable:
+                    type: boolean
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /api/v1/knowledge/{pack}/assist/{session}/reject:
+    post:
+      operationId: reject_knowledge_assist
+      tags: [Knowledge]
+      summary: Reject and discard an assist session
+      description: >
+        Marks the session as rejected and discards the proposed changes. The
+        session record is retained for audit purposes. Returns 202 Accepted.
+        Returns 409 if the session is still in progress.
+      parameters:
+        - $ref: "#/components/parameters/pack"
+        - $ref: "#/components/parameters/session"
+      responses:
+        "202":
+          description: Session rejected
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AssistSession"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+components:
+
+  parameters:
+
+    job_id:
+      name: job_id
+      in: path
+      required: true
+      schema:
+        type: string
+      description: Unique job identifier (UUID).
+
+    incident_id:
+      name: incident_id
+      in: path
+      required: true
+      schema:
+        type: string
+      description: Incident identifier as supplied in the original incident submission.
+
+    pack:
+      name: pack
+      in: path
+      required: true
+      schema:
+        type: string
+      description: Knowledge pack name (directory name under knowledge.pack_dir).
+
+    session:
+      name: session
+      in: path
+      required: true
+      schema:
+        type: string
+      description: Pack assistant session identifier.
+
+    report_format:
+      name: format
+      in: query
+      required: false
+      schema:
+        type: string
+        enum: [json, view, html, md, pdf]
+        default: json
+      description: >
+        Report format. json (default) returns the structured report object.
+        view returns a browser-renderable HTML fragment. html returns a
+        complete HTML document. md returns Markdown source. pdf returns a
+        PDF binary.
+
+    evidence_kind:
+      name: kind
+      in: query
+      required: false
+      schema:
+        type: string
+        enum: [raw, transformed]
+        default: raw
+      description: >
+        raw returns the log rows as retrieved. transformed returns the
+        post-correlation transformed rows.
+
+    evidence_download:
+      name: download
+      in: query
+      required: false
+      schema:
+        type: integer
+        enum: [1]
+      description: >
+        If 1, return the full evidence file rather than a bounded outline and
+        set Content-Disposition: attachment.
+
+    evidence_full:
+      name: full
+      in: query
+      required: false
+      schema:
+        type: integer
+        enum: [1]
+      description: >
+        If 1, return the full evidence data inline (no download header).
+
+  responses:
+
+    BadRequest:
+      description: The request was malformed or contained invalid field values.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorBody"
+
+    NotFound:
+      description: The requested resource does not exist.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorBody"
+
+    Conflict:
+      description: >
+        The operation is not valid in the resource's current state (e.g. a
+        gate resolution when no gate is open, or a concurrent processing
+        request).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorBody"
+
+    InternalError:
+      description: An unexpected server-side error occurred.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorBody"
+
+    QueueFull:
+      description: >
+        The run queue's backlog is full (jobs.max_queued_jobs). The submission
+        is refused rather than accepted, because a job id for a run that may
+        never start reads exactly like a run that is merely slow.
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+              queued:
+                type: integer
+                description: Submissions waiting when the request was refused.
+              max_queued:
+                type: integer
+                description: The configured backlog bound.
+              retry:
+                type: string
+                example: >
+                  poll GET /api/v1/jobs and resubmit once the backlog drains
+
+    ServiceUnavailable:
+      description: >
+        A required service (LLM endpoint, storage backend, or retrieval
+        backend) is not available or not yet initialised.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorBody"
+
+    BlockingRetired:
+      description: >
+        This blocking endpoint is disabled. The server is configured with
+        blocking_endpoints=auto or on, which returns 501 in deployment
+        environments where the ingress timeout is shorter than the pipeline
+        duration. Use POST /api/v1/jobs instead.
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+                example: >
+                  This endpoint is disabled (blocking_endpoints=auto). Use
+                  POST /api/v1/jobs to submit incidents asynchronously.
+              use_instead:
+                type: string
+                example: POST /api/v1/jobs
+
+  schemas:
+
+    ErrorBody:
+      type: object
+      properties:
+        error:
+          type: string
+          description: Human-readable error message.
+        detail:
+          type: string
+          description: Additional context, present on some errors.
+      required: [error]
+
+    ShallowHealth:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded]
+      required: [status]
+
+    DeepHealth:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded]
+        llm_credential:
+          type: boolean
+          nullable: true
+          description: >
+            true a token resolves, false wired but unusable (every LLM stage will
+            401), null no LLM client wired at all. null and false are different
+            answers: a pure-export deployment legitimately has none, and reporting
+            "not wired" as a failure is how an indicator stops being read.
+        pack:
+          type: boolean
+          description: Whether knowledge.pack_dir is configured.
+        jobs:
+          type: integer
+          nullable: true
+          description: >
+            Number of live jobs, or null if no job manager is wired or the lister
+            raised.
+        pipeline:
+          type: boolean
+          description: Whether an incident-processing function is wired.
+        storage:
+          type: string
+          enum: [local, databricks, sql]
+          nullable: true
+          description: Where durable state lives, or null if no store is wired.
+        storage_ok:
+          type: boolean
+          nullable: true
+          description: >
+            true usable, false unusable with storage_detail naming the cause, null
+            not wired.
+        storage_detail:
+          type: string
+          nullable: true
+          description: >
+            Why the store is unusable (a blank catalog, a 403 from a
+            workspace-scoped PAT, an unset DSN env var), else null.
+        sources_declared:
+          type: integer
+          nullable: true
+          description: >
+            How many sources the pack declared and the engine resolved - built plus
+            unavailable. null when no engine is wired.
+        sources_unavailable:
+          type: object
+          additionalProperties:
+            type: string
+          nullable: true
+          description: >
+            {source: reason} for every declared source that built no retriever on
+            this boot; {} when all are queryable, null when no engine is wired. A
+            map rather than a count because "0 unavailable" and "18 of 30, every ES
+            one" are different answers and only the second names a credential to set.
+        retrieval_cache:
+          allOf:
+            - $ref: "#/components/schemas/RetrievalCacheStats"
+          nullable: true
+          description: >
+            Retrieval cache counters and bounds, or null when no retrieval engine
+            is wired.
+      required: [status, storage_ok]
+
+    RetrievalCacheStats:
+      type: object
+      description: >
+        Counters for the in-process retrieval cache (log_sources.cache). Disabled
+        unless a deployment enables it, in which case every lookup misses.
+      properties:
+        enabled:
+          type: boolean
+        entries:
+          type: integer
+        rows:
+          type: integer
+          description: Rows held across all entries.
+        hits:
+          type: integer
+        misses:
+          type: integer
+        hit_rate:
+          type: number
+          description: >
+            hits / (hits + misses), reported beside the raw counts and not instead
+            of them: a rate over three lookups is not a measurement.
+        stores:
+          type: integer
+        evictions:
+          type: integer
+        expiries:
+          type: integer
+        ttl_seconds:
+          type: integer
+        empty_ttl_seconds:
+          type: integer
+          description: >
+            0 means an empty answer is never kept - it is the answer a re-ask most
+            often changes.
+        max_entries:
+          type: integer
+        max_rows:
+          type: integer
+      required: [enabled, entries, hits, misses]
+
+    ExtractedEntity:
+      type: object
+      description: A named entity extracted from an incident description.
+      properties:
+        type:
+          type: string
+          description: >
+            Entity type as declared in the pack's entity glossary, e.g. user_id
+            or ip_address.
+        value:
+          type: string
+          description: Canonical entity value.
+        raw:
+          type: string
+          default: ""
+          description: Raw string as it appeared in the incident text.
+        value_form:
+          type: string
+          default: ""
+          description: >
+            Classified surface form of the value, used to route the value to
+            the correct column binding in field_mapping.
+        co_occurrence:
+          type: string
+          default: ""
+          description: >
+            Co-occurrence tag used for co-identity resolution in correlation.
+      required: [type, value]
+
+    EventWindow:
+      type: object
+      description: A time window bounding a security event.
+      properties:
+        start:
+          type: string
+          description: ISO-8601 start of the window.
+        end:
+          type: string
+          description: ISO-8601 end of the window.
+      required: [start, end]
+
+    IncidentAnalysis:
+      type: object
+      description: >
+        Structured understanding of an incident as produced by the
+        understanding stage. This object is both the Python data contract and
+        the JSON schema handed to the LLM.
+      properties:
+        incident_summary:
+          type: string
+        severity:
+          type: string
+        severity_reasoning:
+          type: string
+        impact_assessment:
+          type: string
+        key_investigation_areas:
+          type: array
+          items:
+            type: string
+        log_sources_to_review:
+          type: array
+          items:
+            type: string
+        initial_hypotheses:
+          type: array
+          items:
+            type: string
+        recommended_actions:
+          type: array
+          items:
+            type: string
+        stakeholder_notification:
+          type: array
+          items:
+            type: string
+        extracted_entities:
+          type: array
+          items:
+            $ref: "#/components/schemas/ExtractedEntity"
+        correlation_keys:
+          type: array
+          items:
+            type: string
+        event_time:
+          oneOf:
+            - $ref: "#/components/schemas/EventWindow"
+            - type: "null"
+        requested_links:
+          type: array
+          items:
+            type: string
+          description: Procedure names the understanding stage suggests linking to.
+        pinned_use_case:
+          type: string
+          default: ""
+          description: >
+            If non-empty, overrides the dynamic playbook selection and forces
+            this use-case key.
+      required:
+        - incident_summary
+        - severity
+        - severity_reasoning
+        - impact_assessment
+        - key_investigation_areas
+        - log_sources_to_review
+        - initial_hypotheses
+        - recommended_actions
+        - stakeholder_notification
+        - extracted_entities
+        - correlation_keys
+
+    RetrievalQuery:
+      type: object
+      description: A single log-source query in the retrieval plan.
+      properties:
+        target_log_source:
+          type: string
+          description: Name of the log source to query.
+        natural_language_query:
+          type: string
+          description: The question the query is intended to answer.
+        scope_id:
+          type: string
+          default: "*"
+          description: Entity value scoping the query, or * for unscoped.
+        actor_id:
+          type: string
+          default: "*"
+          description: Actor entity value, or * for unscoped.
+        date_from:
+          type: string
+          description: ISO-8601 start of the retrieval window.
+        date_to:
+          type: string
+          description: ISO-8601 end of the retrieval window.
+        entities:
+          type: array
+          items:
+            $ref: "#/components/schemas/ExtractedEntity"
+          description: Entities resolved onto this query by _enrich_queries.
+      required:
+        - target_log_source
+        - natural_language_query
+        - date_from
+        - date_to
+
+    AnomalyItem:
+      type: object
+      description: A single anomaly detected by the anomaly-detection stage.
+      properties:
+        description:
+          type: string
+        supporting_data:
+          type: string
+        potential_implications:
+          type: string
+        confidence_score:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+        recommended_actions:
+          type: string
+        patterns:
+          type: string
+        below_threshold:
+          type: boolean
+          default: false
+          description: >
+            True when the anomaly's confidence is below the current detection
+            threshold. Below-threshold anomalies are retained in exports and
+            PDF/text tables but are not included in the primary report
+            narrative.
+      required:
+        - description
+        - supporting_data
+        - potential_implications
+        - confidence_score
+        - recommended_actions
+        - patterns
+
+    AnomalyList:
+      type: object
+      properties:
+        anomalies:
+          type: array
+          items:
+            $ref: "#/components/schemas/AnomalyItem"
+      required: [anomalies]
+
+    ReportSection:
+      type: object
+      description: A section in an investigation report (may be nested).
+      properties:
+        section_title:
+          type: string
+        content:
+          description: >
+            Section body. May be a string, a list of strings (bullet points),
+            or a list of nested ReportSection objects.
+          oneOf:
+            - type: string
+            - type: array
+              items:
+                type: string
+            - type: array
+              items:
+                $ref: "#/components/schemas/ReportSection"
+      required: [section_title, content]
+
+    InvestigationReport:
+      type: object
+      description: The final investigation report produced by the report-generation stage.
+      properties:
+        sections:
+          type: array
+          items:
+            $ref: "#/components/schemas/ReportSection"
+      required: [sections]
+
+    IncidentInput:
+      type: object
+      description: An incident submitted for processing.
+      properties:
+        incident_id:
+          type: string
+          description: >
+            Caller-supplied incident identifier. If absent the server assigns
+            one.
+        title:
+          type: string
+          description: Short title for the incident.
+        description:
+          type: string
+          description: Full incident description text.
+        timestamp:
+          type: string
+          description: >
+            ISO-8601 timestamp of when the incident was raised. Used to anchor
+            the retrieval window. If absent the server uses the ingestion time.
+        severity:
+          type: string
+          description: Caller-assessed severity level.
+        metadata:
+          type: object
+          additionalProperties: true
+          description: Arbitrary additional fields passed through to the pipeline.
+      required: [description]
+
+    FreetextIncidentInput:
+      type: object
+      description: Free-text incident description for the freetext endpoint.
+      properties:
+        text:
+          type: string
+          description: Unstructured incident description text.
+        incident_id:
+          type: string
+        timestamp:
+          type: string
+      required: [text]
+
+    CreateJobRequest:
+      type: object
+      description: Request body for creating a pipeline job.
+      properties:
+        incident:
+          $ref: "#/components/schemas/IncidentInput"
+          description: Incident to process. Required unless freetext is supplied.
+        freetext:
+          type: string
+          description: >
+            Free-text incident description. Mutually exclusive with incident.
+        run_mode:
+          type: string
+          enum: [auto, semi_auto, supervised]
+          description: >
+            Controls gate behaviour. auto runs without pausing; semi_auto
+            pauses at scored gate thresholds; supervised pauses at every stage.
+            Defaults to the server configuration value.
+        pack:
+          type: string
+          description: >
+            Knowledge pack to use. If absent, the server uses the loaded pack.
+        parent_job_id:
+          type: string
+          description: >
+            ID of the parent job when this job is a child investigation
+            spawned via a cross-procedure link referral.
+
+    CreateBatchRequest:
+      type: object
+      description: Request body for submitting a batch of incidents.
+      properties:
+        incidents:
+          type: array
+          minItems: 1
+          maxItems: 500
+          description: >
+            Each entry is either a free-text description or an object carrying
+            description, extended_retrieval and link_pin.
+          items:
+            oneOf:
+              - type: string
+              - type: object
+                properties:
+                  description:
+                    type: string
+                  extended_retrieval:
+                    type: boolean
+                  link_pin:
+                    type: string
+                required: [description]
+        mode:
+          type: string
+          enum: [auto, semi_auto, supervised]
+          description: >
+            Run mode applied to every job in the batch. An unrecognised value
+            falls back to auto with a warning.
+        batch_id:
+          type: string
+          description: >
+            Caller-supplied batch id. Generated when absent.
+      required: [incidents]
+
+    BatchSubmission:
+      type: object
+      description: What a batch submission accepted, refused and rejected.
+      properties:
+        batch_id:
+          type: string
+        accepted:
+          type: array
+          description: One entry per job created, with its position in the backlog.
+          items:
+            type: object
+            properties:
+              job_id:
+                type: string
+              incident_id:
+                type: string
+              status:
+                type: string
+              queue_position:
+                type: integer
+                description: 1-based position while waiting; 0 once running.
+        refused:
+          type: array
+          description: Incidents the backlog bound had no room for.
+          items:
+            type: object
+            properties:
+              incident_id:
+                type: string
+              reason:
+                type: string
+              depth:
+                type: integer
+              limit:
+                type: integer
+        rejected:
+          type: array
+          description: Malformed entries, by their index in the request.
+          items:
+            type: object
+            properties:
+              index:
+                type: integer
+              error:
+                type: string
+        queue:
+          $ref: "#/components/schemas/RunQueueStats"
+
+    BatchStatus:
+      type: object
+      description: One batch's progress, derived from its jobs.
+      properties:
+        batch_id:
+          type: string
+        total:
+          type: integer
+        counts:
+          type: object
+          additionalProperties:
+            type: integer
+          description: Live job count per status value.
+        done:
+          type: integer
+          description: >
+            Jobs in a terminal status. A floor, not a total — finished jobs are
+            pruned from memory after their TTL.
+        jobs:
+          type: array
+          items:
+            type: object
+            properties:
+              job_id:
+                type: string
+              incident_id:
+                type: string
+              status:
+                type: string
+              current_stage:
+                type: string
+                nullable: true
+              queue_position:
+                type: integer
+              error:
+                type: string
+                nullable: true
+
+    RunQueueStats:
+      type: object
+      description: The run queue's width, depth and lifetime counters.
+      properties:
+        width:
+          type: integer
+          description: Submitted runs allowed in flight (jobs.max_concurrent_jobs).
+        max_queued:
+          type: integer
+          description: Backlog bound (jobs.max_queued_jobs).
+        running:
+          type: integer
+        queued:
+          type: integer
+        admitted:
+          type: integer
+          description: Runs started immediately, since process start.
+        queued_total:
+          type: integer
+          description: Runs that had to wait, since process start.
+        refused:
+          type: integer
+          description: Submissions refused for a full backlog.
+        withdrawn:
+          type: integer
+          description: Waiting runs taken out of the backlog before starting.
+
+    Job:
+      type: object
+      description: A pipeline job record.
+      properties:
+        id:
+          type: string
+          description: Unique job identifier (UUID).
+        incident_id:
+          type: string
+        status:
+          type: string
+          enum: [queued, running, paused, completed, failed, cancelled]
+        run_mode:
+          type: string
+          enum: [auto, semi_auto, supervised]
+        created_at:
+          type: string
+          description: ISO-8601 creation timestamp.
+        updated_at:
+          type: string
+          description: ISO-8601 last-update timestamp.
+        stages:
+          type: array
+          items:
+            $ref: "#/components/schemas/StageRecord"
+          description: Per-stage execution records.
+        gate:
+          oneOf:
+            - $ref: "#/components/schemas/GateState"
+            - type: "null"
+          description: Current gate state, or null if no gate is open.
+        health:
+          type: object
+          additionalProperties: true
+          description: Per-stage health scores and aggregate health score.
+        interventions:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+          description: Audit trail of human interventions applied to this job.
+        verdict:
+          type: string
+          nullable: true
+          description: >
+            Final verdict string from the verdict engine, e.g. FRAUD,
+            FALSE_POSITIVE, INSUFFICIENT_DATA. Null while the pipeline is
+            still running.
+      required: [id, status, created_at]
+
+    StageRecord:
+      type: object
+      description: Execution record for one pipeline stage.
+      properties:
+        name:
+          type: string
+        status:
+          type: string
+          enum: [pending, running, completed, failed, skipped]
+        started_at:
+          type: string
+          nullable: true
+        completed_at:
+          type: string
+          nullable: true
+        health_score:
+          type: number
+          nullable: true
+          description: Gate health score for this stage (0.0 to 1.0).
+        pass:
+          type: integer
+          description: Retrieval pass number. Omitted for non-retrieval stages.
+          nullable: true
+      required: [name, status]
+
+    GateState:
+      type: object
+      description: The state of a currently open approval gate.
+      properties:
+        job_id:
+          type: string
+        stage:
+          type: string
+          description: Name of the stage at which the gate is open.
+        stage_output:
+          type: object
+          additionalProperties: true
+          description: The stage output being reviewed.
+        health_score:
+          type: number
+          description: Computed health score that triggered the gate.
+        guidance:
+          type: array
+          items:
+            type: string
+          description: Guidance submitted by previous reviewers, if any.
+        opened_at:
+          type: string
+          description: ISO-8601 timestamp when the gate was opened.
+        timeout_at:
+          type: string
+          nullable: true
+          description: >
+            ISO-8601 timestamp when the gate will auto-resolve if a timeout
+            is configured. Null if the gate holds indefinitely.
+        timeout_action:
+          type: string
+          enum: [hold, proceed, abort]
+          nullable: true
+      required: [job_id, stage, opened_at]
+
+    GateResolution:
+      type: object
+      description: Operator decision for resolving an open gate.
+      properties:
+        action:
+          type: string
+          enum: [approve, reject, override]
+          description: >
+            approve: proceed with the current stage output. reject: re-run the
+            stage with the supplied guidance. override: replace the stage
+            output with the supplied data.
+        guidance:
+          type: string
+          description: >
+            Guidance text injected into the stage prompt on rejection. Required
+            when action is reject.
+        output:
+          type: object
+          additionalProperties: true
+          description: >
+            Replacement stage output. Required when action is override.
+        actor:
+          type: string
+          description: Identifier of the operator resolving the gate.
+      required: [action]
+
+    ControlRequest:
+      type: object
+      description: A control action sent to a running job.
+      properties:
+        action:
+          type: string
+          enum:
+            - pause
+            - resume
+            - step
+            - cancel_stage
+            - cancel_all
+            - retry_stage
+            - retry_all
+            - skip_stage
+            - release_gate
+          description: The control action to apply.
+        stage:
+          type: string
+          description: >
+            Stage name. Required for cancel_stage, retry_stage, and
+            skip_stage.
+        guidance:
+          type: string
+          description: Optional guidance to inject when retrying a stage.
+      required: [action]
+
+    QueryPlan:
+      type: object
+      description: The retrieval plan for a job.
+      properties:
+        queries:
+          type: array
+          items:
+            $ref: "#/components/schemas/RetrievalQuery"
+        pass:
+          type: integer
+          description: Current retrieval pass number.
+      required: [queries]
+
+    QueryPlanEdit:
+      type: object
+      description: A set of edits to apply to the retrieval plan.
+      properties:
+        add:
+          type: array
+          items:
+            type: object
+            required: [source, question]
+            properties:
+              source:
+                type: string
+                description: Name of the log source to query.
+              question:
+                type: string
+                description: Natural-language question for the query.
+          description: Queries to add to the plan.
+        remove:
+          type: array
+          items:
+            type: integer
+          description: Zero-based indices of queries to remove from the plan.
+
+    LinkFinding:
+      type: object
+      description: An advisory cross-procedure link finding.
+      properties:
+        procedure:
+          type: string
+          description: Name of the linked procedure.
+        score:
+          type: number
+          description: Cost-ladder relevance score.
+        mode:
+          type: string
+          enum: [planned, semi_auto, auto]
+        referred:
+          type: boolean
+          description: True if the link has already been referred (child job created).
+        child_job_id:
+          type: string
+          nullable: true
+          description: ID of the child job if the link has been referred.
+      required: [procedure, score, mode, referred]
+
+    LinkOverview:
+      type: object
+      description: >
+        What this deployment lets the link lane spend, and what it may be asked
+        to spend it on.
+      properties:
+        job_id:
+          type: string
+        correlated:
+          type: boolean
+          description: False before the correlation stage has run.
+        link_count:
+          type: integer
+        job_modes:
+          type: object
+          additionalProperties:
+            type: string
+            enum: [planned, semi_auto, auto]
+          description: Per-procedure mode overrides this job currently holds.
+        procedures:
+          type: array
+          items:
+            type: string
+          description: >
+            Procedure names the loaded pack declares — the menu the mode endpoint
+            accepts.
+        escalation:
+          $ref: "#/components/schemas/LinkEscalationBudget"
+      required: [job_id, correlated, link_count, job_modes, procedures, escalation]
+
+    LinkEscalationBudget:
+      type: object
+      description: >
+        The two paid rungs of the cost ladder, reported apart. Every value is
+        resolved through the same functions the run itself reads.
+      properties:
+        modes:
+          type: array
+          items:
+            type: string
+          description: The modes the mode endpoint accepts.
+        engine_default:
+          type: string
+          description: Mode in force where nothing declares one (semi_auto).
+        config_mode:
+          type: string
+          description: >
+            What this deployment asked for, and "" where it asked for nothing —
+            the difference between a default in force and a chosen value.
+        min_escalation_score:
+          type: number
+          description: Score at or above which semi_auto acts by itself.
+        escalation_budgeted:
+          type: boolean
+          description: >
+            Whether the lane can spend anything at all; either paid rung having a
+            budget answers it. The per-rung flags say which.
+        probes_budgeted:
+          type: boolean
+        max_probes_per_run:
+          type: integer
+          description: Rung-3 budget; 0 disarms that rung and keeps the referral.
+        probe_timeout_seconds:
+          type: integer
+        probe_deadline_seconds:
+          type: integer
+          description: max_probes_per_run × probe_timeout_seconds, under a collective ceiling.
+        probe_row_cap:
+          type: integer
+        children_budgeted:
+          type: boolean
+        max_children_per_run:
+          type: integer
+          description: Rung-4 budget; 0 disarms that rung and keeps the referral.
+        max_child_depth:
+          type: integer
+        max_concurrent_children:
+          type: integer
+        max_total_children:
+          type: integer
+          description: Total child runs this process may launch; the runaway backstop.
+      required:
+        - modes
+        - engine_default
+        - config_mode
+        - min_escalation_score
+        - escalation_budgeted
+        - probes_budgeted
+        - max_probes_per_run
+        - children_budgeted
+        - max_children_per_run
+
+    LinkModeUpdate:
+      type: object
+      description: One mode, applied to one or more target procedures.
+      properties:
+        mode:
+          type: string
+          enum: [planned, semi_auto, auto]
+        targets:
+          type: array
+          items:
+            type: string
+          description: >
+            Procedure names. Omitted means every link this run currently holds,
+            which requires that correlation has run (409 otherwise); naming them
+            explicitly is how a mode is set in advance.
+        actor:
+          type: string
+          description: Recorded in the audit trail.
+      required: [mode]
+
+    LinkModeResult:
+      type: object
+      description: The mode that took effect per target, and what is stored on the job.
+      properties:
+        job_id:
+          type: string
+        mode:
+          type: string
+          description: The mode that was asked for.
+        applied:
+          type: array
+          items:
+            type: object
+            properties:
+              target_use_case:
+                type: string
+              asked:
+                type: string
+              mode:
+                type: string
+                description: The EFFECTIVE mode, which clamping may have narrowed.
+              mode_source:
+                type: string
+                description: Which layer decided the effective mode (e.g. clamp, pack, job).
+              mode_note:
+                type: string
+                description: Why, where the effective mode is not the ask.
+              proposed_action:
+                type: string
+              links:
+                type: integer
+                description: Link findings this target currently holds; 0 when set in advance.
+        link_modes:
+          type: object
+          additionalProperties:
+            type: string
+          description: What is actually stored on the job.
+        targets_checked_against_pack:
+          type: boolean
+          description: >
+            False means validation was SKIPPED for want of a pack handle, not that
+            it passed.
+      required: [job_id, mode, applied, link_modes, targets_checked_against_pack]
+
+    LinkReferral:
+      type: object
+      description: Options for composing a referral. Every field is optional.
+      properties:
+        mode:
+          type: string
+          enum: [auto, semi_auto, supervised]
+          description: Run mode for the composed request; absent = the parent run's own mode.
+        actor:
+          type: string
+          description: Recorded in the audit trail.
+        launched_job_id:
+          type: string
+          description: >
+            Record an already-launched child in the parent's trail. The endpoint
+            verifies the id and never launches anything itself.
+
+    LinkReferralComposition:
+      type: object
+      description: A child run's request body, composed and not launched.
+      properties:
+        job_id:
+          type: string
+        index:
+          type: integer
+        launched:
+          type: boolean
+          description: Always false; this endpoint composes and never spawns.
+        launch_recorded:
+          type: string
+          description: The child job id recorded in the trail, or "" if none was supplied.
+        request:
+          type: object
+          description: >
+            Submit verbatim to POST /api/v1/jobs. Its `link_pin` routes the child
+            through the same single procedure-selection seam the parent's verdict
+            used; dropping it falls the child back to scoring the parent's prose.
+        post_to:
+          type: string
+        pin:
+          type: object
+          description: Whether the procedure pin was applied, and how.
+        scope:
+          type: object
+          description: The pivot entity, its values, the causal direction, and the window.
+        parent:
+          type: object
+        link:
+          type: object
+          description: The link's state, rung, and advisory severity.
+      required: [job_id, index, launched, request, post_to]
+
+    ArtifactListing:
+      type: object
+      description: Available artifacts for a job.
+      properties:
+        report:
+          type: object
+          additionalProperties:
+            type: boolean
+          description: >
+            Map of format name (json, html, md, pdf, view) to whether the
+            artifact is present.
+        evidence:
+          type: object
+          additionalProperties:
+            type: boolean
+          description: Map of kind name (raw, transformed) to whether the artifact is present.
+      required: [report, evidence]
+
+    FeedbackSubmission:
+      type: object
+      description: Analyst feedback for a completed job.
+      properties:
+        job_id:
+          type: string
+          description: ID of the job the feedback relates to.
+        agrees_with_verdict:
+          type: boolean
+          description: Whether the analyst agrees with the pipeline's verdict.
+        analyst_verdict:
+          type: string
+          description: The analyst's own verdict, if different from the pipeline's.
+        missed_anomalies:
+          type: array
+          items:
+            type: string
+          description: Anomalies the analyst believes the pipeline missed.
+        false_positives:
+          type: array
+          items:
+            type: string
+          description: Anomalies flagged by the pipeline that the analyst considers incorrect.
+        notes:
+          type: string
+          description: Free-text analyst notes.
+        analyst:
+          type: string
+          description: Identifier of the submitting analyst.
+      required: [job_id]
+
+    FeedbackEntry:
+      type: object
+      description: A stored feedback record.
+      allOf:
+        - $ref: "#/components/schemas/FeedbackSubmission"
+        - type: object
+          properties:
+            submitted_at:
+              type: string
+              description: ISO-8601 timestamp when the feedback was received.
+          required: [submitted_at]
+
+    FeedbackGuidance:
+      type: object
+      description: Distilled guidance derived from stored feedback entries.
+      properties:
+        understanding:
+          type: array
+          items:
+            type: string
+          description: Guidance items injected into the understanding prompt.
+        anomaly_detection:
+          type: array
+          items:
+            type: string
+          description: Guidance items injected into the anomaly-detection prompt.
+        item_count:
+          type: integer
+          description: Number of feedback entries included in the distillation.
+        distilled_at:
+          type: string
+          description: ISO-8601 timestamp of the most recent distillation run.
+      required: [understanding, anomaly_detection]
+
+    ThresholdInfo:
+      type: object
+      description: Anomaly-detection threshold values.
+      properties:
+        effective:
+          type: number
+          format: float
+          description: >
+            Currently applied threshold. Anomalies with confidence_score below
+            this value are marked below_threshold.
+        baseline:
+          type: number
+          format: float
+          description: Configured baseline threshold from the config file.
+        domain:
+          type: string
+          nullable: true
+          description: Domain the threshold applies to, or null for the default.
+      required: [effective, baseline]
+
+    IncidentSummary:
+      type: object
+      description: Brief metadata for a completed incident.
+      properties:
+        incident_id:
+          type: string
+        job_id:
+          type: string
+        completed_at:
+          type: string
+        verdict:
+          type: string
+          nullable: true
+      required: [incident_id]
+
+    KnowledgePackSummary:
+      type: object
+      description: Brief metadata for a knowledge pack.
+      properties:
+        name:
+          type: string
+        domain:
+          type: string
+          nullable: true
+        use_case_count:
+          type: integer
+        source_count:
+          type: integer
+      required: [name]
+
+    KnowledgePackDetail:
+      type: object
+      description: Metadata and structure summary for a knowledge pack.
+      allOf:
+        - $ref: "#/components/schemas/KnowledgePackSummary"
+        - type: object
+          properties:
+            use_cases:
+              type: array
+              items:
+                type: string
+              description: Names of the use cases defined in the pack.
+            sources:
+              type: array
+              items:
+                type: string
+              description: Names of the log sources declared in the pack.
+
+    FileTree:
+      type: object
+      description: A directory or file node in the knowledge pack file tree.
+      properties:
+        name:
+          type: string
+        type:
+          type: string
+          enum: [file, directory]
+        children:
+          type: array
+          items:
+            $ref: "#/components/schemas/FileTree"
+          description: Child nodes. Present only for directory nodes.
+        size:
+          type: integer
+          description: File size in bytes. Present only for file nodes.
+      required: [name, type]
+
+    FileHistoryEntry:
+      type: object
+      description: A historical version of a knowledge pack file.
+      properties:
+        version_id:
+          type: string
+        saved_at:
+          type: string
+          description: ISO-8601 timestamp when this version was saved.
+        size:
+          type: integer
+          description: File size in bytes.
+      required: [version_id, saved_at]
+
+    ValidationReport:
+      type: object
+      description: Result of a knowledge pack validation run.
+      properties:
+        ok:
+          type: boolean
+          description: True if the pack passed all checks.
+        errors:
+          type: array
+          items:
+            $ref: "#/components/schemas/ValidationIssue"
+        warnings:
+          type: array
+          items:
+            $ref: "#/components/schemas/ValidationIssue"
+        path_lists_checked:
+          type: integer
+          description: >
+            Number of condition path lists that could be verified against a
+            source schema. Zero means no schema inventory was available and
+            all path checks were skipped.
+      required: [ok, errors, warnings]
+
+    ValidationIssue:
+      type: object
+      description: A single validation error or warning.
+      properties:
+        file:
+          type: string
+          nullable: true
+        path:
+          type: string
+          nullable: true
+          description: Dotted field path within the file, if applicable.
+        message:
+          type: string
+      required: [message]
+
+    AssistRequest:
+      type: object
+      description: Request to start a pack assistant session.
+      properties:
+        prompt:
+          type: string
+          description: >
+            Natural-language description of the change the operator wants the
+            assistant to propose.
+        files:
+          type: array
+          items:
+            type: string
+          description: >
+            Subset of pack file paths to include in the LLM context. If absent
+            the assistant determines which files are relevant.
+      required: [prompt]
+
+    AssistSession:
+      type: object
+      description: A pack assistant session record.
+      properties:
+        id:
+          type: string
+          description: Session identifier.
+        pack:
+          type: string
+          description: Pack name.
+        status:
+          type: string
+          enum: [running, completed, failed, applied, rejected]
+        prompt:
+          type: string
+          description: The prompt that started the session.
+        proposed_changes:
+          type: array
+          items:
+            $ref: "#/components/schemas/ProposedChange"
+          description: >
+            File changes proposed by the assistant. Present only when the
+            session is completed.
+        created_at:
+          type: string
+        completed_at:
+          type: string
+          nullable: true
+        error:
+          type: string
+          nullable: true
+          description: Error message if the session failed.
+      required: [id, pack, status, prompt, created_at]
+
+    ProposedChange:
+      type: object
+      description: A single file change proposed by the pack assistant.
+      properties:
+        path:
+          type: string
+          description: Relative path within the pack.
+        action:
+          type: string
+          enum: [create, modify, delete]
+        content:
+          type: string
+          nullable: true
+          description: New file content. Null for delete actions.
+        diff:
+          type: string
+          nullable: true
+          description: Unified diff for modify actions.
+      required: [path, action]

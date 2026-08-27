@@ -1,0 +1,86 @@
+# =============================================================================
+# domain_vocabulary.yaml — YOUR DOMAIN'S WORDS, so the engine can be proven not
+# to speak them.
+#
+# WHAT THIS FILE IS FOR
+# =====================
+# No pipeline code reads it. `validate_pack` reads it, scans every file under
+# `src/` and `config/templates/` for these words, and reports a hit as a
+# `neutrality-collision` ERROR. Filling it in is how you install that guarantee
+# for your domain; leaving it empty is itself an error, because a pack with no
+# words declared is a pack nothing keeps out of the engine.
+#
+# The rule it protects is this repo's central structural convention: the engine
+# is generic, every domain fact lives in `knowledge/<domain>/`. That rule is easy
+# to state and it decays silently, because the leak that matters is not a
+# hardcoded value (a test catches that on the first run) — it is a COMMENT, a
+# docstring, or an LLM PROMPT LINE phrased in your vocabulary. Those change no
+# behaviour on your domain, so nothing fails; they change behaviour on the NEXT
+# domain, where the sentence is simply false, and they teach every future reader
+# that the engine owns your subject matter. A prompt line is the worst of the
+# three: an instruction written in your nouns steers the model on every other
+# domain too.
+#
+# HOW TO FILL IT IN
+# =================
+# List the words a person would immediately recognise as yours. Include the
+# inflections you expect in prose — singular AND plural — because the scan does
+# no stemming, on purpose. Measured: a domain declaring `holder` under a stemmer
+# that folds it to `hold` would flag all 118 ordinary-English uses of "hold" in
+# `src/` ("a gate holds the run", "modules hold their config slice"), and the
+# first response to a check that noisy is always to weaken it.
+#
+# Matched case-insensitively. The boundary rejects adjacent LETTERS AND DIGITS
+# only, so `_`, `.` and `-` DO end a word here and listing a stem also catches
+# its compounds — list `widget` and `widget_ledger_v2` is caught too. That is
+# deliberate and was a fix: a plain `\b` treats `_` as a word character, so it
+# missed four live leaks that were all snake_case identifiers in comments, which
+# is where a domain noun is hardest to see on review.
+#
+# THE HARD PART IS WHAT TO LEAVE OUT, and it is worth getting right the first
+# time. Do NOT list:
+#
+#   * Ordinary English the engine needs for its own job. If your domain says
+#     "claim", "record", "asset" or "refund", so does the engine — the word is
+#     doing generic work there, and listing it buys nothing but a permanent
+#     stream of false hits.
+#   * A backend's own wire vocabulary. If a word is also a field name in an API
+#     the engine reads (`manifest` in a Databricks statement response, say), the
+#     engine must spell the key the API sends.
+#   * A word that appears in `src/` only inside a CROSS-DOMAIN ILLUSTRATION —
+#     "a pack whose scope unit is a depot, a site, a tenant". Those sentences are
+#     evidence the engine is generic; they exist to stop the next author assuming
+#     the scope unit is one particular thing. Banning them would delete the best
+#     demonstration of genericity in order to satisfy a genericity check.
+#
+# When you decide to omit a word, RECORD THE REASON here in a comment, as
+# `knowledge/mock_domain/domain_vocabulary.yaml` does. An omission with a stated
+# reason is a decision a reviewer can check; a silently missing word is
+# indistinguishable from an oversight, and the whole point of this file is to
+# make the boundary inspectable.
+#
+# A NOTE ON WHAT NOT TO BUILD. It is tempting to derive this list from
+# `entity_glossary.yaml` instead of writing it. Measured on the mock pack, that
+# is wrong in both directions: six of its 29 derivable tokens appear legitimately
+# in `src/`, and a derived list misses the words that actually leak, because a
+# leak is prose and prose uses nouns no glossary key spells.
+# =============================================================================
+
+domain_vocabulary:
+  # Replace every line below with your own domain's words, and delete this
+  # comment. The examples are from an invented domain purely to show the shape.
+  #
+  # The unit of work your investigations are about, and what it is called.
+  - example_widget
+  - example_widgets
+  # Your actor's name, and the place or org unit it belongs to.
+  - example_operator
+  - example_operators
+  # Your internal system, product and platform names. These are usually the most
+  # valuable entries in the file: they are unmistakably yours, they carry no
+  # generic meaning, and they are the ones most likely to be typed into a comment
+  # without a second thought.
+  - example_platform
+  # Your domain's jargon and acronyms — the words in your procedure documents
+  # that a newcomer would have to look up.
+  - example_jargon

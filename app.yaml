@@ -1,0 +1,137 @@
+# Databricks App definition (custom Python app).
+#
+# The platform runs `command` as a long-lived process and routes HTTPS traffic to it on
+# $DATABRICKS_APP_PORT. AFIR is a single aiohttp server that binds 0.0.0.0 on that port,
+# serves a health probe at /health, the UI at / and the API under /api/v1/.
+#
+# Investigations run as background asyncio tasks inside this process: a measured run takes
+# 38 min at the median and 476 min at the longest, and the ingress closes a request at
+# ~60-120s, so `POST /api/v1/jobs` returns a job id immediately and the caller polls or
+# streams. The three blocking endpoints (/api/v1/incidents, /incidents/freetext, /ir)
+# answer 501 naming that replacement rather than hanging until the ingress cuts them —
+# see `incident_input.blocking_endpoints` to override.
+#
+# ONE REPLICA ONLY. Gates are asyncio.Events, the SSE queues and JobManager._jobs are
+# per-process, and DatabricksStorage serialises its writes on a single thread — a second
+# replica could neither release a gate held on the first nor append safely.
+command: ["python", "app.py"]
+
+env:
+  # --- The bootstrap block -----------------------------------------------------
+  # THESE FOUR EXIST BECAUSE OF A CHICKEN-AND-EGG, not as a second place to configure.
+  # Everything else about AFIR is editable in the Configuration tab and mirrored to the
+  # Volume — but only once there IS a Volume. In a container the first config comes from
+  # the read-only bundle, whose template says `backend: local`, meaning the container's own
+  # disk; an operator switching that in the UI writes the switch to the disk that the
+  # applying restart throws away. Measured: accepted, `durable: true` reported (there is no
+  # mirror to push to yet), `local` again after restart. So where state lives has to be
+  # decided BEFORE the app can be configured, and an env var is the only channel the
+  # platform offers that early. Every key is read through `${VAR:-default}` in the shipped
+  # template, so a laptop or VM that sets none of them behaves exactly as it did before.
+  #
+  # Once these are set the loop closes: the store exists, the mirror activates, and every
+  # later edit — log-source backends, thresholds, the pack itself — is durable from the UI.
+  - name: AFIR_STORAGE_BACKEND
+    value: "databricks"
+  # The Volume that holds job documents, evidence, exports and the feedback log. Must match
+  # the one the app's service principal was granted READ VOLUME + WRITE VOLUME on (see
+  # databricks.yml for the GRANT statements). Without WRITE every write 404s and
+  # /health?deep=1 answers storage_ok: false with a reason.
+  # No shipped default, and the placeholder below is deliberately not a resolvable name: a
+  # catalog that resolves to somebody else's is worse than one that fails, because the
+  # deploy succeeds and every write 404s into a store answering `storage_ok: false`.
+  - name: AFIR_UC_CATALOG
+    value: "<uc-catalog>"
+  - name: AFIR_UC_SCHEMA
+    value: "afir"
+  - name: AFIR_UC_VOLUME
+    value: "state"
+  # WHICH DOMAIN THIS INSTANCE INVESTIGATES, and it has no safe default. Left unset the app
+  # boots on `mock_domain`, the credential-free demo pack — which answers real incidents
+  # plausibly, against the wrong domain's rules and sources. Set it to the pack directory
+  # under knowledge/ that this deployment is for.
+  - name: AFIR_PACK_DIR
+    value: "<pack-directory>"
+  # `AFIR_LLM_BASE_URL` is deliberately NOT set: blank means "Model Serving on the workspace
+  # the SDK resolves", which is exactly what the injected OAuth credentials give an App. Set
+  # it only to reach OpenAI or another workspace's endpoint.
+  #
+  # `AFIR_LLM_MODEL` IS set, because the template's default names a different served model
+  # than this workspace has. A wrong model name is not a silent degrade — every LLM stage
+  # 404s — but it is one that reads as an endpoint problem rather than a config one.
+  - name: AFIR_LLM_MODEL
+    value: "databricks-claude-opus-5"
+
+  # The *working* copy of the YAML configs, not the durable one. The deployed bundle is
+  # read-only, so `seed_working_copies()` fills this from the bundle at boot and the
+  # storage mirror then lays the Volume's copy over the top; every UI edit is written
+  # here and pushed back. Container-local on purpose: the byte-level patcher that keeps
+  # ~25k of load-bearing comments needs a real filesystem with `os.replace`.
+  - name: AFIR_CONFIG_DIR
+    value: "/tmp/afir/config"
+  # Same arrangement for the knowledge pack. Without this, pack writes target the
+  # read-only bundle and every Knowledge-tab save fails.
+  - name: AFIR_KNOWLEDGE_DIR
+    value: "/tmp/afir/knowledge"
+  # A CACHE, not the store. The App filesystem is explicitly ephemeral ("lost when the app
+  # restarts"), so anything that must outlive a restart — job docs, gates, exports,
+  # feedback — goes to the UC Volume via the `storage:` block in main_config.yaml. What
+  # lands here is only what can be rebuilt: the FAISS index and scratch files.
+  - name: AFIR_DATA_DIR
+    value: "/tmp/afir/data"
+  # One JSON object per line, so the pipeline's structured fields survive into /logz
+  # instead of being flattened into a console string.
+  - name: AFIR_LOG_FORMAT
+    value: "json"
+  # NOT optional, and not a performance setting. The SDK's experimental Files API client
+  # transfers via presigned URLs, which are network-blocked from an App container — and it
+  # returns no error when they are, so a Volume upload HANGS rather than failing over
+  # (databricks-sdk issues #1148 / #1153, open as of v0.125.0). AFIR's own storage backend
+  # speaks the Files API directly with `requests`, but any SDK path must not take the
+  # experimental route.
+  - name: DATABRICKS_DISABLE_EXPERIMENTAL_FILES_API_CLIENT
+    value: "true"
+  # --- Foreign-workspace and log-source credentials ------------------------------
+  # An App's OAuth service principal is scoped to its OWN workspace (a PAT for workspace A
+  # gets 403 on B), and the log sources live elsewhere, so each foreign workspace needs a
+  # static token injected as a secret. One `valueFrom` per env var named in
+  # `log_sources.backends.*.api_key_env` / `.password`. The name on the left is the env var
+  # the process sees; the name on the right is the app RESOURCE (declared in databricks.yml),
+  # not the secret key.
+  #
+  # NEVER NAME ONE OF THESE `DATABRICKS_TOKEN`. Measured against databricks-sdk 0.125.0: a
+  # PAT in `DATABRICKS_TOKEN` alongside the platform's injected OAuth vars makes `Config()`
+  # raise `ValueError: more than one authorization method configured: oauth and pat` — the
+  # SDK refuses to choose. `try_build_auth()` catches that and returns None, so the failure
+  # arrives as *no auth at all*: `llm_config.base_url` is blank (it means "the workspace the
+  # SDK resolves"), so there is then no endpoint to call and every LLM stage is dead, while
+  # each Databricks retriever loses the host it was going to inherit. The log line says
+  # "SDK auth unavailable", which reads as a platform fault rather than a name collision.
+  # Locally the same name is correct and harmless — there are no OAuth vars to collide with.
+  # One pair per foreign workspace; the left name is what
+  # `log_sources.backends.databricks.<name>.api_key_env` points at.
+  # - name: WAREHOUSE_A_DATABRICKS_TOKEN
+  #   valueFrom: "warehouse-a-token"
+  # - name: WAREHOUSE_B_DATABRICKS_TOKEN
+  #   valueFrom: "warehouse-b-token"
+  # - name: ELK_USER
+  #   valueFrom: "elk-user"
+  # - name: ELK_PASS
+  #   valueFrom: "elk-pass"
+
+# --- Required resources & permissions -----------------------------------------
+# The app runs as a service principal authenticated via injected OAuth env vars
+# (DATABRICKS_HOST / DATABRICKS_CLIENT_ID / DATABRICKS_CLIENT_SECRET). Grant it:
+#   - CAN USE on the SQL warehouse referenced by log_sources.backends.databricks.*
+#   - CAN QUERY on the Model Serving endpoint named in llm_config.yaml `model`
+#   - CAN QUERY on the embedding endpoint named in main_config.yaml `rag.embedding_model`
+#   - SELECT on each catalog (and information_schema) used for schema discovery
+#   - READ VOLUME + WRITE VOLUME on the Volume named in the `storage:` block — without
+#     WRITE, every job doc, export and gate is lost on restart while the app still runs
+#
+# Notes:
+#   - No DATABRICKS_TOKEN is needed for the App's own workspace; the SDK uses the OAuth vars.
+#   - Keep every deployed file under 10 MB (the limit is PER FILE): exclude .venv,
+#     exports/, model_cache/, and any *.yaml.bak (which holds unredacted credentials).
+#   - `verify_ssl: false` in a local config is for a self-signed corporate chain. The App
+#     sees the public chain, so leave it true here.

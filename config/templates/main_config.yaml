@@ -2,52 +2,457 @@ incident_input:
   type: "api"
   post_incident_endpoint: "/api/v1/incidents"
   post_ir_endpoint: "/api/v1/ir"
-  win_url: "win@proach.url"
-  win_username: "username"
-  win_password: "password"
+  post_freetext_endpoint: "/api/v1/incidents/freetext"
+  # The three endpoints above hold the HTTP connection open until the investigation is
+  # finished. `auto` enables them everywhere EXCEPT a Databricks App, where they cannot
+  # work: the platform ingress closes a request at ~60-120s and measured runs take 38 min
+  # at the median, 476 min at the longest — so the caller gets a timeout with no job id
+  # while the run continues invisibly. Refused there with 501 naming POST /api/v1/jobs,
+  # which returns a job id immediately (poll GET /api/v1/jobs/{id}, or stream its
+  # /events). `on` / `off` override, because the ingress limit is the platform's and not
+  # ours: an operator with one in front of a VM may want them off, and one reaching an App
+  # through a tunnel may want them on.
+  blocking_endpoints: auto
+  # Endpoint the UI posts analyst reviews to. Default "/api/v1/feedback".
+  post_feedback_endpoint: "/api/v1/feedback"
+  win_url: "<win-proach-url>"
+  win_username: "<win-username>"
+  win_password: "${WIN_PASSWORD}"
+  # Bind address + port. host defaults to 0.0.0.0 (works locally and inside a
+  # Databricks App). As an App, the port is overridden by $DATABRICKS_APP_PORT.
+  host: "0.0.0.0"
   port: 5000
-  max_incidents_per_batch: 100
   rate_limit:
     requests: 1000
     per_seconds: 3600
 
 log_sources:
-  use_ssh_tunnel: true
+  use_ssh_tunnel: false
   tunnel:
-    url: "tunnel.url"
-    user: "username"
-    password: "password"
+    url: "<tunnel-host>"
+    user: "<tunnel-user>"
+    password: "${TUNNEL_PASSWORD}"
     remote_bind_url: "remote.bind.url"
     remote_bind_port: 9000
     local_bind_url: "local.bind.url"
     local_bind_port: 9000
-  names_list:
-    - application_logs
+
+  # Cap per source so one slow/unreachable backend fails in seconds (reported live)
+  # instead of burning minutes through transport-level retries. Optional (default 20).
+  per_source_timeout_seconds: 20
+
+  # Budget for a source the PACK declares `retrieval_class: primary` — one the investigation
+  # cannot be concluded without. Applied to BOTH budgets that must move together (the engine's
+  # per-source cap and the retriever's statement budget), overriding its backend block.
+  # TWO HOURS: for these sources a cap that fires DECIDES the verdict rather than degrading it
+  # (every decisive condition goes `unknown` while the stage still reports success), and a
+  # warehouse we have genuinely lost contact with is caught far faster and separately by
+  # max_consecutive_poll_errors — so elapsed time is not the liveness signal here and waiting
+  # costs only wall clock. Set it well ABOVE the worst cost you have measured, not just above
+  # the typical one: an accepted baseline that finished 27s under a 3000s cap timed out on a
+  # re-run when the shared warehouse was busy, and came back with 15 conditions `unknown`.
+  # Editable in the Configuration UI (Retrieval budgets); takes effect on the next run, no
+  # restart needed. Optional (default 7200).
+  primary_source_timeout_seconds: 7200
+
+  # How many days back to read when the incident text states NO date, time or relative time
+  # expression anywhere. Counted back from the incident's own ingestion timestamp, never from
+  # the moment the run starts, so a re-run of the same incident reads the same span.
+  # The knowledge pack's top-level `retrieval.default_lookup_days` WINS over this — retention
+  # and alerting lag are facts about the domain's stores, not about the deployment; this is the
+  # fallback for a pack that declares none. Unset (or <= 0) and every query keeps whatever
+  # window the generator invented for it: measured on one undated incident, 29 queries carried
+  # eight different windows, several of them the single day the run happened to start on. A
+  # window is the hard scope of every retrieval, so an invented one decides what can be seen.
+  # Editable in the Configuration UI (Retrieval budgets); next run, no restart. Optional.
+  default_lookup_days: 30
+
+  # Global row cap: the fallback used when no per-endpoint max_results is set.
+  # Overridable per endpoint under backends.<kind>.<name>.max_results.
+  # Restart required; default 500.
+  max_results: 500
+
+  # OPT-IN extended retrieval. By default the caps above are respected exactly. A user
+  # can opt into "let slow sources run longer" per-incident (POST an incident/job with
+  # `"extended_retrieval": true`) or globally by setting `extended_retrieval: true`
+  # here. When on, each source's cap is raised to `extended_retrieval_timeout_seconds`
+  # (per-source override or this global value), else 4x its normal cap; Databricks poll
+  # budgets are widened to match for that run. Use for a slow source (typically a VIEW
+  # over a very large table) where the analyst is willing to wait. Both keys optional.
+  extended_retrieval: false
+  extended_retrieval_timeout_seconds: 900
+
+  # OPT-IN retrieval cache, keyed on the QUESTION asked (source + question + window +
+  # entities + row cap + any analyst guidance), never on the generated query — which does
+  # not exist until the retriever has run and is LLM-authored, so keying on it would only
+  # ever miss. A hit costs no timeout slot and no query-generation LLM call. It pays for
+  # itself on the re-asks the pipeline's shape hides: a rejected gate re-runs the stage, a
+  # follow-up pass may repeat a pass-1 query, a link child run overlaps its parent's plan,
+  # and comparing two configurations means running one incident twice.
+  #
+  # Only an ANSWER is cached. A timeout, a backend error, a cancel and an empty result from
+  # a query carrying an unfilled '<...>' are all ABSENT from the retrieved set by design, so
+  # none of them can be stored — caching one would turn a transient gap into a persistent
+  # INSUFFICIENT DATA. Every hit carries its age and says so on the source's own line, so a
+  # report cannot present yesterday's rows under today's heading.
+  #
+  # Per process and NOT durable: it holds result sets, one replica does not see another's,
+  # and a restart empties it. An extended-retrieval run does not read it (that flag is a
+  # deliberate re-ask) but does refresh it.
+  cache:
+    enabled: false
+    # Seconds a non-empty answer stays usable. Optional (default 3600).
+    ttl_seconds: 3600
+    # Seconds an EMPTY answer stays usable. 0 = never stored, which is the default: zero
+    # rows from a keyed lookup IS a finding, but it is also the answer a re-ask most often
+    # changes, and a cached empty is indistinguishable from a source that has nothing.
+    empty_ttl_seconds: 0
+    # Bounds, enforced together with least-recently-used eviction. Two of them because one
+    # truncated primary source can carry more rows than sixty small answers together.
+    max_entries: 64
+    max_rows: 200000
+
+  # Backend credentials for sources defined in the knowledge pack's source_catalog.
+  # The pack holds only LOGICAL coordinates (cluster + indices, catalog + schema);
+  # secrets live HERE (this file is gitignored). The engine merges a pack source's
+  # `endpoints` with the matching backend creds to build a retriever — so backend
+  # coordinates have one source of truth (the pack), credentials another (here).
+  #
+  # Secrets use env-var indirection (${VAR}); never paste real tokens/passwords.
+  # A pack source whose cluster / profile is missing here is skipped (logged), not
+  # fatal. Supported endpoint kinds: elasticsearch, databricks_uc, snowflake, rest.
+  backends:
+    elasticsearch:
+      # Keyed by the `endpoints.cluster` value in source_catalog.yaml. Add one entry
+      # per cluster the pack references — a pack routinely spans more than one.
+      <cluster-name>:                   # must match endpoints.cluster
+        # url: a direct node "https://<es-host>:9200" OR an App-Gateway/Kibana host
+        # (no port needed, e.g. "https://<gateway-host>"). ${VAR} references are expanded
+        # from the environment at load time, so export the basic-auth creds as env vars
+        # rather than pasting secrets here. Unset vars expand to "" and the source is
+        # skipped-with-log (graceful degrade).
+        url: "https://<es-host>:9200"
+        # gateway: kibana   # set ONLY when the host is a Kibana gateway that blocks the
+        #                   # raw ES REST API — routes to KibanaRetriever (Query DSL via
+        #                   # /internal/search/es). Omit for a direct ES node (ES|QL).
+        username: "${ES_USER}"
+        password: "${ES_PASSWORD}"
+        timeout: 30
+        max_results: 500
+        # TLS (optional): verify_ssl: false disables verification (dev/self-signed
+        # ONLY — prefer ca_bundle in production); ca_bundle: /path/ca.pem trusts a CA.
+        # verify_ssl: false
+        # ca_bundle: "/path/to/ca.pem"
+      # <other-cluster-name>:           # add more clusters the same way; each one needs
+      #   url: "https://<other-es-host>:9200"   # its OWN credential env vars
+      #   username: "${OTHER_ES_USER}"
+      #   password: "${OTHER_ES_PASSWORD}"
+      #   timeout: 30
+      #   max_results: 500
+    databricks:
+      # WORKSPACE-KEYED map: one entry per Databricks workspace, keyed by the
+      # `endpoints.workspace` value in the pack's source_catalog.yaml (like
+      # elasticsearch.<cluster>). Databricks PATs are WORKSPACE-SCOPED, so catalogs
+      # that live in different workspaces each need their own warehouse + token env.
+      # (Back-compat: a FLAT block — warehouse_id directly under `databricks:`, no
+      #  per-workspace keys — still works for a pack source that declares no
+      #  `workspace`. Use the map form as soon as you have >1 workspace.)
+      <workspace-name>:                 # must match endpoints.workspace
+        # workspace_url optional: defaults to the SDK-resolved host (DATABRICKS_HOST).
+        workspace_url: "https://<workspace-host>"
+        # The 16-hex SQL WAREHOUSE id (SQL Warehouses > your warehouse > copy id).
+        # NOTE: this is NOT the workspace/org id from the URL — using that yields 403s.
+        warehouse_id: "<sql-warehouse-id>"
+        # This workspace's PAT env var. Each workspace needs its OWN token — a token
+        # from another workspace 403s here.
+        api_key_env: "DATABRICKS_TOKEN"
+        max_results: 500
+        # Poll budget must cover a cold/auto-stopped warehouse start (observed ~7 min
+        # from fully-stopped) PLUS the query itself for big tables. Raise BOTH the poll
+        # budget and the _gather cap together — the lower of the two wins. A heavy
+        # struct-projection scan on a very large table (the biggest source in a pack)
+        # can take several minutes STANDALONE and 2-3x that when many sources queue on one
+        # warehouse concurrently; if the cap is too low the source returns 0 rows and any
+        # verdict condition over it silently degrades.
+        #
+        # SIZE THE CAP TO BE HIT ONLY WHEN GENUINELY STUCK. A statement in RUNNING is
+        # working; PENDING means queued behind other statements — neither is stuck. Real
+        # stuckness is LOST CONTACT, which `max_consecutive_poll_errors` detects in seconds
+        # and independently of elapsed time. So prefer a generous wall-clock budget: the
+        # cost of a cap that is too low is a source returning 0 rows, every condition over
+        # it degrading to UNKNOWN, and the investigation reporting INSUFFICIENT DATA.
+        # Reference measurements from one such table (33 TB, WITH its mandatory partition
+        # prune): bare count(*) 65.7s, actor scope sweep 147.2s, full projection 717.4s.
+        # Optimize the query FIRST (a missing partition prune turned all three into
+        # timeouts) and treat the timeout as the backstop, not the tuning knob.
+        poll_interval_seconds: 5
+        # `statement_timeout_seconds` is the authoritative WALL-CLOCK poll budget;
+        # max_poll_attempts x poll_interval remains only as a legacy floor. An attempt count
+        # silently changes meaning whenever poll_interval moves, which is why time won.
+        max_poll_attempts: 360          # 360 x 5s = 30 min (legacy floor)
+        statement_timeout_seconds: 1800 # 30 min of wall-clock for ONE statement
+        # Per-source retrieval cap for _gather; Databricks needs longer than the global
+        # per_source_timeout_seconds default because a cold start takes minutes.
+        # MUST match statement_timeout_seconds — if these drift, the lower one wins.
+        retrieval_timeout_seconds: 1800
+        # Consecutive poll FAILURES (not elapsed time) meaning we lost contact with the
+        # warehouse. This is the real "genuinely stuck" signal.
+        max_consecutive_poll_errors: 5
+        # TLS (optional): verify_ssl: false disables verification (dev/self-signed
+        # ONLY — prefer ca_bundle in production); ca_bundle: /path/ca.pem trusts a CA.
+        # verify_ssl: false
+        # ca_bundle: "/path/to/ca.pem"
+      # <other-workspace>:              # add more workspaces the same way
+      #   workspace_url: "https://<other-host>"
+      #   warehouse_id: "<other-16-hex-id>"
+      #   api_key_env: "OTHER_DATABRICKS_TOKEN"
+    snowflake:
+      # Keyed by the `endpoints.account` value in source_catalog.yaml.
+      <account-name>:                  # must match endpoints.account
+        account: "<snowflake-account>"   # e.g. xy12345.eu-west-1
+        user: "${SNOWFLAKE_USER}"
+        password: "${SNOWFLAKE_PASSWORD}"
+        # private_key_env: "SNOWFLAKE_PRIVATE_KEY"  # alt: key-pair auth (PEM in env)
+        role: "<snowflake-role>"
+        warehouse: "<snowflake-warehouse>"
+        max_results: 500
+    rest:
+      # Keyed by the `endpoints.service` value in source_catalog.yaml.
+      <service-name>:                  # must match endpoints.service
+        base_url: "https://<service-host>"
+        username: "${REST_SERVICE_USER}"
+        password: "${REST_SERVICE_PASSWORD}"
+        # token_env: "REST_SERVICE_TOKEN" # alt: Bearer token instead of basic auth
+        timeout: 30
+        max_results: 500
+
+  # Explicit sources (full connection info) still work and take precedence over a
+  # pack source of the same name. The LLM writes the backend query (ES|QL / SQL)
+  # from a natural-language request; the retriever bounds the row count.
   sources:
     - name: "application_logs"
       type: "elasticsearch"
-      url: "www.elastic.instance"
-      username: "username"
-      password: "password"
+      url: "<es-host>"
+      username: "<es-user>"
+      password: "${ES_PASSWORD}"
       index: 'my-index'
       timeout: 30
-      retry_attempts: 3
-      retry_delay: 5
+      max_results: 500
+      # Brief field hint so the LLM writes correct ES|QL (name + type).
+      field_schema: "orgUnitId (keyword), user.userId (keyword), date (date), action (keyword), status (keyword)"
 
+    # Databricks via SQL Statement Execution API. Auth is unified through
+    # databricks-sdk: locally it uses DATABRICKS_TOKEN/host (or api_key_env below);
+    # as a Databricks App it uses the injected OAuth service principal — no token.
+    # Swap type to `databricks_genie` once available (same interface).
+    #
+    # Schema discovery (provide only what you have):
+    #   - catalog + schema  -> discover that schema's columns.
+    #   - catalog only       -> scan ALL schemas, LLM curates fraud-relevant tables.
+    #   - field_schema set   -> use it verbatim (skip discovery).
+    - name: "transaction_logs"
+      type: "databricks"
+      # workspace_url optional: defaults to the SDK-resolved host (DATABRICKS_HOST).
+      workspace_url: "https://<workspace-host>"
+      # 16-hex SQL WAREHOUSE id (NOT the workspace/org id from the URL — that yields 403s).
+      warehouse_id: "<sql-warehouse-id>"
+      api_key_env: "DATABRICKS_TOKEN"   # fallback token when SDK auth is unavailable
+      catalog: "main"
+      # schema: "fraud"                 # omit to scan all schemas + LLM curation
+      max_results: 500
+      poll_interval_seconds: 5          # poll budget covers a cold warehouse start
+      max_poll_attempts: 60             # 60 x 5s = 5 min
+      retrieval_timeout_seconds: 330    # per-source cap in _gather (cold start is slow)
+      field_schema: ""                  # blank = auto-discover from information_schema
+
+
+# Swappable domain knowledge pack (entity glossary, source catalog, playbooks).
+# pack_dir is a folder name under knowledge/ (or under $AFIR_KNOWLEDGE_DIR).
+# Re-target the whole system to a new domain by pointing this at another pack.
+# `knowledge/mock_domain` ships with the repo and runs end to end with no credentials —
+# copy it to knowledge/<your-domain>/ and fill it in; its READMEs document every key.
+#
+# Env-driven for the deployment reason, not the domain one: which pack is loaded decides
+# every source, rule and playbook, and in a container the first boot reads the bundle's
+# value. Left at the shipped default an App investigates real incidents against the demo
+# pack — which answers, plausibly, about the wrong domain. `${VAR:-default}` keeps every
+# local run on `mock_domain` unless AFIR_PACK_DIR says otherwise.
+knowledge:
+  pack_dir: "${AFIR_PACK_DIR:-mock_domain}"
+
+# Correlation/aggregation stage (between retrieval and anomaly detection).
+# Correlation keys are resolved in precedence order: (1) a playbook's structured
+# `correlation:` block (functional, authoritative), (2) the incident-understanding
+# module's correlation_keys + event_time, (3) data-driven join-key discovery
+# (fallback). Execution is DETERMINISTIC by default (pure Python); the LLM is used
+# only for low-volume/complex incidents (cost control).
+correlation:
+  sample_rows: 20                # rows per source shown to the LLM when it narrates
+  # Volume gate: skip the LLM (use the deterministic plan + summary) when the data is
+  # large. The LLM is only used when total rows <= llm_max_records AND sources <=
+  # llm_max_sources AND the deterministic layer resolved no join keys.
+  llm_max_records: 2000
+  llm_max_sources: 6
+  # Data-driven discovery filter aggressiveness when no playbook overrides it:
+  #   strict      — identifier-shaped fields only (digit-bearing); lowest false joins.
+  #   cardinality — any high-cardinality field (also catches alpha-only IDs).
+  #   both        — union of the above.
+  discovery_key_filter: "strict"
+  # Char budget for the deterministic investigation-evidence pack (chronology + actor
+  # attribution + trimmed per-source aggregates) fed to anomaly detection & the report.
+  # The pack degrades (aggregates harder) to fit this before the LLM stages embed it.
+  evidence_char_budget: 15000
+
+  # Cross-procedure links — the ADVISORY lane, and nested here because it is a deterministic
+  # step at the end of this stage rather than a stage of its own. Nothing under this key can
+  # reach the verdict, a condition, a severity or the health score: a link is a referral
+  # addressed to a human, and a router that adds no evidence must not add confidence.
+  #
+  # Each declaring ruleset says INBOUND how its own pattern shows up in another procedure's
+  # rows; the engine climbs the free rungs of a cost ladder over those declarations
+  # arithmetically (is a value of the other procedure's subject in hand · does that
+  # procedure's own applicability gate survive these rows · did a declared entry signal fire)
+  # and emits one finding per candidate in four states that never collapse: `unreachable`,
+  # `not_probed`, `probed_negative`, `probed_positive`. A pack declaring no `entry_signals`
+  # produces an empty list and a byte-identical report.
+  links:
+    enabled: true
+    # A declaration weaker than this is reported as a candidate but carries no advisory
+    # severity. 0.0 keeps every declared signal; it is a floor on the PACK's own number and
+    # never a judgement of its own.
+    min_signal_strength: 0.0
+    # The severity carried by a confirmed link, labelled router-added wherever it renders.
+    # It is a second line beside the verdict's severity and never an input to it.
+    advisory_severity_default: "MEDIUM"
+    # May a link ACT on its own, or only propose? The same three words as the job run modes, so
+    # an operator meets one vocabulary: `planned` composes a referral and a human executes it,
+    # `semi_auto` acts by itself only at or above the configured link score, `auto` acts by itself
+    # within every cap. This is the global default for every pair; a ruleset overrides it per pair
+    # with its own `link_escalation:` block, and an operator overrides that per job through the API
+    # and the link cards.
+    #
+    # `semi_auto` is the default rather than `auto` or `planned`. A link reaching the gate below on
+    # a thin score is exactly the case a human should see, which `auto` cannot express; and a lane
+    # whose automatic path is off by default is a lane nobody exercises — this one is bounded on six
+    # axes precisely so it can be on.
+    #
+    # Setting anything but `planned` here is not sufficient to make a link act: a link escalates
+    # only where the TARGET procedure's own `gate: scope` conditions, re-evaluated against the rows
+    # THIS run retrieved, come back PASS. A gate that failed, was unresolved, read no sources, or
+    # does not exist holds the link at `planned` whatever any of the three layers asks for, and the
+    # finding says which of those it was. A declared entry signal firing on its own is NOT enough —
+    # the gate answers the prior question (does that procedure apply to these rows at all?).
+    #
+    # No historical statistic gates this. A measured per-pair base rate, where one exists, can only
+    # ADD to the score below.
+    escalation_mode: semi_auto
+    # The score `semi_auto` is gated on — the one number that makes it semi. It is computed
+    # deterministically per candidate from the free rungs that actually held (a pivot value in
+    # hand · the target procedure's own applicability test surviving these rows · a declared entry
+    # signal firing · that signal's measured discrimination), summed from 0.0, and it reads 0.0 on
+    # any candidate whose target procedure ruled itself out or that has no pivot to be scoped by.
+    # Nothing about it comes from prose or from a model.
+    #
+    # The last of the four terms is the only one that reads a historical measurement, and it can
+    # only ADD: an unmeasured pair escalates on the gate exactly like a measured one, and what a
+    # thin corpus costs it is confidence rather than permission.
+    #
+    # 0.6 mirrors the stage gates' own default threshold. Lowering it to 0.0 does not make
+    # `semi_auto` more permissive — it makes it `auto` under a cautious-looking name, which is the
+    # one setting here worth spelling out, since the two would then differ in nothing.
+    min_escalation_score: 0.6
+    # Per-term weights, overridable one at a time (the others keep their defaults). They sum to
+    # 1.0, so the threshold above reads as the fraction of the free evidence a deployment insists
+    # on. The heaviest term is the sibling gate because it is the only one authored by the TARGET
+    # procedure, about its own rows, for exactly this question — the rest are this engine's
+    # arithmetic over a declaration. Commented out: the defaults are the measured shape and an
+    # override here is a deliberate re-weighting, not a value to fill in.
+    # score_weights:
+    #   pivot_in_hand: 0.15
+    #   sibling_gate_holds: 0.35
+    #   entry_signal_fired: 0.3
+    #   signal_discriminates: 0.2
+    # THERE IS DELIBERATELY NO CANDIDATE CAP. The candidates are the other procedures of the
+    # pack — ten here — so the list is bounded by the pack and a cut could only hide a leg,
+    # which is the one thing this mechanism exists to stop: `probed_negative` ("checked, does
+    # not apply") is a finding, and silence is what it must not be confused with.
+    #
+    # RUNG 3 — confirming a candidate with ONE query against a source the target procedure owns
+    # and this run did not retrieve. The budget is not the only licence, and it is the weakest of
+    # the four: a probe also needs an escalating mode on the pair, a rung-1 PASS, and
+    # `auto_probe: true` on the declaration that nominated the source. Each refuses on its own,
+    # and a pack that nominates nothing for an automatic ask spends nothing at any budget. Set
+    # this to 0 to disable the rung outright.
+    #
+    # THE MARGIN IS THE BUDGET, NOT THE NUMBER. These two multiply: the run will not spend more
+    # than `max_probes_per_run * probe_timeout_seconds` seconds on this lane, and the engine
+    # SHORTENS each probe rather than lengthening the run if the product would exceed its own
+    # ceiling. That is what keeps a fan-out of weak links from reaching the primary-source
+    # budget, where a timeout stops degrading the verdict and starts deciding it.
+    max_probes_per_run: 2
+    probe_timeout_seconds: 120
+    # Rows read from a probe, bounded separately from every timeout because a row cap and a time
+    # cap are different limits. A probe is a yes/no question about a shape being present, so this
+    # is deliberately small: a probe that has to read 10,000 rows to answer is a retrieval, and
+    # retrieving is rung 4's job. A probe returning exactly this number is reported as truncated,
+    # never as an exhaustive read.
+    probe_row_cap: 200
+    # RUNG 4 — adjudicating the sibling procedure properly, as a full child run of this system,
+    # pinned to that procedure so its verdict is not decided by scoring a description. The most
+    # expensive rung, so it ships at one child per run and every bound below is what holds it
+    # there; 0 disables it and keeps the referral.
+    #
+    # FOUR BOUNDS, AND THEY ARE NOT FOUR VERSIONS OF ONE. `max_children_per_run` bounds one run's
+    # fan-out; `max_child_depth` bounds a lineage (A refers B refers C); the cycle guard on
+    # (procedure, pivot value) stops A→B→A; and `max_total_children` bounds this PROCESS, checked
+    # independently of all three, because a fan-out that is shallow, acyclic and wide satisfies
+    # every one of them and is still unbounded. Hitting it stops the spawning and records why —
+    # a refusal is a row and not silence.
+    #
+    # Each is clamped to a ceiling in the engine, so raising one here cannot exceed it. A backstop
+    # an operator can raise without bound is not a backstop.
+    max_children_per_run: 1
+    max_child_depth: 1
+    # In-flight child runs, and the one bound that is a claim about CONTENTION rather than about
+    # counting: every job in this process shares one LLM semaphore (`llm_config.yaml`'s
+    # `max_concurrency`) and one backend estate, so this is additionally floored against that
+    # number minus one — leaving the parent a slot of its own. A deployment throttled to a single
+    # LLM call must not run a child beside the run that asked for it.
+    max_concurrent_children: 1
+    max_total_children: 8
 
 anomaly_detection:
   use_llm: true
   threshold: 0.8
   max_anomalies: 50
-  time_window:
-    hours: 24
+  # Token budget for the anomaly-detection structured output call. A zero-anomaly but
+  # fully-verdicted incident needs more tokens to explain itself, not fewer — so this
+  # is a floor per stage, never scaled to anomaly count. Default 8000.
+  detect_max_tokens: 8000
+  # Char budget for the investigation brief fed into anomaly detection. Default 6000.
+  brief_char_budget: 6000
+  # Char budget for the correlation JSON fed to the LLM (truncated to fit). Default 15000.
+  llm_input_char_budget: 15000
 
 report_generation:
-  template: "standard_report"
   output_path: '../exports'
   output_format: 'pdf'
   logo_path: '../assets/company_logo.jfif'
-  max_report_size_mb: 10
+  # Size the single report LLM call to the incident's data volume so it stays under the
+  # endpoint's per-request limit. These bound only what the LLM narrates; ALL anomalies
+  # still appear in the exported JSON/CSV and the PDF/txt anomalies table.
+  max_anomalies_in_prompt: 15        # top-N by confidence sent to the LLM
+  llm_input_char_budget: 15000       # correlation JSON truncated to this many chars
+  # The report has SEVEN fixed narrative sections whose size is independent of anomaly
+  # count, so the budget must fit the whole structure or the model's output is cut off
+  # mid-report and the missing sections get backfilled as deterministic bullet lists.
+  # Measured on one live verdicted incident (0 anomalies, 22k-char prompt): 4096 tokens
+  # -> finish_reason='length' and an empty '{}'; 8000 -> 6.7k tokens and all seven
+  # sections. max_tokens is a cap, not a reservation, so headroom costs nothing.
+  report_min_tokens: 4000            # floor so the fixed sections always fit
+  report_max_tokens: 12000           # ceiling; well above the 4096 client default
+  # Char budget for the investigation brief fed into report generation. Default 6000.
+  brief_char_budget: 6000
 
 output_interface:
   type: "email"
@@ -61,28 +466,444 @@ output_interface:
     - "fraud_analysts@example.com"
   cc:
     - "management@example.com"
-  attachment_size_limit_mb: 25
+
+# Approval gates. A job's run mode is chosen per request (`auto` | `semi_auto` |
+# `supervised`), NOT here — this section only calibrates when `semi_auto` decides a
+# stage needs a human. `auto` never gates; `supervised` gates every enabled stage
+# regardless of score. See docs/architecture/hitl.md §3.
+#
+# Health is DETERMINISTIC: each stage starts at 1.0 and loses a weight per countable
+# defect in its output (no entities extracted, sources that returned nothing, a
+# fallback report, ...). It is never the LLM's own confidence — a model that
+# hallucinated an entity is not the thing to ask whether it hallucinated an entity.
+stage_gates:
+  # Gate when score < threshold. 0.6 lets one 0.3-weight signal through and gates on
+  # two. This is a starting point to CALIBRATE against your own runs, not a measured
+  # constant — watch the [health] log lines before trusting it.
+  threshold: 0.6
+  # Per-stage overrides. Only these six stages can ever gate (plugins/export/output
+  # produce side effects, not data a later stage reasons over). Set `enabled: false`
+  # to exempt a stage even in supervised mode, and `threshold:` to hold this one stage
+  # to a different bar than the global one above.
+  #
+  # Written in BLOCK style, one key per line, and not as `{enabled: true}` — the config
+  # patcher is line-anchored (it edits bytes so comments survive a write), so it cannot
+  # reach a key that lives inside a flow mapping. It refuses honestly rather than
+  # corrupting the line, but the effect was that every per-stage gate control in the
+  # Configuration tab reported "restructure it in the raw editor" and changed nothing.
+  stages:
+    understanding:
+      enabled: true
+    query_generation:
+      enabled: true
+    log_retrieval:
+      enabled: true
+    correlation:
+      enabled: true
+    anomaly_detection:
+      enabled: true
+    # The last stage before the report is written — the most expensive place to be
+    # wrong, so a lower bar for asking.
+    report_generation:
+      enabled: true
+      threshold: 0.7
+  # Recalibrate an individual signal without a code change; 0.0 disables it. Unknown
+  # codes are ignored with a warning. Full list in src/stage_health.py.
+  weights: {}
+  #
+  # Gate timeouts. UNSET = hold forever, which is the default on purpose: a gate
+  # exists because a human decision is due, and a timeout that quietly expires is a
+  # decision made by a clock. `0` or a negative value also mean "no timeout" (an
+  # instantly-expiring gate is never what anyone means by writing 0).
+  #
+  #   on_timeout: hold     notify once, then keep waiting (DEFAULT — the only option
+  #                        that cannot make an unreviewed decision)
+  #              proceed   continue as if approved; recorded in interventions and
+  #                        gate_history with actor "timeout", so the report can never
+  #                        read as reviewed when nobody reviewed it
+  #              abort     cancel the job
+  #
+  # `hold` fires its notification EXACTLY ONCE — a repeating alert on an unanswered
+  # gate is how a recipient learns to mute the channel. Set both globally or per stage.
+  timeout_seconds: 0
+  on_timeout: hold
+
+# Outbound webhooks. Optional, disabled by default, and never able to fail or slow a
+# run — delivery is a background POST and every failure degrades to a log line.
+#
+# WHY, given SSE already exists: SSE needs a client connected and STAYING connected.
+# A gate can hold for days, outliving any browser tab, so an integrating app needs a
+# push it can receive while nothing of its own is running.
+#
+# NOT a delivery guarantee: retries are bounded and there is no durable outbox. That is
+# acceptable because the state a webhook announces is itself durable — the gate is
+# still in GET /api/v1/gates and still in the job store. Treat a webhook as a latency
+# optimisation over polling, never as the system of record.
+#
+# Subscribable events: gate_opened, gate_resolved, gate_timeout, job_completed,
+# job_cancelled, stage_failed. The chatty per-stage events are deliberately NOT
+# subscribable — a webhook firing on all of them is a self-inflicted DoS on the receiver.
+webhooks:
+  enabled: false
+  timeout_seconds: 10
+  max_attempts: 3
+  targets: []
+  # A webhook URL IS a secret (a Slack/Teams URL is a bearer credential), so reference
+  # an env var — never paste the literal. An unresolvable ${VAR} drops the target and
+  # logs an ERROR rather than quietly sending nowhere.
+  # targets:
+  #   - name: soc-slack
+  #     url: "${AFIR_SLACK_WEBHOOK}"
+  #     events: ["gate_opened", "gate_timeout"]   # omit `events` to receive all of them
+  #   - name: case-management
+  #     url: "${AFIR_CASE_MGMT_WEBHOOK}"
+  #     events: ["job_completed", "stage_failed"]
+  #     headers:
+  #       Authorization: "Bearer ${AFIR_CASE_MGMT_TOKEN}"
+
+# Durable job persistence. An approval gate holds indefinitely by design, which makes
+# a supervised job a multi-day object — without this, a deploy or an App restart
+# silently discards every pending approval. One JSON file per job under
+# `<AFIR_DATA_DIR>/jobs/`, written atomically (temp file, parsed back, then swapped in,
+# with the previous version kept as .prev). Point AFIR_DATA_DIR at a Unity Catalog
+# Volume in deployment; if that path is not writable the store falls back to LOCAL DISK
+# and logs an ERROR — local disk does NOT survive a container restart.
+# WHERE durable state lives — job documents, evidence sidecars, exports, the feedback
+# log. One decision, taken once, and NOT a property of the deployment mode: a laptop or a
+# VM can keep its state on an external Volume, and a Databricks App can keep its config in
+# the image. Verified live in both directions.
+#
+# The values below are the DEFAULTS, spelled out rather than left implicit so they can be
+# switched from the Configuration tab — a commented-out block is documentation, not a
+# setting. `backend: local` is byte-for-byte the layout that shipped before this seam
+# existed, so an existing deployment needs no edit here.
+#
+# THIS ONE BLOCK IS ENV-DRIVEN, and it is the only block that has to be, because it is the
+# one an operator CANNOT bootstrap from the UI. In a container the config comes from the
+# bundle, `backend: local` means the container's own disk, and a UI edit switching it to
+# `databricks` is written to that disk — so the restart that would apply it is the restart
+# that discards it. Measured: switch accepted, `durable: true` reported (there is no mirror
+# to push to yet), `local` again after restart. `${VAR:-default}` carries the shipped
+# default with it, so a laptop and a VM that set nothing behave exactly as before while
+# `app.yaml` can hand an App a durable store on its FIRST boot.
+storage:
+  # local      — a FILESYSTEM. `root` below chooses which one: blank = disk under
+  #              AFIR_DATA_DIR (does NOT survive a container restart, which is why it is
+  #              wrong for an App and fine for a VM with a real disk), or a path to a
+  #              MOUNTED / EXTERNAL volume to keep state off the machine's own disk. Still
+  #              the same implementation either way — an NFS/SMB mount takes os.replace and
+  #              fsync, so there is nothing a separate backend would do differently.
+  # databricks — a Unity Catalog Volume over the Files API, MANAGED OR EXTERNAL. Both kinds
+  #              live in the same /Volumes/<catalog>/<schema>/<volume> namespace and are
+  #              written through the same API, so an external Volume needs no different
+  #              setting here — only the name of a Volume that happens to be external.
+  #              Reached over HTTP rather than by pointing `root` at /Volumes, which in an
+  #              App container is not mounted at all: that write lands in /tmp and reports
+  #              success while losing every pending approval on the next restart.
+  # sql        — a transactional database (sqlite or postgresql), configured under `sql:`
+  #              below. The ONLY option safe with more than one replica: its upsert and its
+  #              append are each one atomic statement, where the Volume backend emulates
+  #              append through a single writer thread that a second replica does not share.
+  backend: "${AFIR_STORAGE_BACKEND:-local}"
+
+  # Read only when `backend: local`. Blank = AFIR_DATA_DIR, i.e. what every existing
+  # deployment gets. A path here is how an external or mounted volume is used, and it must
+  # be a real filesystem: see the warning against /Volumes in an App above.
+  root: "${AFIR_STATE_DIR:-}"
+
+  # The config files and the knowledge pack are MIRRORED rather than moved: every write
+  # lands on the local working copy through the byte-level path it always used (a
+  # line-anchored scalar patch that preserves the comments, a verified line-range
+  # replacement, a content-addressed undo store), and the resulting bytes are then pushed
+  # to the durable store. At boot the durable copy is laid back over the working one. Only
+  # EDITED files are stored — everything else is re-read from the deployed bundle on every
+  # boot, so a release still delivers new pack files while an operator's edit to another
+  # file survives it.
+  #   auto (default) — mirror when `backend` is remote, do not when it is local.
+  #   always         — mirror even over local disk. For a VM that wants its pack and its
+  #                    config to outlive the machine, or for exercising the seam.
+  #   never          — do not mirror. For a deployment that keeps its state remote but
+  #                    treats config and pack as part of the immutable image.
+  # A write that reaches the working copy but not the durable store answers
+  # `durable: false` and the UI says so in red, because it looks exactly like a save until
+  # the restart that discards it.
+  mirror_config_and_pack: auto
+
+  # Read only when `backend: databricks`. Left here with empty/neutral values so the
+  # Configuration tab can fill them in: an absent key can be inserted, but a form cannot
+  # offer a field the file never mentions.
+  databricks:
+    # Env-driven for the same bootstrap reason as `backend` above — a Volume path that can
+    # only be set after the first boot is a Volume that never holds the first boot's state.
+    # Blank stays blank on a laptop, where the backend is local and nothing reads these.
+    catalog: "${AFIR_UC_CATALOG:-}"   # REQUIRED for the databricks backend; the Volume is
+                                      # /Volumes/<catalog>/<schema>/<volume>. Empty means
+                                      # the backend refuses to write and SAYS so at boot.
+    schema: "${AFIR_UC_SCHEMA:-afir}"
+    volume: "${AFIR_UC_VOLUME:-state}"
+    # Blank host = the Databricks SDK resolves its own workspace, which is what an App
+    # wants: the platform injects OAuth credentials for the workspace holding the Volume.
+    # Set both for a local/VM run against a PAT — and note a PAT is workspace-scoped, so
+    # one issued for another workspace answers 403 with a token that looks entirely valid.
+    # Ambient SDK credentials WIN over token_env, so a local run that sets DATABRICKS_HOST
+    # to one workspace while DATABRICKS_TOKEN holds another's is the 403 above.
+    host: ""
+    token_env: DATABRICKS_TOKEN
+    verify_ssl: true            # true here unlike log_sources; a store holding pending
+                                # approvals must not inherit a dev-only insecure posture
+
+  # Read only when `backend: sql`. Present with defaults for the same reason as the block
+  # above: the Configuration tab can fill in a key that exists, and cannot offer one the
+  # file never mentions.
+  #
+  # A WAREHOUSE IS NOT AN OPTION HERE, and that is measured rather than a preference.
+  # Databricks SQL caps combined statement parameters at 1 MiB (measured: 768 KB accepted,
+  # 1024 KB answered HTTP 400) while real evidence sidecars in this system reach 2.07 MB, so
+  # a parameterised write cannot carry the payload at all — and job documents at 599 KB
+  # leave a 1.28x margin, where the margin IS the budget. Snowflake rewrites
+  # micro-partitions to update one row and cannot concatenate BINARY, so the append the
+  # feedback log needs would lose a concurrent reviewer. Both are excellent at reading many
+  # rows once, which is what log_sources uses them for. See src/storage/sql.py.
+  sql:
+    # sqlite     — one ACID file, no server. A real answer for a mounted/external volume.
+    # postgresql — a server, and the one configuration safe with several replicas.
+    dialect: "${AFIR_SQL_DIALECT:-sqlite}"
+    # The connection string comes from the ENVIRONMENT, named here — the same indirection
+    # as api_key_env / token_env, and for a reason specific to this value: a libpq URL
+    # carries its password INSIDE the string, so keeping the literal out of this file also
+    # keeps it out of the Configuration tab, whose redacted controls would otherwise PUT a
+    # placeholder back over it on the next save.
+    #   sqlite:     a FILE PATH, e.g. /var/lib/afir/state.sqlite3 (its parent is created)
+    #   postgresql: a libpq URL, e.g. postgresql://afir@db.internal/afir
+    # REQUIRED for this backend: with neither this variable set nor a `dsn` written below,
+    # the store refuses every write and says so at boot rather than accepting them and
+    # holding nothing.
+    dsn_env: AFIR_SQL_DSN
+    # An explicit connection string, which WINS over the variable above. Fine for a sqlite
+    # path, which is not a credential. Redacted on read either way — but a password written
+    # here is a literal secret in a config file, so use dsn_env for postgresql.
+    dsn: ""
+    # Created if absent. Validated as a SQL identifier rather than quoted, because it is
+    # the one value here that cannot be a bound parameter. May be schema-qualified.
+    table: afir_blobs
+
+# Writes go through one background thread (a measured Volume upload is ~0.6s and a run
+# saves ~15 times, which would otherwise stall the UI), coalescing per key since every
+# job save is a full snapshot. A gate-opening save is flushed synchronously before the
+# gate is announced — that is the state a restart must come back to.
+#
+# SINGLE REPLICA ONLY. The append emulation is a read-modify-write serialised by that one
+# writer thread; a second replica would have its own and silently lose one analyst's
+# review. See docs/architecture/databricks-deployment.md.
+
+jobs:
+  persist: true
+  # A LOCAL directory override; default <AFIR_DATA_DIR>/jobs. Do NOT put a /Volumes path
+  # here — it is opened as a filesystem path, and in an App container /Volumes is not
+  # mounted, so the store falls back to /tmp and reports success while losing every
+  # pending approval on restart. A Volume is reached through `storage:` above instead.
+  dir: ""
+  # Retrieved log rows go in a `<job_id>.evidence.json` sidecar, rewritten only when
+  # the evidence actually changes. Past this cap the evidence is DROPPED and the
+  # omission is recorded in the job doc, so a reloaded job reports that its evidence
+  # is missing instead of looking complete with empty logs.
+  max_evidence_mb: 64
+  # How long job FILES are kept. Deliberately longer than the in-memory TTL (1h): the
+  # point of persisting is to outlive the process, and an audit may come days later.
+  retention_days: 14
+  # How many entries each per-stage summary list keeps — extracted entities, generated
+  # queries, findings, anomalies, verdict subjects. These summaries are what the
+  # Investigate cards and the APPROVAL GATES show, so a list cut here is a list the
+  # operator approves without seeing it: at the old hardcoded 12, one run generated 13
+  # queries and displayed 12, and classified 14 entities and displayed 12. The true total
+  # is now always shown beside the list and the card states "Showing N of M", but raise
+  # this for incidents naming many entities or sources. The full data is in the export
+  # regardless. Bounded at all because these summaries ride the live SSE replay buffer.
+  summary_max_items: 30
+  # Ceiling on retrieval PASSES for one run. A knowledge pack may declare that a
+  # procedure needs a further round of query generation + retrieval driven by what the
+  # previous round returned — the values it must ask about do not exist until an earlier
+  # answer comes back. The engine allows that; it does not require it, and a pack that
+  # declares none runs exactly one pass, as every run did before this key existed.
+  #
+  # This is a runaway guard, not a tuning knob: a pack whose harvest re-qualifies for its
+  # own next pass would otherwise loop forever, and a run that never finishes reports as
+  # one still running. Set 1 to refuse follow-up passes entirely. Reaching the cap is
+  # LOGGED with the source and purpose of the pass that was dropped and recorded as an
+  # intervention on the job, because a pass that never ran and a pass that found nothing
+  # produce the same (absent) evidence.
+  max_retrieval_passes: 3
+  # How many runs execute stages at once. Submissions past this WAIT in a FIFO backlog
+  # (`GET /api/v1/jobs` reports each one's position) rather than starting alongside; a
+  # batch of twenty incidents therefore finishes in order instead of making every run in
+  # it slower. Raising it does not raise throughput past the LLM endpoint: one run fans
+  # out ~19 retrievers making two or three calls each, and they already share
+  # `llm_config.yaml`'s concurrency semaphore and rate limiter — past a few runs that
+  # semaphore becomes the real queue, with no depth, position or cancel an operator can
+  # see. Capped by the engine at 8 regardless of what is written here.
+  #
+  # The width governs SUBMITTED runs only. A resumed run, a stage retry and a linked
+  # child run all start outside it: each is a decision already taken, and backpressuring
+  # one of those is how a control surface stops being trusted. A run that parks on an
+  # approval gate or a pause hands its slot back while it waits.
+  max_concurrent_jobs: 2
+  # How many submissions may wait. Past this, POST /api/v1/jobs and POST /api/v1/batches
+  # answer 429 naming the depth and this limit — a refusal, never a silent accept, because
+  # a job id for a run that may never start reads exactly like a run that is merely slow.
+  # Lower it to shed load early; raise it for an overnight backlog. Capped at 4096.
+  max_queued_jobs: 256
+
+# Human-in-the-loop feedback. Analyst reviews (POST /api/v1/feedback) are persisted
+# on arrival to feedback_log.jsonl + feedback_pending.jsonl under the data dir, then
+# distilled into feedback_insights.json once `batch_size` reviews accumulate (or on
+# POST /api/v1/feedback/process).
+feedback:
+  batch_size: 10
+  # When true, the distilled insights are rendered into the incident-understanding
+  # and anomaly-detection prompts (GET /api/v1/feedback/guidance shows the exact
+  # text). The guidance is ADVISORY and capped: the knowledge pack, the official
+  # procedure, and any deterministic verdict outrank it. Set false to collect
+  # feedback without letting it steer the LLM.
+  apply_to_prompts: true
+
+  # NUMERIC tuning of anomaly_detection.threshold from analyst reviews. OFF by
+  # default because this knob changes what the system reports: with it off the
+  # recommendation is still computed and readable (GET /api/v1/feedback/threshold)
+  # so a human decides. The direction comes from COUNTED structured review fields,
+  # never from the LLM's prose: reviews listing `false_positives` mean noise got
+  # through (raise), reviews listing `missed_anomalies` mean real findings were
+  # filtered out (lower). Balanced reports leave it alone.
+  #
+  # `anomaly_detection.threshold` above stays the DECLARED baseline — the tuned value
+  # lives in feedback_thresholds.json and is bounded relative to the baseline, so
+  # config remains the source of truth and POST /api/v1/feedback/threshold/reset
+  # reverts in one call.
+  auto_tune_threshold: false
+  threshold_step: 0.05          # max move per adjustment
+  min_reviews_for_tuning: 5     # new reviews required since the last adjustment
+  max_threshold_drift: 0.15     # max total distance from the configured baseline
+  threshold_min: 0.3            # hard floor, regardless of baseline
+  threshold_max: 0.95           # hard ceiling
 
 plugin_dir: "../plugins"
 
-knowledge_base:
-  path: "/path/to/your/knowledge_base"
-  update_frequency: "daily"
-
 rag:
-  use_rag: false
-  sentence_transformer_model: "all-MiniLM-L6-v2"
+  use_rag: true
+
+  # Where embeddings come from — one seam, two providers, any model:
+  #
+  #   databricks            a Model Serving endpoint with an `llm/v1/embeddings` task.
+  #                         Nothing to download and no torch cold start, which is why it is
+  #                         the default in every deployment mode. `embedding_model` is the
+  #                         ENDPOINT NAME; leave `embedding_host` blank to reuse the
+  #                         Databricks auth already resolved for the LLM (correct whenever
+  #                         the endpoint is in the same workspace, and the only thing that
+  #                         works with an App's OAuth service principal).
+  #   sentence_transformers a local model — the right choice with no network. Reads
+  #                         `sentence_transformer_model` when `embedding_model` is blank,
+  #                         so a config written before this seam existed keeps its exact
+  #                         behaviour. Costs ~420MB of weights plus torch.
+  #
+  # A provider that cannot produce vectors does NOT fail the boot: retrieval degrades to a
+  # deterministic keyword fallback over the playbooks. An unknown provider NAME does raise —
+  # a typo would otherwise run a different model than the one configured, and every symptom
+  # would look like poor retrieval quality.
+  #
+  # All of these are restart-only. A vector is comparable only to an index built by the same
+  # model, so the index records its own provider:model:dim and rebuilds when they disagree —
+  # a swap costs one boot, never a search in the wrong vector space.
+  embedding_provider: databricks
+  embedding_model: "databricks-qwen3-embedding-0-6b"
+  embedding_dim: 1024            # sizes the index before the first call; the provider's
+                                 # measured width wins and a mismatch is logged
+  embedding_host: ""             # blank = the workspace the LLM auth resolves to
+  embedding_token_env: ""        # env var NAME holding a PAT; blank = unified auth
+  embedding_verify_ssl: true     # off only for a self-signed corporate chain
+  embedding_batch_size: 100      # inputs per request; serving endpoints refuse above 150
+  embedding_max_chars: 96000     # per document, truncated (and logged) before sending
+
+  sentence_transformer_model: "all-mpnet-base-v2"
   max_retrieved_documents: 5
-  similarity_threshold: 0.7  
+  similarity_threshold: 0.5
 
-error_handling:
-  max_retries: 3
-  backoff_factor: 2
-  jitter: 0.1
-  log_errors: true
-  notify_on_critical: true
+  # Pluggable knowledge sources, consolidated into ONE knowledge base before the
+  # LLM sees them. Each entry is one KnowledgeSource, discriminated by `type`:
+  #   playbook         — the domain pack's playbooks (knowledge/<pack>/playbooks/*.md)
+  #   pack_schema      — the pack's per-table field inventories (knowledge/<pack>/schemas/
+  #                      *.yaml), one doc per table. Retrieval-only and OPT-IN: these docs
+  #                      are returned solely to a caller passing filter_type="schema", so
+  #                      enabling this cannot change any existing prompt. They exist so a
+  #                      field that EXISTS is never recorded as absent — retriever schema
+  #                      discovery stops at an ARRAY<STRUCT<..>> (a dotted path into an
+  #                      array isn't valid SQL), which is right for generating SQL and
+  #                      wrong as a statement about the data.
+  #   document         — local folders of pdf/docx/txt/csv/json (also a UC Volume mount)
+  #   confluence       — Confluence spaces / labels
+  #   databricks_table — rows of a Unity Catalog table mapped to docs
+  # `name` becomes the knowledge-base source key (must be unique). Declare the
+  # playbook source FIRST — the deterministic fallback (used if the embedding model
+  # can't load) reads playbook docs by that key, so playbook context is never lost.
+  # Adding a new backend = one new KnowledgeSource subclass + one entry here.
+  sources:
+    - type: playbook
+      name: playbook
 
-performance:
-  use_multiprocessing: true
-  max_workers: 4
-  batch_size: 50
+    - type: pack_schema
+      name: pack_schema
+
+    - type: document
+      name: local_documents
+      enabled: false
+      paths: []
+
+    - type: confluence
+      name: confluence
+      enabled: false
+      url: ""
+      username: ""
+      password: ""
+      spaces: []
+      labels: []
+
+    - type: databricks_table
+      name: db_fraud_kb
+      enabled: false
+      table: "main.fraud.knowledge_articles"
+      title_col: "title"
+      content_col: "body"
+      type_col: "article_type"     # optional; default "databricks_row"
+      where_clause: ""             # optional SQL WHERE body, e.g. "active = true"
+      extra_cols: []               # extra columns to keep in doc metadata
+      # warehouse_id / workspace_url default to log_sources.backends.databricks
+
+  # Back-compat: if `sources` is omitted, the playbook pack + document_paths +
+  # confluence below are used instead.
+  document_paths: []
+  confluence:
+    url: ""
+    username: ""
+    password: ""
+
+
+# Logging. The pipeline already logs verbosely and readably: one [event] line per stage
+# transition, [health] with the score AND every reason behind it, [gate] on
+# open/resolve/timeout. This section only chooses the FORMAT those lines are written in.
+#
+#   console  aligned human-first text (DEFAULT) — what you want in a terminal
+#   json     one JSON object per line, with job_id / stage / score / action promoted to
+#            top-level keys. In a Databricks App the console is the only telemetry that
+#            leaves the container, and this is what makes "which gates opened this week"
+#            a query instead of a regex over prose that changes when someone rewords it.
+#
+# AFIR_LOG_FORMAT and AFIR_LOG_LEVEL override these, because the right format is a
+# property of where the process runs, not of the investigation config — and in a
+# container an env var is the thing you can actually set.
+logging:
+  format: "console"       # console | json
+  level: "INFO"
+  # Known-chatty third-party loggers (openai, elasticsearch, urllib3, ...) are raised to
+  # WARNING automatically so they cannot bury the pipeline's own lines. Naming one here
+  # wins over that default — this is how you get the HTTP detail back when debugging.
+  levels: {}
+  #   openai: DEBUG
+  #   src.retrievers.databricks_retriever: DEBUG

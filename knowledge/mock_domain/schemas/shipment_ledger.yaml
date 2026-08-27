@@ -1,0 +1,245 @@
+# =============================================================================
+# MOCK-DOMAIN PACK — field inventory for `shipment_ledger`.
+#
+# WHAT A SCHEMA DOC IS FOR. Schema discovery in the retrievers stops at an
+# ARRAY<STRUCT<...>> — a dotted path into an array is not valid SQL — and caps
+# depth and leaf count. That is correct for GENERATING a query and wrong as a
+# statement about the data: it makes an array's contents invisible, so a field
+# that EXISTS gets recorded as absent. These files hold the COMPLETE inventory,
+# arrays descended, with an `explode_path` on every leaf that needs one.
+#
+# RAG-ONLY, BY CONSTRUCTION. One document per TABLE, never added to the source
+# selection prompt. A real inventory runs to thousands of leaves; pasting it would
+# crowd out the pack's targeting guidance and shift query shapes on sources that
+# work today. Completeness lives in the corpus; SELECTIVITY happens at retrieval
+# (`type='schema'`, one table's worth at a time).
+#
+# The structure (paths, types, explode_path, populated_pct) is DISCOVERED from the
+# live backend by `scripts/generate_source_schemas.py` and is overwritten on every
+# regeneration. `description:` is written by HAND and preserved across
+# regenerations — which is the whole point: the discovered half says a leaf
+# exists, the hand-written half says what it means, and neither is derivable from
+# the other.
+#
+# This file is hand-authored (the reference domain has no live backend) but keeps
+# the generated shape exactly, so it exercises the same loader path.
+# =============================================================================
+
+source: shipment_ledger
+kind: databricks_uc
+generated_by: hand-authored (mock pack — no live backend)
+note: >
+  Field inventory for this pack's system of record. Arrays ARE descended here,
+  unlike the retriever's query-generation schema. A leaf carrying an `explode_path` is
+  reachable ONLY through that explode — selecting it without one fails the whole query.
+
+tables:
+  shipment_ledger:
+    fully_qualified_name: reference_catalog.logistics.shipment_ledger
+    # DISCOVERED from backend metadata on a real source; stated here because the reference
+    # pack has no backend to discover from. `pad_days` never comes from a catalog, which is
+    # why the source_catalog declares that part as an override.
+    partition_columns: [scan_date]
+    columns:
+
+      tracking_code:
+        type: string
+        leaves:
+          - path: tracking_code
+            type: string
+            kind: scalar
+            populated_pct: 100.0
+            description: >
+              The shipment's own identifier and the subject a verdict is rendered for. Two
+              uppercase letters then eight digits.
+        description: "Primary key of a shipment envelope."
+
+      depot_code:
+        type: string
+        leaves:
+          - path: depot_code
+            type: string
+            kind: scalar
+            populated_pct: 100.0
+            description: >
+              The sorting facility that handled the shipment. Bounds a cohort comparison —
+              "did this courier claim refunds on other shipments" is answered from
+              depot-scoped rows, not from a second subject-keyed query.
+        description: "Handling depot."
+
+      created_at:
+        type: timestamp
+        leaves:
+          - path: created_at
+            type: timestamp
+            kind: scalar
+            populated_pct: 100.0
+            description: >
+              When the shipment RECORD was created. Not when the parcel moved — the first
+              entry of `scans` is the earliest evidence of movement, and on a fabricated
+              shipment the two are minutes apart with no scan at all.
+        description: "Record creation time."
+
+      scan_date:
+        type: date
+        leaves:
+          - path: scan_date
+            type: date
+            kind: scalar
+            populated_pct: 100.0
+            description: >
+              PARTITION COLUMN. Must be bounded in every generated query or the backend
+              scans the whole table. An unbounded partition changes nothing about WHICH rows
+              come back, only how much storage is read — so it never looks like a
+              correctness bug, it looks like slowness, and past a timeout it looks like "the
+              source returned nothing".
+        description: "Partition column: the date the shipment was last scanned."
+
+      pod_captured_ms:
+        type: bigint
+        leaves:
+          - path: pod_captured_ms
+            type: bigint
+            kind: scalar
+            populated_pct: 71.4
+            description: >
+              POD capture instant as EPOCH MILLISECONDS. An epoch integer advertises neither
+              its unit nor its era, so a hand-written literal in a prompt goes stale
+              silently: the value AND-ed into a filter is a plausible number that matches
+              nothing, which reads downstream as "the source had no data". Declared as
+              `{name, unit}` on the source; the engine converts the incident's window.
+        description: "Proof-of-delivery capture time, epoch ms."
+
+      element_counters:
+        type: struct
+        leaves:
+          - path: element_counters.INS
+            type: int
+            kind: scalar
+            populated_pct: 100.0
+            description: "Count of insurance elements on the shipment."
+          - path: element_counters.SIG
+            type: int
+            kind: scalar
+            populated_pct: 100.0
+            description: "Count of signature-required elements on the shipment."
+        description: >
+          Per-type element counts. THERE IS NO `SCAN` LEAF — scans are counted by descending
+          the `scans` array, not from a counter. Declaring a leaf that does not exist fails
+          the WHOLE query, not just that leaf, so confirm a leaf here before using it.
+
+      scans:
+        type: array<struct>
+        leaves:
+          - path: scans.scan
+            type: string
+            kind: array_leaf
+            explode_path: scans
+            populated_pct: 88.2
+            description: "The scan event code. Absent entirely on a fabricated shipment."
+          - path: scans.scanned_at
+            type: timestamp
+            kind: array_leaf
+            explode_path: scans
+            populated_pct: 88.2
+            description: "When the scan was taken."
+          - path: scans.scanned_by
+            type: string
+            kind: array_leaf
+            explode_path: scans
+            populated_pct: 86.9
+            description: "Badge of the courier who took the scan."
+        description: "The scan chain — the shipment's evidence of having moved."
+
+      handler:
+        type: struct
+        leaves:
+          - path: handler.badge
+            type: string
+            kind: scalar
+            populated_pct: 99.8
+            description: >
+              The handling courier's EMPLOYEE BADGE (4 digits + a letter). One of two
+              non-interchangeable identifier forms — see the `actor_identity_forms` concept.
+          - path: handler.device_login
+            type: string
+            kind: scalar
+            populated_pct: 94.1
+            description: >
+              The handling courier's HANDHELD DEVICE LOGIN (6 lowercase letters). Names the
+              same person as the badge; bound to the wrong column it returns zero rows,
+              which reads as "this courier did nothing".
+        description: "Who handled the shipment."
+
+      pod:
+        type: struct
+        leaves:
+          - path: pod.signature_captured
+            type: boolean
+            kind: scalar
+            populated_pct: 100.0
+            description: >
+              Whether a POD signature was captured. `never_filter` — it is evidence, not a
+              noise reducer.
+          - path: pod.captured_by
+            type: string
+            kind: scalar
+            populated_pct: 71.4
+            description: >
+              Badge of the courier who captured the POD. Compared to `handler.badge` WITHIN
+              the row: two identities on one parcel is the collusion shape.
+        description: "Proof-of-delivery block."
+
+      refund:
+        type: struct
+        leaves:
+          - path: refund.amount
+            type: decimal(10,2)
+            kind: scalar
+            populated_pct: 12.3
+            description: "Claimed refund amount. NOT the trigger — the detector fires on the burst."
+          - path: refund.reason_code
+            type: string
+            kind: scalar
+            populated_pct: 12.3
+            description: >
+              Documented reason: DAMAGE / LOST / RTS / DELAY. A value outside that
+              vocabulary is a fraud indicator; see `data/refund_reason_map.yaml`.
+          - path: refund.claimed_at
+            type: timestamp
+            kind: scalar
+            populated_pct: 12.3
+            description: "When the refund was claimed. The end of the `refund_within_window` gap."
+          - path: refund.manually_reviewed
+            type: boolean
+            kind: scalar
+            populated_pct: 12.3
+            description: >
+              Whether a person reviewed and approved the claim. `never_filter`: it reads like
+              a noise reducer but it IS the exculpatory fact, so `AND manually_reviewed =
+              false` deletes exactly the rows that decide the verdict and the check goes
+              inert reporting "flag absent".
+          - path: refund.approved_by
+            type: string
+            kind: scalar
+            populated_pct: 9.7
+            description: >
+              Badge of the approving reviewer. What makes the review a CATEGORICAL exclusion
+              rather than a heuristic one: a named person on a stated date is an attributed
+              fact, checkable against the record.
+        description: "Refund block — populated only on shipments with a claim."
+
+      route:
+        type: struct
+        leaves:
+          - path: route.origin
+            type: string
+            kind: scalar
+            populated_pct: 100.0
+            description: "Origin depot code. Read by the scope gate."
+          - path: route.destination
+            type: string
+            kind: scalar
+            populated_pct: 100.0
+            description: "Destination depot code. Read by the scope gate."
+        description: "The movement's endpoints."

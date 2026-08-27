@@ -16,14 +16,27 @@ Please follow the standard python rules if possible:
 There is always room for opportunistic refactoring, but be careful and ensure the cosmetic changes have no adverse impact on performance or readability.
 
 ### Testing conventions
-The project comes which a suite of unit tests covering most of the aspects. Make sure you pass all the existing tests locally before submitting the PR. Furthermore, any new feature, flow or the amendment of the existing one should be reflected in newly added unit tests or the update of the existing tests depending on the context.
+The project has a suite of unit tests. All existing tests must pass before submitting a PR. Any new feature, changed flow, or bug fix must be accompanied by new or updated tests.
 
-Please follow [pytest good practices](https://docs.pytest.org/en/stable/goodpractices.html). You can also draw some inspirations from [this article](https://realpython.com/pytest-python-testing/).
+Run the suite with:
 
-Make sure you test the syntax before submitting the PR. Run a local build if you can and verify if all the new extra resources are also checked in.
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+Please follow [pytest good practices](https://docs.pytest.org/en/stable/goodpractices.html).
+
+**Formatting posture.** There is no `setup.cfg`, `pyproject.toml`, or `.flake8` in this repository. Running `flake8` with defaults applies a 79-column limit against black's 88, which produces roughly 13,600 pre-existing findings across the codebase, and `black src tests` would reformat files unrelated to a change. Format only the files you touched, and verify that a touched file introduces no new non-E501 flake8 findings. Repository-wide reformatting is a separate, coordinated commit and is not expected from individual contributors.
+
+Make sure all new resources are checked in before submitting the PR.
+
+**Measurement citations, and the one class of file that is deliberately absent.** Comments in `src/` and prose in `docs/architecture/` regularly attribute a number to a one-off script — `scripts/probe_*.py`, `scripts/measure_*.py`, or a run log under `scripts/out/`. Most of those are **not in the repository**, and that is the intent rather than an omission: they are single-use instruments pointed at a live backend, carrying one deployment's coordinates, and their output directory is gitignored (the `scripts/out/` entry in `.gitignore`). The artifact that ships is the measured **result**, recorded beside the value it justifies — so a comment reading *"measured in `scripts/probe_volume_semantics.py`: 768 KB accepted, 1024 KB answered HTTP 400"* is complete without the file, and the filename is an attribution rather than a path you can follow.
+
+Two obligations follow, and they are the whole convention. **Put the number in the sentence that cites it** — a bare *"see `scripts/probe_x.py`"* says nothing in a fresh clone, and the fix is to move the measurement into the prose, not to commit the probe. **A script becomes tracked only when a document presents it as an instrument to RE-RUN**, not as provenance for a result already stated; `scripts/measure_link_signals.py` and `scripts/validate_source_selection.py` are tracked for exactly that reason, and a tracked script must hold no deployment-specific literal. So the rule above applies in full to everything a reviewer or a fresh clone needs in order to build, run and test — and stops at your own measurement scratch.
 
 ### Branching conventions
-We are working with a single master branch and one development branch to make is simple.
+We are working with a single default branch (`main`) and one development branch to keep it simple. Open your PR against `main`.
 
 ### Commit-message conventions
  * Prefix each commit with the GitHub Issue ticket number if possible i.e. [ABC-123] New package nnn added to allow running bbb
@@ -67,16 +80,16 @@ We are working with a single master branch and one development branch to make is
   * Remember that good documentation is essential, so take time to do it properly
 
 ### Dependencies
-All the development dependencies are incorporated into [requirements.txt](./requirements.txt)
+Runtime dependencies are listed in [requirements.txt](./requirements.txt). Development, testing, and formatting dependencies are in [requirements-dev.txt](./requirements-dev.txt), which installs the runtime set as well (`pip install -r requirements-dev.txt` is the developer install command).
 
 ### Build process schedule
-The deliverable(python wheel) is built as soon as the PR is merged into release branch. #to be implemented
+A Python wheel is produced when a PR is merged into the release branch.
 
-### Sprint schedule
-There is no specific scrum setup here. All the changes are worked on in a best effort mode.
+### Contribution schedule
+Contributions are reviewed and integrated asynchronously. There is no fixed sprint cadence. PRs are reviewed within approximately one week of submission.
 
 ### Road map
-There is no roadmap yet. One will be created if there is a need for it.
+Feature priorities are discussed in GitHub Issues and evolve as the project develops. Contributions that align with open issues are particularly welcome.
 
 ### When the repositories will be closed to contributions
 At this stage the repositories never get frozen.

@@ -123,6 +123,7 @@ celerybeat.pid
 
 # Environments
 .env
+.afir_env
 .venv
 env/
 venv/
@@ -166,3 +167,87 @@ config/llm_config.yaml
 config/main_config.yaml
 config/plugin_config.yaml
 config/logging_config.yaml
+# Rollback copies written by the Configuration UI's raw editor / importer. Real
+# credentials, and a whole-file save creates one on every write. The `*` after `.bak`
+# matters: a hand-made `main_config.yaml.bak.storage` (taken before editing the real
+# config, so a probe's writes can be diffed away) is the same content class, and
+# `config/*.bak` alone does not match it.
+config/*.bak
+config/*.bak.*
+config/certs/
+# Paste-ready deployment configs, derived from the local config/*.yaml above. Same
+# content class as those: env-var references rather than literal secrets, but real
+# workspace hosts, warehouse ids and a domain vocabulary that `config/templates/`
+# is scanned to keep out of git. Excluded from the bundle sync for the same reason.
+deploy/
+
+# Local credentials / generated artifacts (keep out of the Databricks App bundle)
+.databrickscfg
+exports/
+knowledge_base/
+
+# Human-in-the-loop feedback store (analyst reviews + distilled insights). Written
+# under $AFIR_DATA_DIR, which defaults to the repo root.
+feedback_log.jsonl
+feedback_pending.jsonl
+feedback_insights.json
+feedback_thresholds.json
+
+# macOS + downloaded model weights (too large / machine-local)
+.DS_Store
+model_cache/
+
+# ---------------------------------------------------------------------------
+# PROPRIETARY / PERSONAL DATA. None of the following is a build artifact — each
+# is real operational material that happens to live in the working tree, so the
+# rule is by CONTENT, not by convenience.
+#
+# This section is deliberately IDENTICAL on every branch, generic engine and
+# domain deployment alike, for the same reason `config/templates/` is: a safety
+# rule that differs per branch conflicts on merge, and the merge is exactly when
+# somebody resolves it in the direction that commits the data.
+# ---------------------------------------------------------------------------
+
+# The written procedure a pack encodes is typically classified by whoever owns it.
+# The pack holds the procedure's LOGIC (rules.yaml, playbooks) which is ours to
+# keep; the source document itself is not, so no PDF is ever committed.
+*.pdf
+
+# Persisted job store: every incident AFIR has processed, including the evidence
+# sidecar. This is live production data — real subject identifiers, document
+# numbers, actor identities, personal contact details — not test fixtures.
+# Written under $AFIR_DATA_DIR.
+jobs/
+
+# Resolved real investigations, kept as RAG precedent. Same content class as the
+# job store (real subject identifiers, org units, actor identities, expert
+# rationale), so it stays local even though the surrounding pack is checked in.
+#
+# DEFAULT-DENY, then re-allow the packs that are deliberately fictional. The rule was
+# scoped to one pack by name, which meant a SECOND real domain pack committed its live
+# cases the first time an investigation was seeded into it — and that folder is the only
+# part of a pack holding live incident detail, so the leak is silent and the mistake is
+# only visible after the push. Ignoring every `cases/` and listing the exceptions puts
+# the burden on the fictional pack (where a wrong guess commits invented data) instead of
+# on the real one (where it commits real data).
+knowledge/*/use_cases/*/cases/
+!knowledge/mock_domain/use_cases/*/cases/
+
+# The pack editor's undo store: every prior version of every file it has written,
+# content-addressed. Local by construction — it is a record of one operator's editing
+# session, git already keeps the pack's committed history, and the blobs include prior
+# versions of `cases/` files, so committing it would re-leak exactly what the rule above
+# keeps out.
+knowledge/*/.history/
+
+# Raw catalog/schema dumps from live probing: table and column inventories of
+# production warehouses. Not credentials, but a map of internal systems.
+docs/databricks_catalog_discovery.txt
+
+# Probe scratch output; it holds live row data. Most probe SCRIPTS are not in the
+# repository either — see the citation convention in CONTRIBUTING.md: the measured
+# result ships in the prose beside the value it justifies, and a script is tracked
+# only where a document presents it as an instrument to re-run.
+scripts/out/
+probe_*.json
+probe_*.txt

@@ -1,0 +1,231 @@
+# =============================================================================
+# MOCK-DOMAIN PACK — source catalog.
+#
+# Domain: parcel-courier refund fraud. INVENTED — no real system, index, table
+# or column name appears here.
+#
+# Three sources, one per backend family the engine supports a guarantee on, so
+# this file is a worked example of all five query guarantees plus the selection
+# and budget declarations. See ../../docs/knowledge-pack-template/source_catalog.yaml for the fully
+# commented list of every available key.
+#
+# A source `name` here must match the key the config's
+# `log_sources.backends.<kind>.<name>` credentials are filed under (via the
+# `endpoints` block below) — the pack says WHICH data, the config says only HOW
+# TO REACH the backend. No URL, user or token appears in a pack, ever.
+# =============================================================================
+
+sources:
+
+  # ─────────────────────────────────────────────────────────────────────
+  # 1. The alert record. Where an investigation starts.
+  # ─────────────────────────────────────────────────────────────────────
+  - name: refund_alerts
+    status: active
+    description: >
+      The refund-fraud detector's own alert document: the incident reference, the depot,
+      the courier as BOTH a badge and a device login, the claimed shipments, and the
+      notification trail. This is the authoritative statement of what was alleged — every
+      fact it states must be reproduced by the investigation rather than re-derived.
+    entities: [incident_ref, depot, courier, shipment, refund_claim]
+    entity_bindings:
+      incident_ref: [alert.incident_id]
+      depot: [alert.depot_code]
+      # PER-FORM BINDING. `courier` has two surface forms (see the glossary): a badge lands
+      # in a different column from a device login. Binding both to one column would send a
+      # badge to the login column and return zero rows — and a zero-row result is
+      # indistinguishable from "this courier did nothing". A value whose form this source
+      # does not bind is DROPPED from the filter, never unioned onto the sibling form.
+      courier:
+        badge: [alert.courier_badge]
+        device_login: [alert.device_login]
+      shipment: [alert.claimed_shipments]
+      refund_claim: [alert.claim_id]
+    endpoints:
+      kind: elasticsearch
+      cluster: reference_cluster
+      indices: ["ref-refund-alerts-*"]
+    # ALWAYS AND-ed by the retriever, whatever the LLM generated. This index is a shared
+    # multi-detector bus; without the slice the source answers about other detectors' alerts.
+    # Enforced post-generation, not prompted — a prompt instruction cannot be relied on to
+    # beat another prompt instruction.
+    default_filters:
+      detector: refund_fraud
+    projection:
+      - alert.incident_id
+      - alert.depot_code
+      - alert.courier_badge
+      - alert.device_login
+      - alert.claim_id
+      - alert.claimed_shipments
+      - alert.raised_at
+    query_hints: >
+      `alert.raised_at` is an ISO-8601 string; filter it as a prefix range. The
+      claimed_shipments field is an array of tracking codes — match with a terms query.
+    used_by: [PB-REFUND-001, PB-COURIER-002]
+
+  # ─────────────────────────────────────────────────────────────────────
+  # 2. The system of record. Big, slow, and decisive.
+  # ─────────────────────────────────────────────────────────────────────
+  - name: shipment_ledger
+    status: active
+    description: >
+      One row per shipment envelope: the tracking code, the depot, the handling courier,
+      the scan chain (`scans[]`), the proof-of-delivery block, the refund block (amount,
+      reason, approver) and the element counters that say which servicing elements the
+      shipment carries. Every decisive fact about a shipment is here.
+    entities: [shipment, depot, courier]
+    entity_bindings:
+      shipment: [tracking_code]
+      depot: [depot_code]
+      courier:
+        badge: [handler.badge]
+        device_login: [handler.device_login]
+    endpoints:
+      kind: databricks_uc
+      catalog: reference_catalog
+      schema: logistics
+      tables: [shipment_ledger]
+    # THE INVESTIGATION CANNOT BE CONCLUDED WITHOUT THIS SOURCE, so it is granted the
+    # config's `primary_source_timeout_seconds` instead of the backend's ordinary cap. A cap
+    # that fires on the system of record does not degrade the answer, it DECIDES it: the
+    # retrieval stage still reports success while every decisive condition goes `unknown`.
+    # Strictly a budget signal — it changes neither selection nor zero-row scoring.
+    retrieval_class: primary
+    # DISCOVERED, not declared, wherever the backend's metadata carries it — Databricks
+    # reports partition columns in information_schema, and a discovered fact cannot go stale
+    # the way a hand-written one does. This entry exists only for what metadata cannot say:
+    # `pad_days`, which no catalog exposes. A shipment created before the alert window and
+    # scanned after it must stay in range, so the window is widened on both sides before the
+    # partition bound is applied. Getting this wrong is invisible: an unbounded partition
+    # column looks like slowness, then like an empty source, then like INSUFFICIENT DATA.
+    partition_columns:
+      - name: scan_date
+        role: date
+        type: DATE
+        pad_days: 2
+    # The unit and the era of an epoch integer are not visible in the value, so a wrong
+    # conversion is a plausible number that matches nothing. The pack declares the column
+    # and the unit ONLY; the engine converts this incident's window, injects it already
+    # converted, and repairs a non-intersecting bound afterwards. Never write an epoch
+    # literal into query_hints — the one place that was tried, it went stale by a year.
+    epoch_time_columns:
+      - name: pod_captured_ms
+        unit: milliseconds
+    # EVIDENCE FIELDS: returnable, never filterable. `refund.manually_reviewed` reads like a
+    # noise reducer ("drop the reviewed ones"), but a manual review IS the exculpatory fact
+    # this procedure's decisive exclusion tests — so `AND manually_reviewed = false` deletes
+    # exactly the rows that decide the verdict, and the check then reports "flag absent" and
+    # goes inert. Stripped from the generated query post-generation, on every backend.
+    never_filter:
+      - refund.manually_reviewed
+      - pod.signature_captured
+    projection:
+      - tracking_code
+      - depot_code
+      - handler.badge
+      - handler.device_login
+      - created_at
+      - element_counters.INS
+      - element_counters.SIG
+      - scans.scan
+      - pod.signature_captured
+      - pod.captured_by
+      - refund.amount
+      - refund.reason_code
+      - refund.manually_reviewed
+      - refund.approved_by
+      # The `refund_within_window` condition's END side. It was documented on this source's
+      # own schema and absent from here, which is the gap `field-path-outside-projection`
+      # exists to report: the spelling checks out, the source is retrieved, the rows are real,
+      # and the leaf is not in them — so a `time_gap` over it reads `unknown` on every run.
+      - refund.claimed_at
+      - route.origin
+      - route.destination
+    query_hints: >
+      `scans` is ARRAY<STRUCT<...>> — explode it before selecting leaves under it. Selecting
+      a struct leaf that does not exist fails the WHOLE query, not just that leaf, so add a
+      leaf only after confirming it in schemas/shipment_ledger.yaml. Avoid ORDER BY.
+    not_answered_by:
+      - question: "who LOOKED AT a shipment record without handling it"
+        ask_instead: device_sessions
+      - question: "which device a scan was made from"
+        ask_instead: device_sessions
+    used_by: [PB-REFUND-001, PB-COURIER-002]
+
+  # ─────────────────────────────────────────────────────────────────────
+  # 3. A reference/lookup source. Small, keyed by a TUPLE, and answers by
+  #    being empty.
+  # ─────────────────────────────────────────────────────────────────────
+  - name: device_sessions
+    status: active
+    description: >
+      Handheld-device session records: which device login was signed in, at which depot,
+      on which device, and whether the session was an AUTOMATED depot-terminal session
+      (`session.automated`) rather than a human courier's handheld.
+    entities: [depot, courier]
+    entity_bindings:
+      depot: [depot_code]
+      courier:
+        badge: [badge]
+        device_login: [login]
+    endpoints:
+      kind: databricks_uc
+      catalog: reference_catalog
+      schema: logistics
+      tables: [device_sessions]
+    # A COMPOSITE-KEY LOOKUP: the row is named by the (depot, courier) PAIR and no single
+    # member is selective. The retrievers OR weak entities by default — right for an event
+    # log, wrong here: an OR asks for most of the table, hits the row cap, and returns rows
+    # for OTHER keys than the one being looked up, so a presence test "finds" an identity in
+    # a list it is absent from. AND-ed post-generation on every backend.
+    require_all_entities: [depot, courier]
+    # PRIORITY-ORDERED candidate identity keys, most reliable first. `require_all_entities`
+    # above is one fixed tuple, right when the key never varies. An actor is different:
+    # several combinations name them and WHICH is available varies per incident, so the
+    # engine picks the first candidate whose every member the incident actually carries — a
+    # partial candidate is SKIPPED, never half-applied (a half-applied guard is worse than
+    # none, because the declaration reads as a guarantee). The order is per-source and should
+    # be MEASURED against column nullability, not assumed.
+    #
+    # THE SECOND CANDIDATE NAMES ONE COLUMN, AND THAT IS A WEAKER CLAIM, NOT A SHORTER KEY.
+    # One column cannot be AND-ed with anything, so nothing is rewritten; what it buys is the
+    # reading of an EMPTY result — a query that named this courier and came back with nothing
+    # says the courier is not on the list, which is a finding, where an unkeyed 0 rows is
+    # missing data. It is resolved only after every candidate that IS a conjunction has been
+    # tried, whatever order it is written in, so adding it cannot weaken the pair above it.
+    identity_keys:
+      - [depot, courier]
+      - [courier]
+    never_filter:
+      - session.automated
+    projection:
+      - depot_code
+      - login
+      - badge
+      - device_id
+      - session.automated
+      - session.started_at
+    # WHAT ZERO ROWS MEANS. This source's purpose is an exclusion check, and it answers by
+    # being empty: no session row for this identity means the handling was not an automated
+    # depot-terminal action, i.e. a human courier acted — a finding the investigation needs.
+    # The health scorer's `empty_sources` signal is pro-rata over empty sources and would
+    # penalise that, inverting the evidence. The weight is the arithmetic; the judgement of
+    # which sources qualify is the pack's.
+    zero_rows:
+      health_weight: 0.0
+      meaning: >
+        No session row for this identity means the action was not an automated depot-terminal
+        session — a human courier handled the shipment. An empty result is the ANSWER here,
+        not a retrieval gap.
+    # WHEN this source is worth choosing. The planner keeps the decision, which is right for
+    # a source whose relevance is genuinely incident-dependent. Contrast a ruleset's
+    # `sources:` map, which is a HARD dependency added on every run — right when a condition
+    # READS the source, because an unevaluable condition is not the planner's call to make.
+    selection_guidance:
+      choose_when:
+        - "the incident asks whether an automated terminal, not a person, performed the action"
+        - "the alert names a device login but no badge, or the two disagree"
+      skip_when:
+        - "the alert names only a badge and the question is entirely about refund amounts"
+    used_by: [PB-COURIER-002]

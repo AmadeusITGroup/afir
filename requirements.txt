@@ -1,87 +1,88 @@
-# Core dependencies
-Flask~=3.0.3
+# RUNTIME dependencies — what it takes to run the server, and nothing else.
+#
+# This file is not just a convention here: **Databricks Apps installs exactly this file**
+# from the synced source and offers no way to point at another one. So a package listed
+# here is a package fetched and built on every container start, in a 2 vCPU / 6 GB box.
+# The test suite, the formatters and the notebooks live in `requirements-dev.txt`, which
+# installs this one first (`pip install -r requirements-dev.txt` is the developer command).
+#
+# WHAT WAS REMOVED, AND HOW THAT WAS ESTABLISHED. Every candidate was checked with a
+# repo-wide import scan over `src/`, `app.py` and `plugins/` — not by reading the comment
+# that used to sit beside it here:
+#
+#   Flask, fastapi, uvicorn  — never imported. AFIR is one aiohttp server.
+#   celery, redis            — never imported. Jobs are background asyncio tasks.
+#   splunk-sdk               — never imported. There is no Splunk retriever.
+#   matplotlib, plotly       — never imported. The PDF's charts are reportlab.
+#   markdown, bcrypt, cachetools, tqdm, python-dateutil, python-dotenv
+#                            — never imported. (`cryptography` still arrives with the
+#                              Snowflake connector; it is simply not ours to declare.)
+#   torch, sentence-transformers — see the note below. The only non-obvious one.
+
+# Core
 PyYAML~=6.0.1
 aiohttp~=3.9.5
-asyncio~=3.4.3
 pydantic~=2.8.2
+requests~=2.32.3          # the storage backend's Files API calls, off the event loop
 
-# Database and logging
-elasticsearch~=8.14.0
-splunk-sdk
-redis
+# Data sources
+elasticsearch~=8.14.0     # ES|QL retrieval
+snowflake-connector-python>=3.7   # snowflake retriever + knowledge source
+sshtunnel~=0.4.0          # optional SSH tunnel to a log source
+# ServiceNow / generic REST retrieval uses aiohttp (already core), and Databricks SQL goes
+# through the REST Statement Execution API. databricks-sdk is here for unified auth — a
+# PAT locally, the OAuth service principal in an App, one code path for both.
+databricks-sdk>=0.30
 
-# LLM and NLP
-openai~=1.35.12
-anthropic~=0.30.1
-transformers~=4.42.3
-torch
-sentence-transformers
+# LLM and embeddings, both OpenAI-compatible (OpenAI, Databricks Model Serving, or any
+# compatible endpoint)
+openai>=1.50
 
-# RAG and vector search
-faiss-cpu  # Use faiss-gpu if you have CUDA support
+# Vector search over whatever the embedding provider returns.
+#
+# NO faiss, AND IT MUST NOT COME BACK. `faiss-cpu` and `torch` each bundle their own
+# `libomp`, and libomp aborts the process when a second copy initializes — `enhanced_rag`
+# imported faiss at module top while torch arrives lazily with
+# `rag.embedding_provider: sentence_transformers`, so the abort landed on the first search:
+# mid-run on the first incident, as "Python quit unexpectedly" with no traceback, long after
+# a healthy boot. Measured (see src/rag/flat_index.py): neither import ordering nor
+# KMP_DUPLICATE_LIB_OK fixes it — the flag works in one order and turns the other into a
+# silent SIGSEGV — and both copies are already the same upstream build, so no wheel pairing
+# avoids it either. `src/rag/flat_index.py` does the same EXACT inner-product search
+# `faiss.IndexFlatIP` did, in numpy, at 0.46 ms/query over this corpus (1.2 ms at 100x it)
+# against a 38-minute median run. Re-adding faiss here reintroduces the crash for anyone who
+# switches to the local provider; `tests/test_flat_index.py` fails if `src/` imports it.
+numpy                     # the embedding provider's arrays and the index itself
 
-# Async email
+# THE LOCAL EMBEDDING MODEL IS NOT INSTALLED BY DEFAULT — deliberately, and reversibly.
+# The default provider is a serving endpoint in every deployment mode (measured: 18/18
+# correct playbook matches against the local model's 16/18, which also truncated at ~1536
+# chars against a 2690-char median document), so ~2 GB of torch wheels bought nothing but
+# cold-start time. `SentenceTransformerProvider` imports sentence-transformers lazily and
+# raises `EmbeddingError` when it is absent, which `KnowledgeOrchestrator` catches and
+# answers with the deterministic keyword fallback — so a config asking for the local
+# provider without the package degrades loudly, it does not fail to boot. For an
+# air-gapped deployment, install the two and set `rag.embedding_provider:
+# sentence_transformers`:
+#
+#     pip install 'sentence-transformers>=2.7,<3.0' 'torch>=2.3,<3.0'
+#
+# (They are in `requirements-dev.txt`, because the suite exercises that provider.)
+
+# Reports and exports
+reportlab~=4.2.2          # PDF
+openpyxl~=3.1.5           # XLSX export
+pandas~=2.2.2             # spreadsheet ingestion
+
+# Document ingestion — RAG corpus and the pack assistant's attachments
+PyPDF2
+python-docx
+beautifulsoup4
+atlassian-python-api      # Confluence ingestion, when configured
+
+# Delivery
 aiosmtplib~=3.0.1
-
-# Data processing and visualization
-pandas~=2.2.2
-matplotlib
-plotly
-
-# PDF generation
-reportlab~=4.2.2
+aiofiles~=24.1.0
 
 # Error handling and retrying
 tenacity~=8.5.0
-
-# Testing
-pytest~=8.2.2
-pytest-asyncio
-pytest-cov
-
-# Code quality and formatting
-black
-flake8
-isort
-
-# Async file operations
-aiofiles~=24.1.0
-
-# Environment variable management
-python-dotenv
-
-# Web framework for API
-fastapi
-uvicorn
-
-# Background tasks
-celery
-
-# Markdown support (for documentation in plugins)
-markdown
-
-# Security
-bcrypt
-cryptography
-
-# Caching
-cachetools
-
-# Parsing
-beautifulsoup4
-
-# Date and time handling
-python-dateutil
-
-# Progress bars (for long-running tasks)
-tqdm
-
-# Networking
-requests~=2.32.3
-
-# Development tools
-ipython
-jupyter
-
-sshtunnel~=0.4.0
-openpyxl~=3.1.5

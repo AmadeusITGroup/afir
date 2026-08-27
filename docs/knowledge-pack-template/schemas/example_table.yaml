@@ -1,0 +1,147 @@
+# =============================================================================
+# PACK TEMPLATE — schemas/<source>.yaml — THE COMPLETE FIELD INVENTORY.
+#
+# WHY THESE FILES EXIST, given that the retrievers already discover a schema.
+# Schema discovery stops at an ARRAY<STRUCT<...>> — a dotted path into an array is
+# not valid SQL — and it caps depth and leaf count. That is exactly right for
+# GENERATING a query and wrong as a statement ABOUT THE DATA: it makes an array's
+# contents invisible, so a field that EXISTS is recorded as absent. Anybody
+# reading only the discovered schema concludes the fact cannot be answered.
+#
+# These files hold the inventory the discovery cannot produce: arrays DESCENDED,
+# with an `explode_path` on every leaf that needs one.
+#
+# RAG-ONLY, BY CONSTRUCTION. One document per TABLE, never appended to the source
+# selection prompt. A real inventory runs to thousands of leaves; pasting it would
+# crowd out the pack's targeting guidance and shift query shapes on sources that
+# work today. Completeness lives in the CORPUS; selectivity happens at retrieval
+# (`type='schema'`, one table at a time).
+#
+# HALF DISCOVERED, HALF HAND-WRITTEN, AND THAT SPLIT IS THE POINT.
+#   `scripts/generate_source_schemas.py` writes the STRUCTURE (paths, types,
+#   explode_path, populated_pct) from the live backend and OVERWRITES it on every
+#   regeneration. `description:` is written by HAND and PRESERVED across
+#   regenerations. The discovered half says a leaf exists; the hand-written half
+#   says what it MEANS; neither is derivable from the other. Do not hand-edit the
+#   structure (it will be overwritten) and do not let a generator write the
+#   descriptions (they are the only irreplaceable part of the file).
+#
+# WHEN YOU NEED ONE: a source with nested arrays, a source whose column names do
+# not say what they hold, or any source a decisive condition reads. A flat
+# reference table with self-describing columns needs no schema doc.
+#
+# This file is hand-authored and LIVE, and keeps the generated shape exactly so it
+# exercises the same loader path as a real one.
+# =============================================================================
+
+# Must match a source name in `source_catalog.yaml`. This is how the RAG layer ties the
+# inventory to the source, so a typo produces a document nothing retrieves.
+source: example_source
+
+# Free text, for the reader. Records which backend the shape came from.
+kind: example_backend
+
+# Provenance. On a generated file this carries the script + timestamp; state the truth when
+# hand-authoring, because "hand-authored" tells the next reader the coverage numbers are not
+# measurements.
+generated_by: hand-authored (pack template — no live backend)
+
+note: >
+  Field inventory for the template's example source. Arrays ARE descended here, unlike
+  the retriever's query-generation schema. A leaf carrying an `explode_path` is reachable ONLY
+  through that explode — selecting it without one fails the whole query, not just that leaf.
+
+tables:
+  # The key is the table's short name; one file may document several tables.
+  example_table:
+    # The name a query actually uses. Worth recording because it is often not derivable from
+    # the short name, and a source may be reached through a different catalog than the one its
+    # name suggests.
+    fully_qualified_name: example_catalog.example_schema.example_table
+
+    # DISCOVERED from backend metadata on a real source (Databricks `partition_index`,
+    # Snowflake `clustering_key`) and stated here only because the template has no backend to
+    # discover from. Recorded so a reader knows an unbounded query on this table is a
+    # full-history scan — which does not read as slowness, it reads as an EMPTY SOURCE and then
+    # as INSUFFICIENT DATA.
+    partition_columns: [example_date]
+
+    columns:
+
+      example_id:
+        type: string
+        leaves:
+          - path: example_id
+            type: string
+            kind: scalar
+            # Percentage of sampled rows where the leaf is non-null. A LOW number is a
+            # finding, not noise: a decisive condition reading a 3%-populated leaf reports
+            # `unknown` on almost every subject, and it will look like the data was absent
+            # for a reason rather than absent by default.
+            populated_pct: 100.0
+            description: >
+              The record's own identifier and the subject a verdict is rendered for. Say the
+              SHAPE too — an author who knows the format can write a `value_pattern` in the
+              glossary and a `point_pattern` in a ruleset.
+        description: "Primary key of an example record."
+
+      example_review_flag:
+        type: boolean
+        leaves:
+          - path: example_review_flag
+            type: boolean
+            # `kind: flag` marks a BOOLEAN, and the distinction is load-bearing for ruleset
+            # authors: a boolean holds neither a count nor a collection, so it contributes no
+            # countable leaf and an `element_presence`/`element_absence` check on it returns
+            # `unknown` on every row — including the rows where it is plainly `true`. A
+            # boolean is read with `field_flag`. Recording the kind here is what lets the next
+            # author pick the right condition kind without probing.
+            kind: flag
+            populated_pct: 64.2
+            description: >
+              Whether a human reviewed this record. What it does NOT say is usually the more
+              important half: an unset flag here means "no review recorded", which is not the
+              same as "reviewed and approved" — so absence is only exculpatory if the domain
+              guarantees the flag is written on every review.
+        description: "Manual-review marker. Declared `never_filter` on the source."
+
+      example_elements:
+        type: array<struct>
+        leaves:
+          # THE CONTAINER IS ITS OWN LEAF, and an absence check must usually name IT rather
+          # than a sub-key. An empty array carries no sub-keys, so `example_elements: []`
+          # resolves for the container (a real 0) and resolves for NOTHING underneath
+          # (`unknown`) — naming the sub-key makes the very case an absence check exists to
+          # catch report `unknown` on every row.
+          - path: example_elements
+            type: array<struct>
+            kind: array_container
+            populated_pct: 88.0
+            description: >
+              The servicing elements attached to the record. Count THIS path to ask whether
+              any element is present.
+          - path: example_elements.element_code
+            type: string
+            kind: array_leaf
+            # WITHOUT THIS, SELECTING THE LEAF FAILS THE WHOLE QUERY — not just this column.
+            # It is the one field a generated schema cannot infer and the reason these docs
+            # descend arrays at all.
+            explode_path: example_elements
+            populated_pct: 88.0
+            description: "Per-element type code. Reachable only through the explode."
+        description: "Repeating element block; see the explode note on the leaves."
+
+      example_date:
+        type: date
+        leaves:
+          - path: example_date
+            type: date
+            kind: scalar
+            populated_pct: 100.0
+            description: >
+              The PARTITION column. Say which real-world instant it records and at what
+              granularity — a day-granular column cannot answer a "within 30 minutes"
+              question, and a column that is a DEADLINE rather than an event time can legally
+              precede the record's own creation. Both mistakes produce a confident wrong
+              answer from a correct-looking query.
+        description: "Partition column. Every query on this table must bound it."

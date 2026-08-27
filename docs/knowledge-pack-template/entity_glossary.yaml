@@ -1,0 +1,147 @@
+# =============================================================================
+# PACK TEMPLATE — entity_glossary.yaml
+#
+# WHAT THIS FILE IS FOR: pure VOCABULARY. What to recognise in free-text incident
+# input, and candidate field names as a PRIOR for mapping an entity to a column.
+# It holds no query logic and no investigation logic — those live in
+# source_catalog.yaml and use_cases/<name>/rules.yaml respectively.
+#
+# HOW TO USE THIS FILE: it is LIVE, not commented out. `example_entity` below
+# loads, and the template passes tests/test_pack_template.py as shipped —
+# which is the only way a template can prove its own key names are real. Replace
+# the example with your entities; delete what you do not need. EVERY KEY IS
+# OPTIONAL except `type`.
+#
+# THE ONE THING TO GET RIGHT HERE: an entity type is what the engine JOINS ON and
+# what a verdict is rendered FOR. Two things that are never the same identifier
+# are two types, even when a person calls them one word.
+# =============================================================================
+
+# ---- Abbreviations ----------------------------------------------------------
+# Injected into the understanding prompt as a CLOSED list — "these and no others;
+# do not expand an abbreviation that is not here."
+#
+# WHY IT IS WORTH THE LINES: an LLM asked to summarise an incident expands an unfamiliar
+# acronym rather than leaving it alone, and a plausible wrong expansion reads exactly like a
+# right one. It then propagates: the summary feeds source selection, so a wrong expansion
+# chooses wrong sources. Declaring costs one line each; detecting the invention afterwards is
+# not possible from the output alone.
+#
+# Include the ones a NEWCOMER would misread, not the ones that are merely internal. If your
+# domain has an abbreviation that means something ELSE in general usage, that is the most
+# important entry in this file.
+abbreviations:
+  EXA: "Example Abbreviation — replace this map with your domain's, or delete it"
+
+# ---- Field-name hints -------------------------------------------------------
+# `field-name token -> entity type`. This map does ONE job: it puts a NAME on a join key that
+# layer-3 discovery found on its own by comparing value sets across sources. Discovery is
+# pack-free by construction — its whole purpose is to catch a key nobody declared — so nothing
+# here changes WHICH keys are found; this only labels them.
+#
+# WHY IT IS DECLARED AND NOT DERIVED FROM `field_aliases` ABOVE: deriving it was tried and
+# measured on a real pack. The aliases produced 261 unique tokens of which 77 were claimed by
+# more than one entity, and dropping the ambiguous ones dropped exactly the four tokens that
+# mattered while promoting noise (`at`, `on`, `q`). A label is cheap to write and expensive to
+# guess.
+#
+# Keys are lowercase tokens as they appear after splitting a field name on `.` and `_`. The
+# FIRST token of a name that any map recognises wins, so a token here outranks the engine's
+# generic fallback appearing later in the same name. Values MUST be a `type` declared under
+# `entities:`; an unknown type is logged and dropped, so a typo costs a label rather than
+# inventing an entity nothing else can bind.
+#
+# You do not have to write this. With no block, a discovered key is labelled from the engine's
+# small set of universal computing tokens (`user`, `ip`, `session`, `email`, `card`, `account`,
+# `device`, `transaction`) or comes back `unknown` — which degrades a name in a report, never a
+# join. Write it for the identifiers YOUR domain names its own way.
+field_name_hints:
+  example: example_entity
+
+# ---- Entities ---------------------------------------------------------------
+entities:
+  - type: example_entity
+    # ── description: WHAT IT IS and WHAT ROLE IT PLAYS. Read by the LLM during entity
+    #    extraction, so say what makes this entity the subject of an investigation (or not).
+    description: >
+      Replace with what this entity is in your domain. State its ROLE, not just its shape:
+      "the subject a verdict is rendered for", "the acting identity", "the location that
+      scopes a cohort". The engine treats every type identically, so the role has to be in
+      the prose or it is nowhere.
+
+    # ── role: WHAT THIS TYPE IS TO AN INVESTIGATION, as opposed to what it means in your
+    #    domain. Three values, and the default (absent) is the common case:
+    #
+    #      role: actor  — it names a WHO. Evidence attribution reads each event's acting
+    #                     identity from the first of these types the source binds, and a
+    #                     containment recommendation names one. DECLARATION ORDER MATTERS: if
+    #                     your actor is a pair (a unit plus an account), the account must come
+    #                     first or every event is attributed to the unit.
+    #      role: scope  — it names a POPULATION or incident metadata (an organisational unit, an
+    #                     alert id, a time window). These are EXCLUDED from person-of-interest
+    #                     matching: an actor who merely shares the alerted unit is not thereby a
+    #                     suspect, and without this every member of that unit gets flagged.
+    #      (absent)     — neither. An asset, an amount, a status, a code.
+    #
+    #    Both lists UNION with the engine's own generic ones (`user`/`actor`/`account`/`email`/
+    #    `session` for actors; `organization`/`tenant`/an alert id/a time window for scope), so
+    #    declaring nothing still works for a domain that uses those words — and declaring your
+    #    own never disables the generic ones. Write it when your domain calls its actor or its
+    #    unit something of its own, which is most domains.
+    role: ""
+
+    # ── recognition_hints: how to spot the value IN PROSE. Free text, aimed at the LLM
+    #    reading a human-written incident description — surrounding words matter as much as
+    #    the shape ("often written after 'case' or the abbreviation you declared above").
+    recognition_hints: >
+      What this value looks like in a human's incident text, including the words it usually
+      appears next to. Give an example value.
+
+    # ── field_aliases: candidate COLUMN names, as a prior for entity→field mapping. Not
+    #    authoritative — the authoritative binding is per-source `entity_bindings` in
+    #    source_catalog.yaml, because the same entity is `user_id` in one table and
+    #    `actor.login` in another. This list helps when a source declares no binding.
+    field_aliases: [example_id, example_ref]
+
+    # ── value_pattern: a regex the whole value must match. Used to sanity-check an
+    #    extraction, not to reject one. Anchor it (`^...$`); an unanchored pattern matches a
+    #    substring of something else and quietly widens what is recognised.
+    value_pattern: "^EX[0-9]{4}$"
+
+    # ── value_forms: TWO OR MORE SURFACE FORMS OF ONE ENTITY TYPE. Declare this when one
+    #    type is named by genuinely different identifiers that are NOT interchangeable in a
+    #    query — an employee badge and a device login, a card number and a token, an email
+    #    and an internal uid. Each form binds to its OWN column per source.
+    #
+    #    WHY IT MUST BE DECLARED HERE AND CANNOT BE PROMPTED: by the time a query is
+    #    generated, both values are typed plain `example_entity` and the difference no longer
+    #    exists in the data. A prompt cannot restore a distinction the data model discarded.
+    #    The engine classifies the form from these regexes, stamps it on the extracted
+    #    entity, and routes each value to its own form's column — DROPPING a value whose form
+    #    a source binds nothing for, rather than unioning it onto the sibling form's column
+    #    (which returns zero rows, indistinguishable from "this actor did nothing").
+    #
+    #    Order MOST SPECIFIC FIRST; first match wins. Delete the block entirely if your
+    #    entity has one form — which is the common case.
+    #
+    # value_forms:
+    #   - name: badge
+    #     pattern: "^[0-9]{4}[A-Z]$"
+    #     description: "The HR identifier, on payroll and scan records."
+    #   - name: login
+    #     pattern: "^[a-z]{6}$"
+    #     description: "The device/session login. Same person, different column."
+
+    # ── cardinality: free text, for the reader and the prompt. "one-per-incident",
+    #    "many-per-subject". Affects nothing mechanically; it tells the LLM whether finding
+    #    several values is normal or is itself a signal.
+    cardinality: one-per-incident
+
+    # ── examples: real-SHAPED but synthetic values. Do not put production identifiers here;
+    #    a glossary is committed and a pack is not a place for real data.
+    examples: [EX0001, EX0002]
+
+    # ── used_by: which playbook ids reference this entity. Documentation only — nothing
+    #    breaks if it is stale, but a stale entry is how a reader concludes a source is used
+    #    when it is not.
+    used_by: [PB-EXAMPLE-001]

@@ -1,10 +1,105 @@
-'provider': 'generic'
-'use_fine_tuned': false
-'url': "http://model.url"
-'token': "token"
-'models':
-  'default':
-    'name': "gpt-3.5-turbo-0613"
-    'max_tokens': 2000
-    'temperature': 0.7
-'context': [YOUR CONTEXT IF NOT USING RAG]
+# LLM configuration. The client is built on the OpenAI SDK, so any
+# OpenAI-compatible endpoint works by changing base_url + the token env var.
+#
+# --- Databricks Model Serving (URL + token, no separate API key) ---
+# base_url:    "https://<workspace-host>/serving-endpoints"
+# api_key_env: "DATABRICKS_TOKEN"   # env var holding the workspace token
+# model:       "databricks-meta-llama-3-3-70b-instruct"   # your served model name
+#
+# --- OpenAI ---
+# base_url:    "https://api.openai.com/v1"
+# api_key_env: "OPENAI_API_KEY"
+# model:       "gpt-4o"
+
+# BLANK MEANS "ASK THE SDK", and that is what an App needs: the platform injects OAuth
+# credentials for its own workspace, so the host is knowable at runtime and nothing has to
+# be templated into this file at deploy time. A literal placeholder is worse than a blank —
+# `https://<workspace-host>/serving-endpoints` passes the "is this Model Serving" test,
+# wins over the resolved URL, and reaches the SDK URL-encoded as
+# `https://%3cworkspace-host%3e/serving-endpoints`, so every LLM stage 401s against a
+# hostname that cannot exist. Set it explicitly for OpenAI, or for a PAT against a
+# workspace other than the one the SDK resolves.
+base_url: "${AFIR_LLM_BASE_URL:-}"
+api_key_env: "DATABRICKS_TOKEN"   # name of the env var; never put the token here
+model: "${AFIR_LLM_MODEL:-databricks-meta-llama-3-3-70b-instruct}"
+max_tokens: 4096
+# Response budget for JSON-SCHEMA calls, which is deliberately NOT max_tokens: a model
+# filling a schema must emit every key, wrapper and nested object and cannot stop early
+# (an incomplete object is invalid), so it needs more room than prose. Sharing the chat
+# default made understanding / anomaly detection / report generation each truncate the
+# same way, and a truncated response used to be reported as whichever field went missing.
+# Only a cap — an unused allowance costs nothing, so do NOT scale it to the input size.
+structured_output_max_tokens: 8000
+temperature: 0.2
+# Per-request timeout (seconds). Set generously: the largest calls (anomaly
+# detection over all logs, report narration) can take 60-120s on a busy serving
+# endpoint, and a too-tight timeout turns a slow-but-successful call into a retry
+# storm. The SDK retries transient errors within this budget.
+timeout: 180
+
+# EXTENDED THINKING (Anthropic models on Databricks Model Serving; ignored elsewhere).
+# Pin it — do not leave it unset. The same endpoint answered one trivial prompt with a plain
+# string and the next with a `reasoning` block, and reasoning bills against the SAME
+# max_tokens as the answer, so an unpinned default makes the two budgets above mean
+# different things on different calls.
+#   disabled  — no reasoning block (the default here, and what the pipeline has been getting)
+#   adaptive  — real extended thinking
+# `enabled` is what the Anthropic API calls this and it is REJECTED by the Databricks-served
+# model, which asks for "thinking.type.adaptive" and "output_config.effort" instead. Both
+# ride in the SDK's `extra_body`: they are not declared parameters of
+# `chat.completions.create`, and the OpenAI SDK rejects undeclared kwargs *client-side*, so
+# getting this wrong fails before the request leaves the process — and passes every curl test.
+#
+# **Reasoning is spent out of the answer's budget, so where it helps depends on the stage.**
+# Measured on the real anomaly-detection call (same 16669-token prompt, max_tokens=8000):
+# disabled 53.4s / 3652 completion / 8 anomalies; adaptive+low 27.0s / 1839 / 5 anomalies;
+# adaptive 65.9s / 4676 / 8. Adaptive+low was faster only because it wrote less. So enable it
+# on stages whose output is a SHORT structured judgement, and leave it off where the output
+# volume is the deliverable (anomaly detection, report generation) — there it shortens the
+# acceptance artifact. It cannot change a verdict: the verdict engine is deterministic.
+thinking: disabled
+thinking_effort: low          # low | medium | high — only read when thinking is adaptive
+
+# PER-STAGE OVERRIDE, by the stage tag the call site passes. Editable from the Configuration
+# UI (a dropdown per value) and applied LIVE: LLMClient re-reads these on save, so the next
+# stage to run uses them. Three keys per stage, each omittable or blank to inherit:
+#   mode:       unset | disabled | adaptive   (blank = follow the global above)
+#   effort:     low | medium | high           (adaptive only; blank = global, then endpoint)
+#   max_tokens: the ADVISED output budget for this stage with thinking ON
+#
+# **The budget is the part that is easy to get wrong.** Reasoning bills against the same
+# max_tokens as the answer, so enabling thinking without more room does not buy deliberation
+# — it takes the room out of the deliverable. It is a FLOOR, never a cap: a caller that asks
+# for more still wins, which is what keeps anomaly detection's doubled truncation-retry
+# budget working. 0 or blank = no floor.
+#
+# Recognised stages, with the advised budget for each:
+#   incident_understanding 12000 · api_call_generation 12000 · log_retrieval 8000 ·
+#   correlation 10000 · anomaly_detection 16000 · report_generation 16000 ·
+#   pack_assistant 16000 · feedback_distillation 8000
+# `log_retrieval` is shared by EVERY retriever call — schema curation, entity mapping and
+# query generation across the whole fan-out — so one setting there multiplies by ~40-60
+# calls. It is the most expensive place to turn this on.
+#
+# A bare string is still accepted and means `mode:`.
+thinking_by_stage:
+  incident_understanding:
+    mode: adaptive
+    effort: low
+    max_tokens: 12000
+  api_call_generation:
+    mode: adaptive
+    effort: low
+    max_tokens: 12000
+
+# Throttling for the serving endpoint. The pipeline fans out ~19 retrievers at once,
+# each firing 2-3 LLM calls, which trips rate limits without these guards.
+#   max_concurrency:     cap of in-flight requests (kills the fan-out burst).
+#   requests_per_minute: token-bucket QPS smoothing (0 disables the QPS limit).
+# Lower both if the endpoint still returns 429s; no code change needed.
+max_concurrency: 4
+requests_per_minute: 60
+
+# Static system context used only when RAG is disabled (rag.use_rag = false).
+# Leave empty to send no extra context.
+context: ""

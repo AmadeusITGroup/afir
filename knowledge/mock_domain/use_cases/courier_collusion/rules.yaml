@@ -1,0 +1,155 @@
+# =============================================================================
+# MOCK-DOMAIN PACK — courier-collusion verdict ruleset.
+#
+# THIS FILE IS THE POINT OF THE SHARED LAYER. It is a SECOND procedure over the
+# SAME data, and it declares NO field path of its own. Every check it needs was
+# already written for refund fraud, so it imports the mechanics and supplies only
+# its own judgement:
+#
+#   shipment_elements/manually_reviewed   refund_fraud: DECISIVE, CATEGORICAL exclusion
+#                                         here:         a non-decisive INDICATOR — a
+#                                                       colluding pair can route a claim
+#                                                       past a complicit reviewer, so a
+#                                                       review is corroboration at best
+#   shipment_elements/no_servicing_elements  refund_fraud: decisive exclusion
+#                                            here:         non-decisive — a bare shipment
+#                                                          is not what collusion looks like
+#   actor_identity/pod_captured_by_handler   refund_fraud: not used at all
+#                                            here:         THE decisive check, as a fraud
+#                                                          INDICATOR (a FAIL is the finding,
+#                                                          not an argument against it)
+#
+# NOTE WHAT THE REWEIGHTING CAN AND CANNOT CHANGE. `polarity` decides which way a FAIL
+# argues, and it is the importer's to set — the same recorded fact is evidence FOR fraud in
+# one procedure and evidence against it in another. What no ruleset may change is the
+# check's own reading of the data: the field paths, the comparison, what counts as a FAIL.
+# Those are in the library because they are properties of the data, and a procedure that
+# needed them different would need a different check, not an override.
+#
+# Two procedures legitimately disagreeing about what a fact MEANS is exactly why
+# the weighting stays in the ruleset and the mechanics do not. Before the shared
+# layer this file would have had to copy `refund.manually_reviewed`,
+# `element_counters.INS/SIG`, `handler.badge` and `pod.captured_by` — and a
+# copied field path is how two copies start disagreeing about what the field is.
+# =============================================================================
+
+verdicts:
+  courier_collusion:
+    label_scheme: courier_collusion
+    subject_entity: shipment
+
+    labels:
+      fraud: "COLLUSION CONFIRMED"
+      false_positive: "NO COLLUSION"
+      insufficient: "INSUFFICIENT DATA"
+
+    trigger:
+      description: >
+        Fires when one courier appears as the handler on shipments whose proof-of-delivery
+        was captured by a DIFFERENT courier, repeatedly. It is not refund-based — a
+        collusion pattern may involve no refund at all.
+      min_assets: 2
+      window: "7d"
+      scope: depot
+
+    sources:
+      ledger: shipment_ledger
+      sessions: device_sessions
+
+    indicator_threshold: 2
+
+    conditions:
+
+      # ---- THE DECISIVE CHECK -------------------------------------------------
+      # Imported, and decisive HERE only. One person carries the parcel, another signs for it:
+      # that is the collusion shape.
+      #
+      # A DECISIVE FRAUD INDICATOR, NOT AN EXCLUSION — and the two are not interchangeable
+      # even though both are "decisive". `polarity` says which way a FAIL argues, and the
+      # engine rolls a decisive indicator FAIL up to the `fraud` label while a decisive
+      # exclusion FAIL goes to `false_positive`. Declared as an exclusion, this check would
+      # report the divergence it was written to catch and then conclude NO COLLUSION from it.
+      # `exclusion_kind` is therefore absent rather than `categorical`: it grades an
+      # exclusion's evidence and means nothing on an indicator.
+      - use: actor_identity/pod_captured_by_handler
+        report_group: fraud_indicators
+        polarity: fraud_indicator
+        decisive: true
+        decisive_on: [fail]
+        order: 10
+        # COMPARED WITHIN ONE SHIPMENT, because the question is about one parcel and both
+        # leaves are on one ledger row. Without `pair_by`, `field_equality` gathers each side
+        # over EVERY row of the source and asks only whether the two sets intersect — so two
+        # shipments that each diverge (A handled by 0192C, POD by 0288D; B handled by 0288D,
+        # POD by 0192C) intersect on both sides and the check PASSES, clearing the very shape
+        # it is decisive on. The pair it matched sits on no shipment. Declared here and not in
+        # the shared library because whether two sides may legitimately live on different
+        # records is a property of the SOURCE a procedure reads, not of the comparison.
+        pair_by: record
+        # An INDICATOR's label states its own finding, so a FAIL affirms it and the report
+        # prints it unchanged. The library's label states the REQUIREMENT (the two agree),
+        # which is the right neutral wording for the shared entry and the wrong sentence
+        # under this polarity — so the import overrides it, exactly as `manually_reviewed`
+        # does below. The wording is what changes when the polarity does.
+        label: "Proof-of-delivery captured by a courier other than the handler"
+        fail_detail: >
+          the proof-of-delivery was captured by a courier other than the handler — two
+          identities on one parcel
+
+      # An automated depot terminal captured the POD, which explains a handler/POD
+      # divergence without any second person. Decisive-on-fail and asymmetric: NOT finding a
+      # session is what every human courier looks like and must never degrade the case.
+      - use: actor_identity/automated_terminal_session
+        report_group: validation
+        decisive: true
+        decisive_on: [fail]
+        exclusion_kind: categorical
+        order: 20
+
+      # ---- REWEIGHTED IMPORTS -------------------------------------------------
+      # Same mechanics as refund_fraud, deliberately different weight. The override is a
+      # ONE-LEVEL merge: these keys replace the library's, and a LIST replaces rather than
+      # concatenating (a deep merge unioning `counters` would point the check at a leaf that
+      # does not exist on the source, and selecting a non-existent struct leaf fails the
+      # WHOLE query, not just that leaf).
+      - use: shipment_elements/manually_reviewed
+        report_group: fraud_indicators
+        polarity: fraud_indicator
+        decisive: false
+        order: 30
+        # The label comes from the library and states the REQUIREMENT ("was not manually
+        # reviewed"), which is the wrong sentence for an indicator — an indicator's label
+        # states its own finding. So this import overrides the label too: a mechanics key
+        # may be overridden like any other, and the wording is what changes when the
+        # polarity does.
+        label: "Refund passed review despite a handler/POD divergence"
+        fail_detail: >
+          a review approved this claim even though the POD names a different courier — the
+          reviewer either missed the divergence or is part of it
+
+      - use: shipment_elements/no_servicing_elements
+        report_group: fraud_indicators
+        polarity: fraud_indicator
+        decisive: false
+        order: 40
+
+      - use: shipment_elements/single_handler
+        report_group: fraud_indicators
+        polarity: fraud_indicator
+        decisive: false
+        order: 50
+
+    asset_notes:
+      source: ledger
+      asset_label: shipment
+      actor_label: couriers
+      asset_id_fields: [tracking_code]
+      actor_fields: [handling_courier]
+
+    case_builder:
+      # Both shared. This use case ships NO concepts of its own — the knowledge it needs is
+      # entirely about the data, and it is already written down once.
+      concepts:
+        - actor_identity_forms
+        - shipment_elements
+      expected_joins: [join_shipment, join_courier]

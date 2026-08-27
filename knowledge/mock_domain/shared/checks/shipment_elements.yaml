@@ -1,0 +1,118 @@
+# =============================================================================
+# SHARED CHECK LIBRARY — shipment elements.
+#
+# THE FILE STEM IS THE NAMESPACE. Every top-level key below is a check id, so a
+# ruleset imports them as:
+#     - use: shipment_elements/no_servicing_elements
+#     - use: shipment_elements/manually_reviewed
+# A bare id would collide the moment two subject areas both defined `velocity`.
+#
+# WHAT BELONGS IN THIS FILE: a check's MECHANICS — the `kind`, the logical
+# source, the field paths, the label and the neutral wording. Those describe
+# WHERE A FACT LIVES, which is a property of the data and therefore the same for
+# every procedure that reads that element.
+#
+# WHAT DOES NOT: the WEIGHTING — `decisive`, `decisive_on`, `polarity`,
+# `exclusion_kind`, `order`, `report_group`, `gate`. Those are one procedure's
+# judgement about what the fact MEANS, and two procedures may legitimately
+# disagree. The importing ruleset supplies them.
+#
+# THE OVERRIDE IS A ONE-LEVEL MERGE AND A LIST REPLACES. Every mechanics key a
+# ruleset might adjust (`counters`, `arrays`, `fields`, `where`) is a list or a
+# scalar, and for a list the only safe reading is replacement: a deep merge that
+# concatenated `counters` would union the library's paths with the importer's,
+# and selecting a struct leaf that does not exist fails the WHOLE query, not
+# just that leaf. `lookup` is the one exception, merged per sub-key, because its
+# `data` / `from_entity` pair is two independent facts.
+#
+# A MISSPELLED `use:` IS FATAL AT LOAD. A silently dropped condition is a check
+# that was never evaluated, which in a report is indistinguishable from a check
+# whose source returned no rows — the exact invisible failure this pack spends
+# thousands of words distinguishing elsewhere.
+# =============================================================================
+
+# "The shipment carries none of the servicing elements a normally-handled parcel
+# accumulates." A bare shipment is the fingerprint of a fabricated movement.
+#
+# The counters and the array are the same paths for anybody asking this question; whether a
+# bare shipment condemns the case or merely raises it is not.
+no_servicing_elements:
+  kind: element_absence
+  source: ledger
+  counters:
+    - element_counters.INS      # insurance elements
+    - element_counters.SIG      # signature-required elements
+  arrays:
+    # THE CONTAINER, NOT THE LEAF — `scans`, not `scans.scan`, and on this source shape that
+    # is the difference between a finding and an `unknown`. An absence check may only claim
+    # "absent" for a path it actually READ, so the engine distinguishes an array that arrived
+    # EMPTY (a real 0) from one that never arrived at all (`unknown`). A plain
+    # `array<struct>` that is empty carries no sub-keys: `scans: []` resolves for `scans` and
+    # resolves for NOTHING under `scans.scan`, so declaring the leaf makes the very case the
+    # check exists to catch — a shipment with no scan chain — report `unknown` instead of
+    # PASS, on every row.
+    #
+    # Declare the path THAT ARRIVES. It is not always the container: where a source returns a
+    # struct of per-type arrays (each sub-key present and null when that type is absent), the
+    # sub-key is what arrives and naming the container would count every type at once. Check
+    # the source's schema doc for the shape before choosing — schemas/shipment_ledger.yaml
+    # records `scans` as `array<struct>` with `scans.scan` as an `array_leaf`.
+    - scans                     # the scan chain itself
+  label: "Shipment carries no servicing elements"
+  expected_label: "no servicing element present"
+  # NEUTRAL wording. A condition's `label` is its REQUIREMENT, not its finding — for an
+  # exclusion a FAIL negates the label, so a report printing the label states the opposite
+  # of what was found. The engine assembles the note from these instead.
+  fail_detail: "servicing elements are present — the shipment was normally handled"
+  pass_detail: "no servicing element found on this shipment"
+
+# "A human approved this refund after review." The exculpatory fact: a reviewed refund was
+# adjudicated by a person, whatever the automated pattern looks like.
+#
+# `refund.manually_reviewed` is declared `never_filter` on the source precisely so this
+# check has rows to read — a query filtering the flag away deletes its own evidence.
+manually_reviewed:
+  kind: field_flag
+  source: ledger
+  flag_fields: [refund.manually_reviewed]
+  expected: false
+  label: "Refund was not manually reviewed"
+  # NEUTRAL, and stated as the FINDING rather than as the requirement — an importer reweighting
+  # this check to a fraud indicator inverts what a FAIL argues but not what a FAIL observed.
+  pass_detail: "no manual review is recorded against this refund"
+  unknown_detail: >
+    the manual-review flag was not returned, so an adjudicated claim cannot be
+    distinguished from an unreviewed one
+
+# "The proof-of-delivery signature was captured." A delivered parcel whose POD is missing is
+# the shape a fabricated delivery leaves behind.
+#
+# `field_flag`, NOT `element_presence`, and the difference is a real authoring trap rather
+# than a style preference. `counters:` and `arrays:` name paths that hold a COUNT or a
+# COLLECTION, and the engine concludes presence by counting leaves under them. A BOOLEAN
+# holds neither, so it contributes no countable leaf and the path reads as one that never
+# arrived — the check returns `unknown` on every row, including the rows where the flag is
+# plainly `true`. Match the kind to the data's shape: a boolean is a flag.
+signature_captured:
+  kind: field_flag
+  source: ledger
+  flag_fields: [pod.signature_captured]
+  expected: true
+  label: "Proof-of-delivery signature captured"
+  # `field_flag` is a generic kind, so the wording is the check's own — the engine's
+  # fallbacks describe only the arithmetic it performed.
+  pass_detail: "a POD signature was captured at handover"
+  fail_detail: "no POD signature was captured — nothing records a handover taking place"
+  unknown_detail: "the POD signature flag was not returned, so handover cannot be confirmed"
+
+# "One courier handled the shipment." Two handling identities on one parcel is either a
+# legitimate handover or a claim written by somebody who did not carry it.
+single_handler:
+  kind: distinct_count
+  source: ledger
+  field: handler.badge
+  max: 1
+  label: "Single handling courier"
+  pass_detail: "one handling courier across the shipment's rows"
+  fail_detail: "several handling couriers on one parcel"
+  unknown_detail: "no handler badge was returned, so the handling identities cannot be counted"

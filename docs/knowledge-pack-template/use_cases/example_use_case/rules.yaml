@@ -1,0 +1,506 @@
+# =============================================================================
+# PACK TEMPLATE — use_cases/<name>/rules.yaml — THE VERDICT RULESET.
+#
+# This is the biggest file in a pack and the one that encodes a PROCEDURE as
+# data. The engine (src/correlation.py) holds no procedure: it dispatches on the
+# generic `kind` values below and rolls up by `polarity` / `decisive` /
+# `exclusion_kind`. Delete this file and the verdict stage simply produces no
+# verdict — the rest of the pipeline still runs. Write a different one and the
+# same engine adjudicates a different domain.
+#
+# THIS FILE IS LIVE, and deliberately reaches no verdict: its one condition is a
+# `stub`, so tests/test_pack_template.py can prove the whole file parses and
+# resolves without asserting a domain outcome. Every OTHER key is present but
+# commented, with the failure it prevents written next to it. Uncomment what you
+# need, delete the rest.
+#
+# THE ORDER TO FILL IT IN:
+#   1. `subject_entity` + `labels`     — what is judged, and what the outcomes are called
+#   2. `sources`                       — the logical names your conditions will read
+#   3. one condition, end to end       — prove the plumbing before writing twelve
+#   4. `gate: scope` if the procedure has jurisdiction limits
+#   5. weighting (`decisive`, `polarity`, `exclusion_kind`) — the part that needs care
+#   6. `case_builder` + `notification` — the reporting surface
+# =============================================================================
+
+verdicts:
+  # THE KEY IS THE USE-CASE NAME, and it must match this directory's name — the loader tags
+  # a use case's files by folder and looks the ruleset up by this key. A mismatch is a ruleset
+  # nothing reaches.
+  example_use_case:
+
+    # ---- WHAT IS BEING JUDGED ------------------------------------------------
+    # One verdict is rendered per VALUE of this entity type, so it decides the shape of the
+    # whole report. Choose the thing a human decides about (the transaction, the account, the
+    # claim) — not the actor, unless the actor is what gets adjudicated.
+    subject_entity: example_entity
+
+    # `label_scheme` is a free-text name for this outcome vocabulary, carried into the report
+    # for the reader. It selects nothing mechanically.
+    label_scheme: example_scheme
+
+    # ---- WHAT THE OUTCOMES ARE CALLED ---------------------------------------
+    # Emitted VERBATIM. The engine reaches five rollup states and these name four of them.
+    #
+    # `out_of_scope` IS NOT A FIFTH VERDICT and is the one most often left out: the scope gate
+    # is answered BEFORE the procedure applies, so a gate FAIL is the engine declining to
+    # adjudicate — not a finding about the subject. Without its own label an out-of-scope
+    # subject fails an ordinary exclusion and prints as the false-positive label, which claims
+    # the case was examined and cleared. Only declare it if you declare a `gate: scope`
+    # condition.
+    labels:
+      fraud: "EXAMPLE POSITIVE"
+      false_positive: "EXAMPLE NEGATIVE"
+      insufficient: "INSUFFICIENT DATA"
+      out_of_scope: "OUT OF SCOPE — PROCEDURE DOES NOT APPLY"
+
+    # ---- WHAT MAKES THIS AN ALERT -------------------------------------------
+    # DECLARE THIS. It affects no condition and it is still one of the highest-value blocks in
+    # the file, because it is the one fact about the incident that the retrieved data CANNOT
+    # supply: nothing in the rows says which rule fired. Undeclared, a narration asked to
+    # explain the case reaches for whichever retrieved fact looks most suspicious and states
+    # THAT as the trigger — measured on a live run, a report announced that the alert fired on
+    # the ABSENCE of a payment element, for a detector that never looks at payment, on a record
+    # that did carry one. Both unalleged and false, and it sent the reader hunting for evidence
+    # of something nobody had claimed.
+    #
+    # Reaches the report's alert section and the narration prompt (as ground truth plus an
+    # explicit "do not substitute another trigger"). Absent, both stay silent — a generic
+    # sentence about triggers would read as one having been established.
+    trigger:
+      # VERBATIM into the artifact, and the place to put the NEGATIVE. What the detector does
+      # NOT look at is unreconstructible from the thresholds below and is usually the half a
+      # reader most needs: without it, the largest number in the evidence becomes the
+      # allegation. Write the sentence you would say to a colleague who asked "why did this
+      # fire?", including the "it is not ..." clause.
+      description: >
+        What the detector actually fires on, including what is NOT a trigger. "It is not
+        amount-based — a large value alone is not a trigger, and a small one is not
+        exculpatory" is the kind of sentence that stops a reader over-reading the alert.
+      # The quantitative rule, appended as a parenthetical when present. All three optional —
+      # a purely qualitative detector declares `description` alone and reads cleanly.
+      min_assets: 3
+      window: "24h"
+      # Emitted as the bare declared word ("in one example_location"), because what it NAMES is
+      # your domain's own unit and the engine has no term for it that is not some other
+      # domain's vocabulary.
+      scope: example_location
+
+    # ---- LOGICAL SOURCE NAMES ------------------------------------------------
+    # logical name -> a real `source_catalog.yaml` source name. Conditions reference the
+    # LOGICAL name, so the ruleset stays readable and swapping a source is one line here.
+    #
+    # THIS MAP IS A HARD DATA DEPENDENCY: every source listed is retrieved on every run of
+    # this use case's playbook, whatever the planner thinks. That is right for a source some
+    # condition READS — an unevaluable condition is not the planner's call to make. For a
+    # source whose relevance is genuinely incident-dependent, leave it OUT of this map and give
+    # it `selection_guidance` in the catalog instead. The two mechanisms are NOT
+    # interchangeable, and using the wrong one is either a condition that silently never
+    # evaluates or a large query run on every unrelated incident.
+    sources:
+      record: example_source
+
+    # ---- THE ALERT RECORD ----------------------------------------------------
+    # The one input the pipeline did not derive: the detector emitted it with this incident's
+    # values already in it. So a fact the alert STATES is ground truth to be REPRODUCED, and a
+    # divergence is a finding (wrong record selected, stale index) rather than a reason to
+    # quietly prefer the logs. Omit the block and no reconciliation is attempted.
+    # alert_record:
+    #   source: alert
+    #   label_fields: [alert.incident_id]
+    #   identify:
+    #     - from_entity: incident_ref
+    #       fields: [alert.incident_id]
+    #     # `required: true` — a clause that MUST match. Two alerts in one window are two
+    #     # different incidents and something has to separate them; an alert for another
+    #     # location must never be selected as this one, however well the rest matches.
+    #     - from_entity: example_location
+    #       fields: [alert.location_code]
+    #       required: true
+    #   declares:
+    #     - field: example_location
+    #       from_entity: example_location
+    #       fields: [alert.location_code]
+    #       confirm_in: [record]
+    #       confirm_fields: [location_code]
+    #     # EVERY asset the alert names, not one "primary" one — listing one is how the rest
+    #     # of the impact goes unstated in the report.
+    #     - field: example_entity
+    #       from_entity: example_entity
+    #       fields: [alert.assets]
+    #       confirm_in: [record]
+    #       confirm_fields: [example_id]
+
+    # ---- REPORTING GROUPS ----------------------------------------------------
+    # PRESENTATIONAL ONLY — a group decides which TABLE a check prints in. `decisive`,
+    # `polarity` and `exclusion_kind` decide what it MEANS. Worth declaring anyway: printed
+    # flat, a jurisdiction gate and an exculpatory hint read as equally mandatory steps.
+    condition_groups:
+      - id: scope_gate
+        title: "Scope — does this procedure apply?"
+        note: "Answered first. A FAIL exits the case; the remaining checks are not weighed."
+      - id: validation
+        title: "Mandatory validation"
+      - id: fraud_indicators
+        title: "Positive indicators"
+
+    # ---- THE CORROBORATION THRESHOLD ----------------------------------------
+    # How many NON-DECISIVE indicator FAILs are enough to reach the positive label on their
+    # own. Without it (or with it set very high) the engine can only ever clear a case or match
+    # the textbook fingerprint, so a real-but-atypical case is unreachable. 2 is a reasonable
+    # start; it is a judgement about your domain's false-positive tolerance, so MEASURE it
+    # against resolved cases rather than picking a number that feels prudent.
+    indicator_threshold: 2
+
+    conditions:
+
+      # =====================================================================
+      # ANATOMY OF A CONDITION
+      # =====================================================================
+      # SHARED KEYS (every kind):
+      #   id             a stable identifier. Referenced by report groups, tests and
+      #                  `case_builder`. Renaming one silently orphans those references.
+      #   kind           which evaluator runs. The 20 kinds are listed at the bottom.
+      #   source         the LOGICAL source name whose rows it reads.
+      #   label          THE REQUIREMENT, not the finding — see the polarity note below.
+      #   report_group   which table it prints in.
+      #   order          sort order within the table, and the tiebreak when two decisive
+      #                  exclusions FAIL (lowest wins, so put the strongest evidence first).
+      #   decisive       whether a result SETTLES the verdict on its own.
+      #   decisive_on    which results the flag applies to; default [fail, unknown].
+      #   polarity       `fraud_indicator` inverts the reading of a FAIL.
+      #   exclusion_kind `categorical` | `heuristic` — grades an EXCLUSION's evidence.
+      #   subject_scope  false = evaluate against ALL of the source's rows, unfiltered.
+      #   row_match      which rows are THIS subject's, as a tuple match.
+      #   pass_detail / fail_detail / unknown_detail
+      #                  the NOTE printed for each result. Optional everywhere.
+      #
+      # THE FOUR THINGS TO GET RIGHT, each of which has produced a wrong verdict:
+      #
+      # 1. `label` IS THE REQUIREMENT, NOT THE FINDING. For an EXCLUSION a FAIL negates the
+      #    label, so printing the label states the OPPOSITE of what was found. A live report
+      #    once read "<actor> is not automated (<flag_path>=True)" under a verdict resting on
+      #    the actor being an automation — the label and the evidence beside it contradicting
+      #    each other, with no way for the reader to tell which half to trust. The engine
+      #    assembles the note from `fail_detail` instead. A fraud INDICATOR's label already
+      #    states its finding, so a FAIL affirms it and it prints unchanged. The asymmetry is
+      #    the polarity, not an inconsistency.
+      #
+      # 2. `polarity` DECIDES WHICH WAY A FAIL ARGUES; `decisive` ONLY DECIDES WHETHER IT
+      #    SETTLES. A decisive INDICATOR FAIL reaches the positive label; a decisive EXCLUSION
+      #    FAIL reaches the negative one. Confusing the two inverts the verdict while every
+      #    check in the table still reads correctly.
+      #
+      # 3. `decisive_on: [fail]` MAKES DECISIVENESS ASYMMETRIC, and most real checks want it.
+      #    A check whose FAIL is conclusive but whose absence of evidence is ORDINARY (nobody
+      #    is on the automation list, most subjects have no prior case) would otherwise force
+      #    INSUFFICIENT DATA on every ordinary subject.
+      #
+      # 4. CATEGORICAL vs HEURISTIC IS NOT A STRENGTH RATING. A categorical exclusion rests on
+      #    an ATTRIBUTED FACT (who acted, and when) and cannot be outvoted by indicators —
+      #    once such a fact is on the record the indicators lose their MEANING, not their
+      #    weight. A heuristic exclusion is an INFERENCE about the subject's shape and may
+      #    rightly be outweighed. Identity evidence is prior to behavioural evidence.
+      # =====================================================================
+
+      # THE ONE LIVE CONDITION. `stub` evaluates to `unknown` with a stated reason and no data
+      # access at all — the honest encoding of a check your procedure requires but your data
+      # cannot yet answer. Far better than omitting it: the report then shows the requirement
+      # and says it is unanswered, instead of quietly not testing it.
+      - id: example_stub
+        kind: stub
+        label: "Replace this with your first real condition"
+        expected: "a real check reading a real source"
+        detail: >
+          Template placeholder. `stub` reports `unknown` with this text as its note and touches
+          no source, so this ruleset parses, loads and produces no verdict.
+        report_group: validation
+        decisive: false
+        order: 10
+
+      # ---- A SCOPE GATE ------------------------------------------------------
+      # Asked FIRST, and it asks a different question from the rest: not "is this subject
+      # bad?" but "does this procedure have an opinion at all?". A FAIL exits with the
+      # `out_of_scope` label.
+      #
+      # - id: served_scope
+      #   kind: route_membership
+      #   source: record
+      #   point_fields: [route.origin, route.destination]
+      #   # THE SHAPE OF YOUR SCOPE POINT. The engine's default recognises a 3-letter code
+      #   # (the domain this kind was first written for) and uses it to find points in a
+      #   # WHOLE-ROW scan — which is what makes the check work when the values are scattered
+      #   # under paths a ruleset cannot name in advance. If your codes are a different shape,
+      #   # declare the pattern or the scan recognises nothing and the gate reports `unknown`.
+      #   # That is the expensive direction of wrong: an unanswered GATE suppresses the
+      #   # jurisdiction question for the entire procedure rather than failing one table row.
+      #   point_pattern: "^[A-Z]{3}[0-9]{2}$"
+      #   label: "Subject is within this procedure's scope"
+      #   report_group: scope_gate
+      #   gate: scope
+      #   order: 1
+
+      # ---- AN IMPORTED CHECK -------------------------------------------------
+      # `use: <file stem>/<check id>` pulls the MECHANICS from ../../shared/checks/. This
+      # ruleset then supplies only its own WEIGHTING. A second use case imports the same check
+      # and weighs it differently; neither restates a field path, so they cannot drift apart
+      # about where the fact lives.
+      #
+      # THE OVERRIDE IS A ONE-LEVEL MERGE AND A LIST REPLACES. Declaring `fields:` here
+      # replaces the shared list entirely rather than adding to it — which is what you want
+      # for a source-specific path and a trap if you meant to extend. `lookup` is the one
+      # exception, merged per sub-key. A misspelled `use:` is FATAL AT LOAD, deliberately: a
+      # silently dropped condition is a check that was never evaluated, and in a report that
+      # is indistinguishable from a check whose source returned no rows.
+      #
+      # - use: example_checks/example_shared_check
+      #   report_group: validation
+      #   decisive: true
+      #   decisive_on: [fail]
+      #   exclusion_kind: categorical
+      #   order: 20
+      #   fail_detail: "what a FAIL means IN THIS PROCEDURE"
+
+      # ---- A POSITIVE INDICATOR ----------------------------------------------
+      # - id: example_indicator
+      #   kind: value_matches_pattern
+      #   source: record
+      #   fields: [example_reason_code]
+      #   match_mode: allowed          # a value NOT on the list is the suspicious one
+      #   patterns: ["^(EXPECTED|NORMAL)$"]
+      #   expected: "a documented reason code"
+      #   label: "Reason code is non-specific"   # already a FINDING — indicator polarity
+      #   report_group: fraud_indicators
+      #   polarity: fraud_indicator
+      #   decisive: false
+      #   order: 60
+      #   fail_detail: "the reason code is outside the documented vocabulary"
+
+    # ---- REFERENCE DATA FOR THE GATE ----------------------------------------
+    # Read by a `route_membership` condition: a subject is in scope when its point set
+    # contains BOTH endpoints of any pair (direction-agnostic).
+    #
+    # DECLARING NO PAIRS IS NOT THE SAME AS DECLARING EVERY PAIR: the gate then finds nothing
+    # to match and FAILS, taking every case out of scope. A ruleset with a `gate: scope`
+    # condition of this kind MUST supply this list.
+    # routes:
+    #   - [EX001, EX002]
+
+    # ---- WHAT THE REPORT SAYS ABOUT IMPACT ----------------------------------
+    # Which rows count as "assets affected", and how to name them.
+    # The count itself is emitted under the engine's own stable `asset_count=` note key with
+    # `asset_label=` beside it, so renaming your noun cannot make a consumer lose the line.
+    # `actor_label` is the plural noun for the "multiple acting X" note.
+    # asset_notes:
+    #   source: record
+    #   asset_label: example_entity
+    #   actor_label: operators
+    #   asset_id_fields: [example_id]
+    #   actor_fields: [example_actor]
+
+    # ---- CONTAINMENT: THE IDENTITY A POSITIVE VERDICT NOMINATES -------------
+    # Resolved by the engine and carried ON the verdict, so the report and the notification
+    # cannot recommend action against somebody the verdict cleared. Omit the block and no
+    # target is nominated — which is correct for a procedure that recommends no action.
+    #
+    # `scope_field`/`identity_field` name the two generic ROLES the engine resolves: a SCOPE
+    # (the organisational unit) and an IDENTITY within it. `scope_label`/`identity_label` are
+    # what the report actually PRINTS for them, so a domain whose target is a depot and an
+    # operator says so. Undeclared, the engine prints "Scope" and "Identity" — generic and
+    # truthful. The engine NEVER carries a domain's word for either role.
+    #
+    # lock_target:
+    #   source: record            # the LOGICAL source the identity is read from
+    #   scope_field: location_code
+    #   identity_field: operator_id
+    #   scope_label: "Depot"
+    #   identity_label: "Operator"
+    #   heading: "Operator identified:"
+    #   provenance_label: "Read from"
+    #   class_label: "Identity class"
+    #   none_nominated: "No containment target is nominated by this verdict."
+    #   # For an identity the verdict RESOLVED but declined to act on. Read by exactly the
+    #   # person most likely to act on it anyway, so say what ROLE it played in the record.
+    #   # `{identity}` is the one placeholder.
+    #   withheld_detail: >-
+    #     The dispatcher ({identity}) opened the record and is not nominated for action.
+    #   # The action VERB per platform/class. NO DEFAULT IS APPLIED when the platform is
+    #   # undetermined: two platforms' action sets are usually not interchangeable, so
+    #   # defaulting picks one of them on no evidence.
+    #   actions:
+    #     example_platform_a: "SUSPEND the operator badge."
+    #     example_platform_b: "REVOKE the device login (NOT a badge suspension)."
+    #     unknown: "DETERMINE the platform first — the action sets are not interchangeable."
+    #   # A HARD BLOCKING legal/contractual precondition. Carried ON the target rather than as
+    #   # prose beside it, so every consumer that renders the action renders this with it — the
+    #   # engine always prints it BEFORE the action it blocks, because a precondition printed
+    #   # afterwards is one a reader acts past.
+    #   prerequisites:
+    #     - "BLOCKING PREREQUISITE — notify the customer and LOG the contact before any action."
+
+    # `containment_labels` — which verdict labels MAY carry a target. Defaults to the positive
+    # label alone. An unadjudicated exit carries none either: INSUFFICIENT DATA means we do not
+    # know yet, and "we do not know" is not grounds to suspend somebody.
+    # containment_labels: ["EXAMPLE POSITIVE"]
+
+    # `identity_classes` — patterns that classify the nominated identity so it can be treated
+    # differently. An AUTOMATED identity must be escalated, never contained like a human one:
+    # the application using the account is the compromised thing.
+    # identity_classes:
+    #   - id: automated
+    #     patterns: ["^[0-9]{4}PI$", "^[0-9]{4}WS$"]
+    #     action: "ESCALATE to the integration owner — do NOT suspend."
+    #     rationale: "An automated identity's owner is an application, not a person."
+
+    # ---- THE CASE BUILDER'S INPUTS ------------------------------------------
+    # Everything the deterministic analyzer varies per use case. EVERY KEY NO-OPS WHEN ABSENT,
+    # which is what lets one analyzer serve every use case — if you find yourself wanting a
+    # subclass, the thing you want to vary belongs here.
+    case_builder:
+      # Concept docs injected into the InvestigationBrief, so the report narrates from the
+      # domain's own definitions rather than from the verdict label alone.
+      #
+      # SHARED AND SPECIFIC IDS SIT IN ONE FLAT LIST: this use case's own concepts are unioned
+      # with every untagged shared concept, the specific one winning on an id collision. So a
+      # shared id is nameable here exactly like a local one and no author has to know which
+      # folder a concept lives in. RAG retrieval is separate and WIDER — it can surface any
+      # shared concept by similarity without it being listed here.
+      concepts: []
+
+      # Which join keys this procedure EXPECTS the correlation stage to have used. Lets the
+      # brief distinguish "ran and found nothing" from "never evaluated" — collapsing those
+      # two caused run-to-run report inconsistency.
+      # expected_joins: [join_example_entity]
+
+      # A decisive check reading a leaf the projection dropped returns `unknown`, which is
+      # indistinguishable from "the fact is genuinely absent". So name the leaves the decisive
+      # checks depend on and the analyzer verifies they actually ARRIVED.
+      #
+      # The probe is BOOLEAN-AWARE, so a flag path works here — which matters because a
+      # decisive exculpatory exclusion is usually a boolean.
+      # projection_guard:
+      #   source: record
+      #   probe_paths:
+      #     - path: example_review_flag
+      #       note: >
+      #         example_review_flag missing from the returned rows — the exclusion is UNKNOWN
+      #         for a DATA reason, not because the review is absent.
+      #   empty_note: >
+      #     No rows returned for the record source ({source}); every condition is UNKNOWN.
+
+      # Next-step wording. THE ENGINE OWNS THE BRANCH, THE PACK OWNS THE PROSE: which step
+      # fires follows from the verdict, its words do not. Declare nothing and the brief says
+      # explicitly that no action verb could be resolved — right, because two action sets are
+      # rarely interchangeable and a defaulted verb is an operational error, not a cosmetic one.
+      # Templates substitute with `str.replace`, never `.format` (a stray brace must not raise).
+      # action_templates:
+      #   subject_label: "Asset {subject}"
+      #   fraud_step: "Contain: {who}. {action}"
+
+      # Free-text scope notes carried into the brief.
+      # scope_notes: []
+
+    # ---- THE NOTIFICATION DRAFT ---------------------------------------------
+    # AFIR DRAFTS; AFIR NEVER SENDS. Placeholders are filled per subject and unknown ones are
+    # left blank, so a template can safely reference a field this verdict did not resolve.
+    #
+    # THE PLACEHOLDER NAMES ARE THE ENGINE'S, NOT YOURS. The engine fills a fixed generic set
+    # ({verdict}, {subject}, {lock_scope}, {lock_identity}, {platform_mode}, {asset_count},
+    # {actors}, {route}, {condition_summary}, {closing}, {containment_block},
+    # {containment_action}, {containment_prerequisites}, {distribution}, {decisive_exclusion},
+    # {fraud_indicators}, {unevaluated}, {scope_gate}, {identity_class}, {lock_provenance});
+    # anything else renders BLANK. Write your domain's noun in the surrounding PROSE and keep
+    # the placeholder generic — "Outcome for account {subject}", not "{account}".
+    #
+    # Use `{containment_block}` for the whole containment-identity block rather than laying
+    # out its lines here: on a verdict whose containment was withheld there IS no target, and a
+    # template spelling out the labels renders a stack of empty ones — which reads as missing
+    # data on a case that deliberately named nobody.
+    notification:
+      subject: "[EXAMPLE] {verdict} — example entity {subject}"
+      distribution:
+        - "Replace with the real recipients, or delete — an invented recipient is worse than none"
+      template: |
+        To: {distribution}
+
+        Outcome for example entity {subject}: {verdict}.
+
+        {containment_block}
+
+        Condition summary:
+        {condition_summary}
+
+# =============================================================================
+# THE 20 CONDITION KINDS. Each is generic; the domain is in the parameters.
+#
+#   element_absence        Named counters/arrays are ABSENT (all zero/empty). PARTIAL COVERAGE
+#                          IS `unknown`: absence may only be claimed for a path actually READ.
+#                          Declare the path THAT ARRIVES — for a plain array<struct> that is
+#                          the CONTAINER (`scans`, not `scans.scan`): an empty array carries no
+#                          sub-keys, so naming the leaf makes the very case the check exists to
+#                          catch report `unknown` on every row.
+#   element_presence       The mirror image: named counters/arrays are PRESENT.
+#   field_equality         Two value SETS intersect. Knows nothing about what they hold, so
+#                          name the two sides in `pass_detail`/`fail_detail`. `normalize:
+#                          identifier` compares them prefix-tolerantly, for a store that pads an
+#                          identifier with a role suffix (`6007GG` vs `6007GGSU`); omit it for
+#                          exact set intersection.
+#   time_gap               `end - start <= max`. Missing either end is `unknown`, never a PASS.
+#   record_absence         No row carries a forbidden value. Use `match: exact` unless you
+#                          really want substring matching. A BOOLEAN vocabulary works — quote
+#                          it (`["true"]`) so YAML hands the engine a comparable.
+#   cohort_membership      Does the subject appear in a cohort keyed by something else (a
+#                          location, a device)? Needs ONE cohort-scoped source, not a
+#                          subject-keyed query. Watch truncation: a wider window can return
+#                          FEWER usable rows once a row cap fires.
+#   field_flag             A boolean/flag field holds `expected`. Reads bools in every row
+#                          shape (flat-dotted, nested, JSON-string, underscore-aliased).
+#   distinct_count         Count of distinct values at a path is `<= max`. `fallbacks` lets a
+#                          second path answer when the first was not projected.
+#   route_membership       The subject's point set contains both endpoints of a declared pair.
+#                          Declare `point_pattern` unless your codes are 3 letters.
+#   value_mismatch         Two sides disagree AFTER mapping one through a `lookup` table from
+#                          `data/`. For "this code should imply that value" checks.
+#   value_matches_pattern  Values match (`match_mode: forbidden`) or fail to match
+#                          (`allowed`) a regex list. `inconclusive_patterns` carves out a
+#                          third state for values that are neither.
+#   delimited_field_mismatch  Two positions within one delimited string disagree.
+#                          `equivalent_values` whitelists known-equal pairs.
+#   velocity_count         Distinct subjects per actor exceed `max` — a burst check.
+#   stub                   Always `unknown`, with a stated reason and no data access. The
+#                          honest encoding of a procedure step your data cannot yet answer.
+#
+# The six COMPOSITIONAL kinds. They exist so a pattern the fourteen above cannot express
+# becomes new YAML rather than new engine code; all six are polarity-neutral.
+#
+#   all_of / any_of / none_of  Combine `children` — each a full condition, `use:` imports
+#                          included — under three-valued logic where `unknown` NEVER reads
+#                          as PASS. The parent prints the ONE report line, so it owns every
+#                          weighting key listed above: a child declaring one is inert, and a
+#                          validator error rather than a silent demotion.
+#   numeric_compare        `aggregate` over a field, then `operator` against `bound`. Covers
+#                          count / distinct / sum / min / max / avg / median / ratio, plus
+#                          mode and mode_share (the most frequent VALUE's frequency, and its
+#                          share of the rows — the winner's identity is the finding, so it is
+#                          named in the note). `baseline:` makes the bound a multiplier of a
+#                          second computed aggregate, whose completeness is judged from ITS
+#                          own source. Truncation is judged per aggregate: a partial read is
+#                          `unknown` unless more rows could not overturn the answer.
+#   event_order            One side is BEFORE or AFTER the other, with an optional `tolerance`
+#                          and a quantifier over each side's rows. This is the ordering claim
+#                          `time_gap` does not make — that one bounds a MAGNITUDE and accepts
+#                          either order, so a label saying "followed" needs this kind.
+#   value_equivalence      How many values are THE SAME THING under a form your pack declares
+#                          in `shared/equivalence_forms.yaml`: the size of the largest
+#                          equivalence class, or how many values are equivalent to a declared
+#                          `anchor`. The engine supplies the text operations and owns no
+#                          relation of its own — an absent threshold, `linkage` or form name
+#                          reads `unknown`, never a fallback to equality. Values the form
+#                          cannot read are reported beside the count, because a class of 4
+#                          drawn from 60 values of which 55 were unreadable is not the
+#                          finding it reads as.
+#
+# Full semantics, parameters and the `where:` row-selector on a condition side:
+# docs/architecture/verdict-engine.md (the generic mechanism for every kind,
+# described there is generic).
+# =============================================================================

@@ -1,0 +1,76 @@
+# =============================================================================
+# SHARED CHECK LIBRARY — actor identity.
+#
+# Imported as `actor_identity/<id>`. See shipment_elements.yaml for the rules
+# that govern this whole folder (mechanics here, weighting in the ruleset; a
+# list override REPLACES; an unknown `use:` is fatal at load).
+#
+# WHY THESE ARE SHARED AND NOT IN THE REFUND RULESET WHERE THEY WERE FIRST
+# WRITTEN: "was the actor an automated terminal rather than a person" is a
+# question about the DATA — which source holds the flag, which columns name the
+# identity, what an empty lookup means. Refund fraud asks it, courier-collusion
+# asks it, and a third use case will ask it. The first team to need it should not
+# have to re-derive the column, and a copied field path is how two copies start
+# disagreeing about what the field is.
+# =============================================================================
+
+# "The acting identity is an AUTOMATED depot terminal, not a person."
+#
+# NOTE THE ASYMMETRY, which is the reason `decisive_on` exists. Finding the identity on the
+# automated-session list PROVES a terminal acted (conclusive). NOT finding it is what every
+# human courier looks like — the ordinary case — and must never degrade the investigation to
+# INSUFFICIENT DATA. So an importing ruleset should declare `decisive_on: [fail]`, not the
+# default symmetric `[fail, unknown]`.
+#
+# `subject_scope: false` because this source is keyed by ACTING IDENTITY, not by the subject
+# shipment: filtering its rows by the tracking code drops every one of them and forces a
+# spurious UNKNOWN. It is mechanics, not weighting, so it lives here.
+automated_terminal_session:
+  kind: record_absence
+  source: sessions
+  subject_scope: false
+  fields: [session.automated]
+  # A BOOLEAN column, matched by its string form. `record_absence` compares upper-cased
+  # strings, so `"true"` here matches a real `true` — and `match: exact` is mandatory rather
+  # than cosmetic: substring matching would make the forbidden value `true` a substring of
+  # nothing useful here, but on any single-token vocabulary it hits every value that merely
+  # CONTAINS the token. Declare the value as a quoted string so YAML does not hand the engine
+  # a bool where it expects a comparable.
+  forbidden_values: ["true"]
+  match: exact
+  label: "Acting identity is not an automated depot terminal"
+  expected_label: "no automated-terminal session for this identity"
+  fail_detail: "an automated depot-terminal session acted on this shipment"
+  pass_detail: "the acting identity has no automated-terminal session — a person handled it"
+  # The identity whose rows count. Every clause must match for a row to be the subject's, so
+  # this is a TUPLE match, not a set of independent OR-ed filters: without it, one depot's
+  # rows speak for another's and a presence test finds an identity in a list it is absent
+  # from. A clause the incident cannot fill is reported unresolved, so the check says
+  # `unknown` rather than falling back to the contaminated whole-source set.
+  row_match:
+    - fields: [depot_code]
+      from_entity: depot
+    - fields: [login, badge]
+      from_entity: courier
+
+# "The courier who captured the POD is the courier who handled the shipment."
+#
+# Two identities here is the collusion shape: one person carries the parcel, another signs
+# for it. Compared by `normalize: exact` because badges are already canonical.
+pod_captured_by_handler:
+  kind: field_equality
+  source: ledger
+  left:
+    source: ledger
+    field: handler.badge
+  right:
+    source: ledger
+    field: pod.captured_by
+  label: "POD captured by the handling courier"
+  # `field_equality` compares two value SETS and knows nothing about what they hold, so the
+  # engine's fallbacks say only whether they intersect. Naming the two sides is this check's
+  # job — and note the wording is a FINDING either way, because the two rulesets importing
+  # this check disagree about which way a FAIL argues. A note phrased as a requirement would
+  # be wrong in one of them.
+  pass_detail: "the courier who handled the parcel is the one who captured the POD"
+  fail_detail: "the POD names a different courier from the one who handled the parcel"
