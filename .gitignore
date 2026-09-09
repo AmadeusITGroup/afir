@@ -251,3 +251,8 @@ docs/databricks_catalog_discovery.txt
 scripts/out/
 probe_*.json
 probe_*.txt
+
+# Wheels built by scripts/vendor_wheels.py for the driver-proxy deployment: 36 MB of
+# third-party binaries reproducible from requirements.txt, and the standard `wheels/`
+# entry above does not cover this path.
+vendor/

@@ -19,6 +19,7 @@ Four properties, only the first about the new feature:
 
 import pytest
 
+from src.correlation import SelectionBasis
 from src.models.pydantic_models import (
     IncidentAnalysis,
     RetrievalQuery,
@@ -262,9 +263,11 @@ _PASS_1 = ["understanding", "query_generation", "log_retrieval"]
 class _Correlation:
     """The seam the runner asks WHICH procedure adjudicates — the same one the verdict asks.
 
-    Only `_playbook_correlation_spec` is implemented, because that is the whole question at
-    this point in the run: it is pure token arithmetic over the incident summary and needs no
-    logs, which is what lets the follow-up decision be taken a stage early.
+    Only the selection seam is implemented, because that is the whole question at this point in
+    the run: it is pure token arithmetic over the incident summary and needs no logs, which is
+    what lets the follow-up decision be taken a stage early. It carries the real class's PAIR —
+    the explained form answers and the plain one is its first element — so the double cannot
+    hand the runner a spec that the basis beside it contradicts.
     """
 
     def __init__(self, use_case="", boom=False):
@@ -272,11 +275,18 @@ class _Correlation:
         self._boom = boom
         self.calls = 0
 
-    def _playbook_correlation_spec(self, analysis):
+    def _playbook_correlation_spec_explained(self, analysis):
         self.calls += 1
         if self._boom:
             raise RuntimeError("no playbook could be matched")
-        return {"use_case": self._use_case} if self._use_case else {}
+        if not self._use_case:
+            return {}, SelectionBasis(basis="no_match", spec_count=2)
+        return {"use_case": self._use_case}, SelectionBasis(
+            basis="scored", score=1.0, spec_count=2
+        )
+
+    def _playbook_correlation_spec(self, analysis):
+        return self._playbook_correlation_spec_explained(analysis)[0]
 
 
 def _manager(passes=None, config=None, pack=None, correlation=None):

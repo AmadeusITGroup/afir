@@ -59,6 +59,13 @@ whatever the config and the pack actually say, and never a constant in a scratch
   result) or a `Comparison` (`verdict()` refuses to call a zero-against-a-zero-control a
   finding). Read `sources` FIRST: a declared source that built no retriever cannot answer,
   and that is not a fact about the data.
+
+  **And as the assistant's `probe` tool** — same library, one `op` per CLI subcommand above,
+  same read-only guard, plus three bounds the CLI does not have: a per-session count, a row
+  cap on what comes back, and a wall clock of its own. That last one is deliberate: a source
+  declared `primary` is allowed *two hours* in a pipeline run, and an authoring turn that
+  inherited that budget would hang with nothing to show. So a timeout here says nothing about
+  the data — a real run may well succeed where the probe did not.
 * **`scripts/generate_source_schemas.py --pack <dir>`** — the complete field inventory per
   source into `knowledge/<pack>/schemas/`, arrays descended, `--measure` for per-leaf
   population. Re-running preserves hand-written `description:` text. This is the *build* half:

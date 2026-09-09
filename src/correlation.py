@@ -11,6 +11,7 @@ import json
 import logging
 import re
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -5809,8 +5810,15 @@ def evaluate_verdict(
                     vals = list(own)
             return list(dict.fromkeys(v for v in vals if str(v).strip()))
 
-        def _preprocess(cond_in: Dict[str, Any]) -> Dict[str, Any]:
+        def _preprocess(
+            cond_in: Dict[str, Any], subject_scoped: Optional[bool] = None
+        ) -> Dict[str, Any]:
             """Stamp the runtime facts a condition's kind reads, recursing into ``children``.
+
+            ``subject_scoped`` records whether this condition's rows are THIS subject's, and
+            it is resolved from the top-level condition and then inherited: the evaluation
+            loop below reads `subject_scope` off the root only, so a child is scoped the way
+            its parent is however the child itself is declared.
 
             Every fact below is derived from THIS condition's own sources, and a composite's
             children are stamped by the same recursion rather than inheriting the parent's
@@ -5822,6 +5830,8 @@ def evaluate_verdict(
             INSUFFICIENT DATA, the failure this engine is least able to see.
             """
             c = dict(cond_in)
+            if subject_scoped is None:
+                subject_scoped = cond_in.get("subject_scope") is not False
             # Stamp a scope note when the source was asked but did not answer, so the
             # check reports a retrieval gap rather than "no data". Stamped before any
             # kind-specific handling; skipped if narrowing logic has already set one.
@@ -5852,6 +5862,42 @@ def evaluate_verdict(
                         "answer. Add it to the retrieval plan (the run controls' plan editor) "
                         "and re-run if this check matters to the outcome"
                     )
+                else:
+                    # Every source this condition reads answered, and answered with rows —
+                    # but none of them is THIS subject's. That is a third thing, and the two
+                    # notes above cannot say it: an absent field and an absent subject read
+                    # identically off one `unknown`, while their remedies are opposite (fix
+                    # the projection vs. widen the scope). Requires rows for somebody, or the
+                    # claim "the rows are other subjects'" is false about an empty answer.
+                    # And requires `subject_scoped`, or it is false in the other direction: a
+                    # cohort condition is scoped by its own query and reads the source WHOLE,
+                    # so none of its rows naming this subject is the normal state and the
+                    # rows it did read are real.
+                    _answered = [lg for lg in _condition_sources(c) if lg in src_rows]
+                    _elsewhere = sum(len(real_rows.get(lg) or []) for lg in _answered)
+                    if (
+                        sv
+                        and subject_scoped
+                        and _answered
+                        and _elsewhere
+                        and not any(src_rows.get(lg) for lg in _answered)
+                    ):
+                        _named = ", ".join(
+                            sorted(
+                                {
+                                    (spec.get("sources", {}) or {}).get(lg, lg)
+                                    for lg in _answered
+                                }
+                            )
+                        )
+                        c["_scope_note"] = (
+                            f"the {_named} source answered with {_elsewhere} row(s) on this "
+                            f"run and NOT ONE of them names {sv}, so this check has no rows "
+                            "of its own to read — a scope gap, not a missing field. Either "
+                            "this subject is absent from the source or the run's window and "
+                            "filters excluded it; widening the retrieval scope is what "
+                            "answers that, and re-reading the projection cannot"
+                        )
             if equivalence_forms:
                 # Run-level context, so it inherits down the recursion: the pack's forms are
                 # the same for every condition. Stamped only when the pack declares some, or a
@@ -5979,7 +6025,7 @@ def evaluate_verdict(
                     c["subject_rows"] = subj_sel
             kids = [k for k in (c.get("children") or []) if isinstance(k, dict)]
             if kids:
-                c["children"] = [_preprocess(k) for k in kids]
+                c["children"] = [_preprocess(k, subject_scoped) for k in kids]
             return c
 
         checks: List[ConditionCheck] = []
@@ -6729,6 +6775,54 @@ def evaluate_verdict(
     )
 
 
+#: `basis` values, in the order a reader should think about them. Only `no_match` means the
+#: caller's fallback to the pack default is a guess rather than a selection.
+SELECTION_BASES = ("pinned", "scored", "sole_spec", "no_match", "no_specs")
+
+#: Runners-up carried for the operator to pin. Enough to choose from, short enough to print.
+_MAX_SELECTION_CANDIDATES = 4
+
+
+@dataclass(frozen=True)
+class SelectionBasis:
+    """How this run's procedure was chosen, and how close the choice was.
+
+    ``basis`` is the load-bearing field. A run whose selection scored nothing is still
+    adjudicated — every caller falls back to the pack's default ruleset rather than
+    producing no verdict — so ``no_match`` is the only record that the procedure was a
+    guess. Without it a defaulted adjudication is indistinguishable from a selected one.
+    """
+
+    basis: str
+    score: float = 0.0
+    runner_up: float = 0.0
+    spec_count: int = 0
+    #: ``(use_case, score)`` best-first, so a report can name what the operator could pin.
+    candidates: Tuple[Tuple[str, float], ...] = ()
+
+    @property
+    def defaulted(self) -> bool:
+        """True when nothing selected a procedure, so the caller's fallback is a guess."""
+        return self.basis == "no_match"
+
+    @property
+    def margin(self) -> float:
+        """Share of the winning score not also held by the runner-up; 1.0 when unrivalled."""
+        if self.score <= 0:
+            return 0.0
+        return max(0.0, (self.score - self.runner_up) / self.score)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "basis": self.basis,
+            "score": round(self.score, 4),
+            "runner_up": round(self.runner_up, 4),
+            "margin": round(self.margin, 4),
+            "spec_count": self.spec_count,
+            "candidates": [[n, round(s, 4)] for n, s in self.candidates],
+        }
+
+
 def select_correlation_spec(pack, analysis) -> Optional[Dict[str, Any]]:
     """Pick the playbook correlation block most relevant to this incident.
 
@@ -6740,11 +6834,23 @@ def select_correlation_spec(pack, analysis) -> Optional[Dict[str, Any]]:
     Module-level so the planner and the verdict share one answer; a second
     implementation would be a second answer to the same question.
     """
+    return select_correlation_spec_explained(pack, analysis)[0]
+
+
+def select_correlation_spec_explained(
+    pack, analysis
+) -> Tuple[Optional[Dict[str, Any]], SelectionBasis]:
+    """``select_correlation_spec``'s answer plus how it was reached.
+
+    Same selection, byte for byte; the second element is the fact the pipeline could not
+    otherwise state. Separate entry point rather than a widened return so the ten-odd
+    existing callers keep asking the question they ask.
+    """
     if pack is None:
-        return None
+        return None, SelectionBasis("no_specs")
     specs = pack.correlation_specs()
     if not specs:
-        return None
+        return None, SelectionBasis("no_specs")
 
     # A pinned use_case (set on referrals) bypasses scoring; honoured here so the
     # planner and verdict both follow the pin. Unknown pins fall back to scoring.
@@ -6759,7 +6865,9 @@ def select_correlation_spec(pack, analysis) -> Optional[Dict[str, Any]]:
                     pinned,
                     spec.get("title", "") or "untitled",
                 )
-                return spec
+                return spec, SelectionBasis(
+                    "pinned", spec_count=len(specs), candidates=((pinned, 0.0),)
+                )
         logger.warning(
             "Incident carries a pin to use case '%s', which declares no correlation block; "
             "falling back to scoring the description. The verdict's procedure may not be the "
@@ -6796,22 +6904,46 @@ def select_correlation_spec(pack, analysis) -> Optional[Dict[str, Any]]:
         if not text:
             return 0.0
         total = float(len(specs))
-        return sum(
-            (total - spec_frequency[t]) / total
-            for t in tokens
-            if t and t in text
+        # float() because an empty sum is an int, and these scores are reported now: a
+        # candidate list mixing 0 and 0.0 reads as two different measurements.
+        return float(
+            sum(
+                (total - spec_frequency[t]) / total
+                for t in tokens
+                if t and t in text
+            )
         )
 
     best, best_key = None, (-1.0, -1.0)
+    scored: List[Tuple[Tuple[float, float], str]] = []
     for tokens, spec in zip(tokens_by_index, specs):
         key = (weigh(tokens, primary), weigh(tokens, secondary))
+        scored.append((key, str(spec.get("use_case", "") or "")))
         if key > best_key:  # strict: a tie keeps the earlier-declared spec
             best, best_key = spec, key
+    # Ranked on the same composite key the winner was chosen by, so the runner-up reported
+    # is the one that actually came second rather than the second-highest primary score.
+    ranked = sorted(scored, key=lambda pair: pair[0], reverse=True)
+    candidates = tuple((name, key[0]) for key, name in ranked[:_MAX_SELECTION_CANDIDATES])
+    runner_up = ranked[1][0][0] if len(ranked) > 1 else 0.0
+
     # If nothing matched by keyword but specs exist, still return the top one only
     # when there is a single spec (unambiguous); otherwise require a real match.
     if best_key[0] <= 0 and best_key[1] <= 0 and len(specs) > 1:
-        return None
-    return best
+        return None, SelectionBasis(
+            "no_match", spec_count=len(specs), candidates=candidates
+        )
+    # A one-spec pack scores 0 on every token by construction — inverse spec frequency is
+    # (1-1)/1 — so its spec wins by being the only one, never by matching. Named apart from
+    # `scored` because "unrivalled" and "the description fits" are different claims.
+    basis = "sole_spec" if len(specs) == 1 else "scored"
+    return best, SelectionBasis(
+        basis,
+        score=best_key[0],
+        runner_up=runner_up,
+        spec_count=len(specs),
+        candidates=candidates,
+    )
 
 
 class CorrelationModule:
@@ -6823,6 +6955,7 @@ class CorrelationModule:
         knowledge_pack=None,
         row_caps=None,
         link_probe=None,
+        inquiry_probe=None,
     ):
         self.config = config or {}
         self.llm_client = llm_client
@@ -6830,12 +6963,23 @@ class CorrelationModule:
         # `link_probe` is the only IO path; injected so the module stays mockable.
         # None leaves rung 3 of the advisory link ladder unreachable.
         self.link_probe = link_probe
+        # The same for the other advisory lane: None leaves an open question at the state the
+        # free rung reached, which is a reported state and never a silence.
+        self.inquiry_probe = inquiry_probe
         self.row_caps = dict(row_caps or {})
         self.knowledge_pack = knowledge_pack
         self.sample_rows = int(self.config.get("sample_rows", 20))
         self.llm_max_records = int(self.config.get("llm_max_records", 2000))
         self.llm_max_sources = int(self.config.get("llm_max_sources", 6))
         self.discovery_key_filter = self.config.get("discovery_key_filter", "strict")
+        # How the last run's procedure was chosen. Set here so the attribute always exists;
+        # the module is shared across jobs, so the run-recorded copy on `ctx.stage_facts` is
+        # what the scorer reads and this is only the fallback for direct-drive callers.
+        self.last_selection: Optional[SelectionBasis] = None
+        # Which path produced (or did not produce) `findings` last run: "llm" or
+        # "deterministic". Same sharing caveat as `last_selection` above. Empty findings mean
+        # different things on the two paths and the health scorer charges only one of them.
+        self.last_narration: str = ""
 
     def _entity_hints(self) -> Dict[str, str]:
         """Pack's field-name-token -> entity-type map; ``{}`` when no pack is set."""
@@ -6935,6 +7079,107 @@ class CorrelationModule:
     def _playbook_correlation_spec(self, analysis) -> Optional[Dict[str, Any]]:
         """Delegate to ``select_correlation_spec`` (module-level for planner sharing)."""
         return select_correlation_spec(self.knowledge_pack, analysis)
+
+    def _playbook_correlation_spec_explained(self, analysis):
+        """``(spec, SelectionBasis)`` — the same answer, plus how it was reached."""
+        return select_correlation_spec_explained(self.knowledge_pack, analysis)
+
+    def _annotate_procedure_selection(self, result, selection, ruleset_key) -> None:
+        """Say on the verdict and brief that the procedure was a fallback, not a selection.
+
+        Nothing happens for any basis other than ``no_match``: every other one chose the
+        ruleset that ran, so annotating it would be noise. When the pack declares
+        ``adjudication_policy: abstain`` the verdict is additionally converted to that
+        ruleset's own ``reject`` label — the pack's declared "cannot adjudicate" state, which
+        until now was unreachable — because a routing decision and a finding on the merits are
+        different answers and only one of them is honest here.
+        """
+        if selection is None or not selection.defaulted:
+            return
+        rivals = ", ".join(
+            f"{name} ({score:.2f})" for name, score in selection.candidates if name
+        )
+        detail = (
+            f"No procedure matched this incident's summary, so it was adjudicated under "
+            f"'{ruleset_key or 'the pack default'}' because that is the pack's default "
+            f"ruleset — not because the incident was recognised. Every condition below was "
+            f"evaluated against real rows, so the result reads as confident whether or not "
+            f"the procedure is the right one. Scored candidates, all at zero: "
+            f"{rivals or 'none'}. Pin one with pinned_use_case, or give the matching "
+            f"procedure a title that discriminates."
+        )
+        try:
+            verdict = getattr(result, "verdict", None)
+            subjects = list(getattr(verdict, "subjects", None) or []) if verdict else []
+            for subject in subjects:
+                subject.notes.append(f"procedure_unselected={detail}")
+            brief = getattr(result, "brief", None)
+            if brief is not None:
+                brief.notes.append(f"procedure_unselected={detail}")
+            logger.warning(
+                "No correlation spec matched this incident; adjudicated under the pack "
+                "default ruleset '%s'. Candidates all scored zero: %s.",
+                ruleset_key or "(none)",
+                rivals or "none",
+            )
+            if self._adjudication_policy() == "abstain" and subjects:
+                self._abstain(verdict, subjects, ruleset_key)
+        except Exception as exc:  # noqa: BLE001 — an annotation must never fail the stage
+            logger.warning(
+                "Could not record that no procedure was selected (%s: %s); the verdict is "
+                "unchanged but reads as though its procedure had been chosen.",
+                type(exc).__name__,
+                exc,
+            )
+
+    def _adjudication_policy(self) -> str:
+        """The pack's policy for an unselected incident; ``default`` when it declares none."""
+        pack = self.knowledge_pack
+        if pack is None or not hasattr(pack, "adjudication_policy"):
+            return "default"
+        try:
+            return str(pack.adjudication_policy() or "default")
+        except Exception:  # noqa: BLE001 — a malformed pack must not fail the stage
+            return "default"
+
+    def _abstain(self, verdict, subjects, ruleset_key) -> None:
+        """Convert an unselected run's verdict to the ruleset's own ``reject`` state.
+
+        Refused — loudly, and leaving the verdict as it was — when the ruleset declares no
+        ``reject`` label: the label is the word the pack's reporting vocabulary and closing
+        templates are keyed on, so inventing one produces a verdict nothing downstream can
+        render, which is worse than the finding it replaces.
+        """
+        label = str((getattr(verdict, "labels", None) or {}).get("reject", "") or "").strip()
+        if not label:
+            logger.warning(
+                "Pack declares adjudication_policy: abstain, but ruleset '%s' declares no "
+                "'reject' label, so there is no word to abstain in. Keeping the default "
+                "ruleset's verdict, which is annotated as unselected.",
+                ruleset_key or "(default)",
+            )
+            return
+        for subject in subjects:
+            subject.verdict = label
+            subject.verdict_class = "reject"  # must move with the label or the two contradict
+            subject.notes.append(
+                "reject_reason=No procedure recognised this incident, so it is returned to "
+                "the detector's owner for routing rather than adjudicated under a procedure "
+                "chosen by default."
+            )
+            subject.lock_target = {}
+        counts: Dict[str, int] = defaultdict(int)
+        for subject in subjects:
+            counts[subject.verdict] += 1
+        verdict.summary = "; ".join(f"{v}: {n}" for v, n in counts.items())
+        # The draft was rendered from the verdict this replaces, so it asserts a finding under
+        # a procedure that was never selected — the exact sentence an abstention exists to
+        # withhold. Cleared rather than re-rendered: what to tell whom about an unrecognised
+        # incident is a routing decision, and the pack's templates are keyed on findings.
+        verdict.notification_draft = (
+            "No notification is drafted: no procedure recognised this incident, so there is "
+            "no finding to notify. Route the alert to the detector's owner."
+        )
 
     def _resolve_correlation_keys(
         self, analysis, schema, logs, playbook_spec=None
@@ -7457,7 +7702,10 @@ class CorrelationModule:
         schema = derive_schema(logs)
 
         # --- Layered correlation-key resolution: playbook -> understanding -> discovery.
-        playbook_spec = self._playbook_correlation_spec(analysis)
+        # The basis is kept off `aggregations`: that dict is json.dumps'ed into the transform
+        # and narration prompts, so a key added there changes what two LLM calls read.
+        playbook_spec, selection = self._playbook_correlation_spec_explained(analysis)
+        self.last_selection = selection
         resolved_keys = self._resolve_correlation_keys(
             analysis, schema, logs, playbook_spec
         )
@@ -7495,6 +7743,7 @@ class CorrelationModule:
 
         # --- Volume gate: deterministic by default; LLM only for low-volume/complex.
         used_llm = False
+        self.last_narration = ""
         if self._should_use_llm(aggregations, resolved_keys):
             playbook = await self._match_playbook(analysis)
             used_by_hint = self._used_by_hint(logs, analysis)
@@ -7528,6 +7777,9 @@ class CorrelationModule:
         )
 
         # Narrate findings via LLM only on the low-volume/complex path (cost control).
+        # Which path ran is recorded because empty `findings` is a defect on one and the
+        # design on the other, and the two are indistinguishable from the result alone.
+        self.last_narration = "llm" if used_llm else "deterministic"
         if used_llm:
             narrated = await self._narrate(
                 analysis, aggregations, transforms, playbook, guidance
@@ -7683,6 +7935,10 @@ class CorrelationModule:
             )
             result.brief = None
 
+        # Both the verdict and the brief now exist, so this is where a defaulted procedure can
+        # be stated on each of them. Before the link lane, which reads the verdict.
+        self._annotate_procedure_selection(result, selection, ruleset_key)
+
         # --- Cross-procedure link assessment (best-effort, advisory) ---------------
         # Reads verdict and brief; never reaches this run's verdict, conditions or health.
         try:
@@ -7762,6 +8018,56 @@ class CorrelationModule:
                 "Cross-procedure link assessment failed (%s); continuing without it.", e
             )
             result.links = []
+
+        # --- This procedure's own open questions (best-effort, advisory) ------------
+        # The other axis from the link lane: what THIS procedure could not settle. Reads the
+        # verdict and the brief; never reaches this run's verdict, conditions or health.
+        try:
+            from inquiry import assess_inquiries
+
+            result.inquiries = assess_inquiries(
+                self.knowledge_pack,
+                analysis,
+                logs,
+                verdict=result.verdict,
+                brief=result.brief,
+                ruleset_key=ruleset_key,
+                config=self.config.get("inquiries") or {},
+            )
+            # Probes before the brief copies the list, for the link lane's reason: a probe
+            # settles findings in place, so copying first would leave the brief stale.
+            if self.inquiry_probe is not None and result.inquiries:
+                try:
+                    from inquiry_probe import run_inquiries
+
+                    await run_inquiries(
+                        self.inquiry_probe,
+                        result.inquiries,
+                        pack=self.knowledge_pack,
+                        analysis=analysis,
+                        logs=logs,
+                        config=self.config.get("inquiries") or {},
+                        # The link lane's budget is an INPUT here: the two lanes share one
+                        # ceiling, so this one cannot be resolved without knowing what the
+                        # other may spend.
+                        link_config=self.config.get("links") or {},
+                        ruleset_key=ruleset_key,
+                    )
+                except Exception as e:  # advisory; never break the stage it advises on
+                    logger.warning(
+                        "Open-question probing failed (%s); the questions keep the state the "
+                        "free rung reached.",
+                        e,
+                    )
+            if result.brief is not None and isinstance(
+                getattr(result.brief, "inquiries", None), list
+            ):
+                result.brief.inquiries = list(result.inquiries)
+        except Exception as e:  # advisory; must never break the stage it advises on
+            logger.warning(
+                "Open-question assessment failed (%s); continuing without it.", e
+            )
+            result.inquiries = []
 
         logger.info(
             "Correlation complete: %d records, %d keys, %d transforms, %d findings (%s).",

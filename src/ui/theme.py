@@ -569,6 +569,16 @@ THEME_CSS = r"""
     .advisory .lane { color: var(--skip); font-size: .68rem; text-transform: uppercase;
       letter-spacing: .09em; font-weight: 700; }
     .advisory .why { color: var(--muted); font-size: .78rem; margin-top: .2rem; }
+    /* Amber, not the advisory grey: this one is not a suggestion to weigh but a defect in the
+       run the reader is holding — no procedure recognised the incident — and amber means "a
+       human is needed" everywhere on this page. It sits FIRST in the correlation card, above
+       the evidence, because everything below it was evaluated under a procedure nobody chose
+       and reads exactly as confidently as one that was. */
+    .unsel { border: 1px solid var(--edge-warn); border-left: 3px solid var(--warn);
+      background: var(--veil-warn); border-radius: 9px; padding: .5rem .7rem; margin: 0 0 .5rem; }
+    .unsel .lane { color: var(--warn); font-size: .68rem; text-transform: uppercase;
+      letter-spacing: .09em; font-weight: 700; }
+    .unsel .why { color: var(--text); font-size: .8rem; margin-top: .2rem; }
     .lnk { background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
       padding: .4rem .55rem; margin: .45rem 0 0; }
     .lnk .hd { display: flex; align-items: center; gap: .45rem; flex-wrap: wrap; }
@@ -583,6 +593,19 @@ THEME_CSS = r"""
     .lnk .st.s-probed_negative { color: var(--ok); border-color: var(--edge-ok);
       background: var(--veil-ok); }
     .lnk .st.s-unreachable { color: var(--faint); border-style: dashed; }
+    /* The open-question lane's own states, on the same card chrome. Coloured by whether something
+       is still OWED and never by the outcome's polarity: whether zero rows is good news or bad is
+       what the procedure's declared meaning says, and a colour here would let a reader take the
+       answer off the badge. So `answered` and `empty` stay neutral — both are settled — while the
+       two that need somebody are marked, and each by what would fix it: `not_asked` is a query
+       nobody has made, `unanswered` is a credential or a catalog entry. */
+    .lnk .st.s-not_asked { color: var(--skip); border-color: var(--edge-skip);
+      background: var(--veil-skip); }
+    .lnk .st.s-unanswered { color: var(--warn); border-color: var(--edge-warn);
+      background: var(--veil-warn); }
+    /* The question itself, which is prose and not an identifier — so it wraps, unlike the link
+       card's `.tgt` procedure name that it shares a row with. */
+    .lnk.inq .tgt { font-family: inherit; font-weight: 600; }
     .lnk .ll { color: var(--muted); font-size: .78rem; margin-top: .22rem; }
     .lnk .ll b { color: var(--text); font-weight: 600; }
     /* What the rung-3 scan COST, set slightly apart from the findings because it is a fact about

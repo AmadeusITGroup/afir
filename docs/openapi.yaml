@@ -79,6 +79,14 @@ tags:
       Knowledge-pack management. Lists packs, reads and writes individual
       files, validates packs, manages file history, and runs the LLM-driven
       pack assistant.
+  - name: Identity
+    description: >
+      Who the server thinks the caller is, and the per-caller layers that
+      follow from it. An administrator's configuration and knowledge-pack
+      writes land on the shared base; everyone else's land in their own layer
+      and are re-merged when the base moves. Where the ingress forwards no
+      identity at all — a laptop, a VM, an App Service — every caller is the
+      single local administrator and no layer is ever written.
 
 paths:
 
@@ -91,6 +99,40 @@ paths:
         Returns the single-page HTML application. The document is assembled
         inline from src/ui/* with no external CDN dependencies so that it
         works offline in a Databricks App.
+      responses:
+        "200":
+          description: HTML document
+          content:
+            text/html:
+              schema:
+                type: string
+
+  /afir:
+    get:
+      operationId: index_afir
+      tags: [UI]
+      summary: Serve the web UI under a named path
+      description: >
+        The same document as `/`. It exists so that a deployment behind an
+        ingress whose prefix names no service — a Databricks cluster driver
+        proxy, served at /driver-proxy/o/{org}/{cluster}/{port}/ — has a URL
+        that identifies AFIR. The page's own asset and API calls are unaffected.
+      responses:
+        "200":
+          description: HTML document
+          content:
+            text/html:
+              schema:
+                type: string
+
+  /afir/:
+    get:
+      operationId: index_afir_slash
+      tags: [UI]
+      summary: Serve the web UI under a named path (trailing slash)
+      description: >
+        Identical to `/afir`; registered separately because no trailing-slash
+        normalisation middleware is installed.
       responses:
         "200":
           description: HTML document
@@ -253,15 +295,17 @@ paths:
       deprecated: true
       summary: Submit an incident via the IR endpoint (blocking, deprecated)
       description: >
-        Alternate blocking endpoint for incident submission used by some
-        legacy integrations. Subject to the same 501 behaviour when
-        blocking_endpoints is auto or on. Use POST /api/v1/jobs instead.
+        Alternate blocking endpoint used by some legacy integrations: it looks
+        the incident up in the incident tracker and runs what comes back, so
+        the body names a record rather than describing an incident. Subject to
+        the same 501 behaviour when blocking_endpoints is auto or on. Use POST
+        /api/v1/jobs instead.
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/IncidentInput"
+              $ref: "#/components/schemas/IrLookupRequest"
       responses:
         "200":
           description: Investigation report
@@ -1208,6 +1252,405 @@ paths:
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
+  /api/v1/whoami:
+    get:
+      operationId: whoami
+      tags: [Identity]
+      summary: The resolved caller, their role, and why they have it
+      description: >
+        Reports the identity the ingress asserted, the role derived from it and
+        the reason for that role, so a caller who expected to be an
+        administrator can see which check did not match. `edits_the_base` is
+        the single fact the editors branch on: true means a save changes the
+        shared configuration or pack, false means it lands in this caller's own
+        layer. `source` is `token` (a forwarded credential was validated),
+        `header` (platform-asserted name, no credential) or `local` (no ingress
+        identity — a single-operator deployment, where the role is admin).
+      responses:
+        "200":
+          description: The caller
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user_id: { type: string }
+                  user_name: { type: string }
+                  role: { type: string, enum: [admin, user] }
+                  source: { type: string, enum: [token, header, local] }
+                  groups:
+                    type: array
+                    items: { type: string }
+                  role_reason: { type: string }
+                  mode: { type: string }
+                  enforced: { type: boolean }
+                  can_elevate: { type: boolean }
+                  edits_the_base: { type: boolean }
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /api/v1/whoami/elevate:
+    post:
+      operationId: elevate_identity
+      tags: [Identity]
+      summary: Prove group membership with the caller's own workspace token
+      description: >
+        The browser path through the driver proxy forwards no credential, so an
+        owner arrives indistinguishable from a reader and group membership
+        cannot be read. Posting a personal access token validates it against
+        the identity the platform already asserted and, if the groups it
+        returns include an admin group, promotes this caller for the
+        configured validation window. The token is never stored.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token]
+              properties:
+                token:
+                  type: string
+                  description: A workspace personal access token for the asserted user.
+      responses:
+        "200":
+          description: Accepted; the body carries the re-resolved identity
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  accepted: { type: boolean }
+                  detail: { type: string }
+                  role: { type: string }
+                  groups:
+                    type: array
+                    items: { type: string }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /api/v1/audit:
+    get:
+      operationId: get_audit
+      tags: [Identity]
+      summary: The access journal — who called, and what they changed
+      description: >
+        Newest entry first. Every other durable record AFIR keeps is about a run,
+        which leaves the rest of "usage" invisible: a caller who only browses,
+        reads someone else's report, is refused at the door or edits the shared
+        configuration. `kind` is `request` (one completed HTTP call, with its
+        status and duration), `refused` (an identity that could not be trusted —
+        the one record of why a caller sees a bare 403), `config_change` (each
+        path with its before and after value, secret-shaped keys redacted, and
+        `target` saying whether it landed on the shared base or in that caller's
+        own draft), `secret_change` (a caller replaced or cleared one of their
+        OWN credentials, by name and fingerprint — never the value) or
+        `journal_overflow` (entries discarded while the sink was refusing
+        writes, so the counts around them are floors).
+
+        Administrators only, because it names every other caller. Answers 200
+        with an empty list when the journal is disabled rather than 404 —
+        "nobody has done anything" and "nothing is being recorded" are different
+        answers, and `journal.enabled` is which one this is.
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 2000, default: 200 }
+        - name: since
+          in: query
+          schema: { type: string }
+          description: >
+            An ISO-8601 timestamp; entries at or after it. Days are read
+            newest-first, so this bounds the read as well as the answer.
+        - name: user
+          in: query
+          schema: { type: string }
+          description: One account name, matched case-insensitively.
+      responses:
+        "200":
+          description: The journal
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  entries:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        at: { type: string, format: date-time }
+                        kind:
+                          type: string
+                          enum: [request, refused, config_change, secret_change,
+                                 journal_overflow]
+                        user: { type: string }
+                        user_id: { type: string }
+                        role: { type: string }
+                        auth:
+                          type: string
+                          description: >-
+                            How the identity was established, so a `local` entry is never read as an
+                            authenticated one. `unresolved` where none was established — a refusal at
+                            the door, or a page load that reads no header.
+                          enum: [token, header, local, unresolved]
+                        method: { type: string }
+                        path: { type: string }
+                        status: { type: integer }
+                        ms: { type: number }
+                      additionalProperties: true
+                  count: { type: integer }
+                  limit:
+                    type: integer
+                    description: >
+                      Echoed because a short list under a small limit reads like
+                      a quiet deployment.
+                  journal:
+                    type: object
+                    description: What the journal itself is doing.
+                    properties:
+                      enabled: { type: boolean }
+                      pending: { type: integer }
+                      dropped: { type: integer }
+                      write_failures: { type: integer }
+                      flush_seconds: { type: number }
+                      retention_days: { type: integer }
+                      days_held: { type: integer }
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /api/v1/overlay:
+    get:
+      operationId: get_overlay
+      tags: [Identity]
+      summary: This caller's own drafts of the configuration and the knowledge pack
+      description: >
+        One row per file this caller has changed, in each of the two editable
+        trees. `state` is `clean`, `merged` (an administrator moved the base and
+        the edit was carried forward), `conflict` (both sides changed the same
+        lines; the file holds conflict markers and the edit was kept) or
+        `adopted` (the fork point was lost, so the draft stands as-is). A
+        knowledge path is `<pack>/<path within the pack>`.
+      responses:
+        "200":
+          description: The caller's layers
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  you: { type: string }
+                  role: { type: string }
+                  edits_the_base: { type: boolean }
+                  effect:
+                    type: string
+                    nullable: true
+                    enum: [draft, null]
+                  config:
+                    type: array
+                    items: { $ref: "#/components/schemas/OverlayFile" }
+                  knowledge:
+                    type: array
+                    items: { $ref: "#/components/schemas/OverlayFile" }
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /api/v1/overlay/{label}:
+    delete:
+      operationId: drop_overlay
+      tags: [Identity]
+      summary: Discard one of this caller's own overrides
+      description: >
+        The way back to the shared version, and the only way out of a conflict
+        a rebase left in place — a conflicted draft is kept deliberately, so
+        discarding it has to be an explicit choice. Nothing in the shared tree
+        is touched.
+      parameters:
+        - name: label
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: [config, knowledge]
+        - name: path
+          in: query
+          required: true
+          schema: { type: string }
+          description: >
+            The file to discard. A config file name, or `<pack>/<path>` for a
+            knowledge-pack file.
+      responses:
+        "200":
+          description: Discarded
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  dropped: { type: boolean }
+                  path: { type: string }
+                  layer: { type: string }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/secrets:
+    get:
+      operationId: get_secrets
+      tags: [Identity]
+      summary: Which credentials this caller may replace for their own runs
+      description: >
+        The deployment ships with working credentials and every caller's runs
+        use them. This lists the names a caller may replace with one of their
+        own, what each name reaches, and whether they have replaced it — never a
+        value, in either direction: a stored credential is represented by a
+        short fingerprint of it and there is no read-back. `withheld` names the
+        credentials that are deliberately not offerable and why, because a list
+        that silently omits half of them reads as complete. `available` is false
+        where there is no durable store or no named credential to replace, and
+        `reason` then says which.
+      responses:
+        "200":
+          description: The offerable names and this caller's state on each
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  you: { type: string }
+                  available: { type: boolean }
+                  reason:
+                    type: string
+                    description: Present only when `available` is false.
+                  note: { type: string }
+                  secrets:
+                    type: array
+                    items: { $ref: "#/components/schemas/PersonalSecret" }
+                  withheld:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        name: { type: string }
+                        reason: { type: string }
+
+  /api/v1/secrets/{name}:
+    put:
+      operationId: put_secret
+      tags: [Identity]
+      summary: Replace one credential for this caller's own runs
+      description: >
+        Applies from the caller's next run and to their runs only; no other
+        caller's run changes and nothing appears in the shared configuration or
+        in an export. The value is written to the caller's own durable namespace
+        and never returned — the response carries the same row `GET
+        /api/v1/secrets` shows, fingerprint included. A name no reader on this
+        deployment resolves is refused with the offerable list, because storing
+        it would report success and change nothing.
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema: { type: string }
+          description: The environment-variable name of the credential.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [value]
+              properties:
+                value:
+                  type: string
+                  description: >
+                    The credential itself. An empty value is refused — DELETE is
+                    how a caller goes back to the deployment's own.
+      responses:
+        "200":
+          description: Stored
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - type: object
+                    properties:
+                      saved: { type: boolean }
+                  - $ref: "#/components/schemas/PersonalSecret"
+        "400":
+          description: >
+            Not a name this deployment reads, an empty value, or one over the
+            length limit. A refused name comes back with `offerable`.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error: { type: string }
+                  offerable:
+                    type: array
+                    items: { type: string }
+        "503":
+          description: >
+            No durable store is configured, or the write did not land. Not a
+            400: the request was well formed and the deployment cannot honour
+            it.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorBody" }
+    delete:
+      operationId: delete_secret
+      tags: [Identity]
+      summary: Go back to the deployment's own credential
+      description: >
+        Drops this caller's personal value for one name, so the shared one
+        applies to their next run again. Nothing shared is touched in either
+        direction.
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Dropped
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - type: object
+                    properties:
+                      cleared: { type: boolean }
+                  - $ref: "#/components/schemas/PersonalSecret"
+        "400":
+          description: Not a name this deployment reads.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error: { type: string }
+                  offerable:
+                    type: array
+                    items: { type: string }
+        "404":
+          description: >
+            This caller has no personal credential for that name — a different
+            answer from the 400 above, and a different mistake.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorBody" }
+        "503":
+          description: No durable store, or the write did not land.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorBody" }
+
   /api/v1/config:
     get:
       operationId: get_config
@@ -1395,18 +1838,35 @@ paths:
       description: >
         Scaffolds a new knowledge pack directory under knowledge.pack_dir
         using the built-in template. Returns 409 if a pack with the given
-        name already exists.
+        name already exists. Administrator only, and not because of a policy
+        choice: a new pack has no base to layer a draft over.
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [name]
+              required: [name, vocabulary]
               properties:
                 name:
                   type: string
                   description: Name for the new pack. Must be a valid directory name.
+                vocabulary:
+                  type: array
+                  items:
+                    type: string
+                  description: >
+                    The pack's domain words, written to
+                    domain_vocabulary.yaml. Required, and refused when empty:
+                    that file is what makes the engine provably domain-neutral,
+                    and the template ships without it because its placeholder
+                    words collide with its own example ruleset.
+                actor:
+                  type: string
+                  description: >
+                    Who to record as the author. Ignored wherever an identity
+                    was resolved from the ingress, since a durable decision may
+                    not be signed with somebody else's name.
       responses:
         "200":
           description: Pack created
@@ -1711,8 +2171,11 @@ paths:
       tags: [Knowledge]
       summary: Restore a file to a historical version
       description: >
-        Restores the named file to a specific historical version identified by
-        version ID. Returns 409 if the file is locked by an assist session.
+        Puts a snapshot's bytes back, snapshotting the current content first so
+        the undo is itself undoable. The restored content need not verify —
+        undo is most needed right after an edit went wrong — so the result
+        reports parses/parse_error rather than refusing. Returns 409 if the
+        file is locked by an assist session.
       parameters:
         - $ref: "#/components/parameters/pack"
       requestBody:
@@ -1721,14 +2184,22 @@ paths:
           application/json:
             schema:
               type: object
-              required: [path, version_id]
+              required: [snapshot]
               properties:
+                snapshot:
+                  type: string
+                  description: Snapshot id from the history listing.
                 path:
                   type: string
-                  description: Relative path within the pack.
-                version_id:
+                  description: >
+                    Relative path within the pack. Optional: the snapshot
+                    already names the file it was taken from, and this only
+                    overrides where the bytes land.
+                actor:
                   type: string
-                  description: Version identifier from the history listing.
+                  description: >
+                    Who to record as the author. Ignored wherever an identity
+                    was resolved from the ingress.
       responses:
         "200":
           description: File restored
@@ -2085,6 +2556,18 @@ components:
           schema:
             $ref: "#/components/schemas/ErrorBody"
 
+    Forbidden:
+      description: >
+        The request carries no identity the platform validated, or names an
+        identity that cannot be trusted, or asks for something restricted to an
+        administrator. 403 rather than 401 because there is no credential for
+        the caller to supply here — the ingress supplies it, so the remedy is
+        which URL they used.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorBody"
+
     Conflict:
       description: >
         The operation is not valid in the resource's current state (e.g. a
@@ -2156,6 +2639,66 @@ components:
 
   schemas:
 
+    OverlayFile:
+      type: object
+      description: One file a caller has their own version of.
+      properties:
+        path:
+          type: string
+          description: >
+            A config file name, or `<pack>/<path>` for a knowledge-pack file.
+        state:
+          type: string
+          enum: [clean, merged, conflict, adopted]
+        edited_at:
+          type: string
+          nullable: true
+        rebased_at:
+          type: string
+          nullable: true
+        conflict:
+          type: boolean
+          description: >
+            True when a rebase could not merge cleanly. The draft is kept with
+            conflict markers; losing an edit is worse than keeping one that no
+            longer applies.
+
+    PersonalSecret:
+      type: object
+      description: >
+        One offerable credential name and this caller's state on it. Carries no
+        value in any state: `fingerprint` is the first bytes of a SHA-256 digest,
+        which is enough to confirm a paste landed and to tell two credentials
+        apart, and is not the credential.
+      properties:
+        name:
+          type: string
+          description: The environment-variable name the readers resolve.
+        used_by:
+          type: array
+          items: { type: string }
+          description: >
+            Which subsystems this one name reaches. One name commonly backs
+            several at once, which is why the unit here is the name and not the
+            subsystem.
+        personal:
+          type: boolean
+          description: True when this caller has replaced it.
+        source:
+          type: string
+          enum: [personal, shared]
+        shared_configured:
+          type: boolean
+          description: >
+            Whether the deployment has a value of its own for this name — a
+            caller looking at an empty row needs to know whether there is
+            anything to fall back to.
+        fingerprint:
+          type: string
+          description: Empty unless this caller has a personal value.
+        updated_at:
+          type: string
+
     ErrorBody:
       type: object
       properties:
@@ -2191,7 +2734,18 @@ components:
             "not wired" as a failure is how an indicator stops being read.
         pack:
           type: boolean
-          description: Whether knowledge.pack_dir is configured.
+          nullable: true
+          description: >
+            Whether the knowledge pack LOADED, counted from its own contents - not
+            whether knowledge.pack_dir is set. An absent directory loads as an empty
+            pack with one log line, so the name is set either way. null no pack wired.
+        pack_detail:
+          type: string
+          nullable: true
+          description: >
+            The pack's name and its counted contents (entities, sources, rulesets,
+            playbooks), filled whether or not it loaded: a pack that loaded still has
+            to be read for the ruleset a verdict needs.
         jobs:
           type: integer
           nullable: true
@@ -2203,7 +2757,7 @@ components:
           description: Whether an incident-processing function is wired.
         storage:
           type: string
-          enum: [local, databricks, sql]
+          enum: [local, databricks, dbfs, sql]
           nullable: true
           description: Where durable state lives, or null if no store is wired.
         storage_ok:
@@ -2507,13 +3061,20 @@ components:
 
     IncidentInput:
       type: object
-      description: An incident submitted for processing.
+      additionalProperties: true
+      description: >
+        An incident submitted for processing. Understanding classifies and
+        extracts from whatever shape arrives, so the named properties below are
+        the ones the server itself reads and any others are carried through
+        untouched.
       properties:
-        incident_id:
+        id:
           type: string
           description: >
             Caller-supplied incident identifier. If absent the server assigns
-            one.
+            one. Note the spelling: the response field is incident_id, the
+            request field is id, and a body carrying incident_id gets a
+            server-assigned identifier instead of the one it named.
         title:
           type: string
           description: Short title for the incident.
@@ -2536,44 +3097,67 @@ components:
 
     FreetextIncidentInput:
       type: object
-      description: Free-text incident description for the freetext endpoint.
+      description: >
+        Free-text incident description for the freetext endpoint. The handler
+        reads these two keys and nothing else — an id and a timestamp are
+        assigned by the server, so a caller cannot name either here.
       properties:
-        text:
+        description:
           type: string
           description: Unstructured incident description text.
-        incident_id:
+        extended_retrieval:
+          type: boolean
+          description: >
+            Raise the per-source retrieval time budgets for this run. Bounds
+            seconds only — the row cap is a separate limit and is unchanged.
+      required: [description]
+
+    IrLookupRequest:
+      type: object
+      description: >
+        An incident-tracker record to look up and then run. Only the record id
+        is read: the description, the timestamp and the identifier all come
+        back from the tracker, so this body is not an IncidentInput.
+      properties:
+        id:
           type: string
-        timestamp:
-          type: string
-      required: [text]
+          description: The tracker record id (rnid).
+      required: [id]
 
     CreateJobRequest:
       type: object
-      description: Request body for creating a pipeline job.
+      description: >
+        Request body for creating a pipeline job. The body is FLAT — the
+        incident is its description and nothing else, unlike the classic
+        endpoints, which take a nested IncidentInput. A caller generating a
+        client from a nested shape here gets a 400 on every submission.
+      required: [description]
       properties:
-        incident:
-          $ref: "#/components/schemas/IncidentInput"
-          description: Incident to process. Required unless freetext is supplied.
-        freetext:
+        description:
           type: string
           description: >
-            Free-text incident description. Mutually exclusive with incident.
-        run_mode:
+            The incident text, in whatever shape it arrives in. Understanding
+            classifies and extracts from it, so no layout is required and none
+            is privileged.
+        mode:
           type: string
-          enum: [auto, semi_auto, supervised]
+          enum: [auto, semi_auto, supervised, step]
+          default: auto
           description: >
             Controls gate behaviour. auto runs without pausing; semi_auto
-            pauses at scored gate thresholds; supervised pauses at every stage.
-            Defaults to the server configuration value.
-        pack:
+            pauses at scored gate thresholds; supervised pauses at every
+            stage; step pauses before each one.
+        extended_retrieval:
+          type: boolean
+          description: >
+            Raise the per-source retrieval time budgets for this run. Bounds
+            seconds only — the row cap is a separate limit and is unchanged.
+        link_pin:
           type: string
           description: >
-            Knowledge pack to use. If absent, the server uses the loaded pack.
-        parent_job_id:
-          type: string
-          description: >
-            ID of the parent job when this job is a child investigation
-            spawned via a cross-procedure link referral.
+            Pin the adjudicating procedure by ruleset key, bypassing keyword
+            selection. An unresolvable name reads as nothing pinned, with a
+            warning, rather than as an error.
 
     CreateBatchRequest:
       type: object
@@ -3173,11 +3757,27 @@ components:
 
     FeedbackSubmission:
       type: object
-      description: Analyst feedback for a completed job.
+      description: >
+        Analyst feedback for a completed investigation, keyed on the INCIDENT
+        and not on the job: a resumed or retried run is several jobs over one
+        incident, and a review is about what was concluded. Beyond incident_id
+        the body must carry something substantive — human_feedback, or at least
+        one of the structured fields below — or it is refused, since an empty
+        review would be distilled into guidance saying nothing.
       properties:
+        incident_id:
+          type: string
+          description: ID of the incident the feedback relates to.
+        human_feedback:
+          description: >
+            Free-text review, the original shape. Any JSON is accepted, and it
+            satisfies the substantive-content requirement on its own.
         job_id:
           type: string
-          description: ID of the job the feedback relates to.
+          description: >
+            The particular job the review was read from, recorded alongside the
+            review. Does not identify the incident and does not substitute for
+            incident_id.
         agrees_with_verdict:
           type: boolean
           description: Whether the analyst agrees with the pipeline's verdict.
@@ -3200,7 +3800,16 @@ components:
         analyst:
           type: string
           description: Identifier of the submitting analyst.
-      required: [job_id]
+      required: [incident_id]
+      anyOf:
+        - required: [human_feedback]
+        - required: [agrees_with_verdict]
+        - required: [analyst_verdict]
+        - required: [missed_anomalies]
+        - required: [false_positives]
+        - required: [notes]
+        - required: [analyst]
+        - required: [job_id]
 
     FeedbackEntry:
       type: object

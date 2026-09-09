@@ -5,9 +5,41 @@ import re
 from abc import ABC, abstractmethod
 from typing import Dict, List
 
+import aiohttp
+
 from src.models.pydantic_models import RetrievalQuery
 
 logger = logging.getLogger(__name__)
+
+# A bearer token echoed back inside an error body: the reason is logged, the credential is not.
+_BEARER = re.compile(r"(?i)bearer\s+[A-Za-z0-9._\-]+")
+
+
+async def raise_for_status_with_reason(resp) -> None:
+    """``resp.raise_for_status()``, carrying the backend's own explanation in the message.
+
+    Same exception type and status, so retry classification and ``unanswered_out`` (which
+    records the TYPE) are unchanged — only the message grows. Without it every 4xx reads as
+    ``403, message='Forbidden'``, and an expired credential, a missing grant and a workspace
+    refusing the request's NETWORK are one indistinguishable string; each needs a different
+    person to fix it, so a run that hides which one it hit cannot be acted on.
+    """
+    if resp.status < 400:
+        return
+    try:
+        detail = _BEARER.sub("Bearer <redacted>", await resp.text())[:400]
+    except Exception:  # noqa: BLE001
+        # A body that cannot be read is not a reason to lose the status.
+        detail = ""
+    detail = " ".join(detail.split())
+    reason = resp.reason or ""
+    raise aiohttp.ClientResponseError(
+        resp.request_info,
+        resp.history,
+        status=resp.status,
+        message=(reason + ": " + detail) if detail else reason,
+        headers=resp.headers,
+    )
 
 # Quoted `'<...>'` placeholder left in a generated query. Wildcards allowed around it so
 # a LIKE template (`'<actor>%'`) is caught; `'%<script>%'` is ambiguous and also caught.

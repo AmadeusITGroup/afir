@@ -27,16 +27,40 @@ requests~=2.32.3          # the storage backend's Files API calls, off the event
 
 # Data sources
 elasticsearch~=8.14.0     # ES|QL retrieval
-snowflake-connector-python>=3.7   # snowflake retriever + knowledge source
 sshtunnel~=0.4.0          # optional SSH tunnel to a log source
 # ServiceNow / generic REST retrieval uses aiohttp (already core), and Databricks SQL goes
 # through the REST Statement Execution API. databricks-sdk is here for unified auth — a
 # PAT locally, the OAuth service principal in an App, one code path for both.
 databricks-sdk>=0.30
 
+# THE SNOWFLAKE DRIVER IS NOT INSTALLED BY DEFAULT — same arrangement as the local
+# embedding model below, and for a sharper reason. `snowflake-connector-python` requires
+# `boto3>=1.24`, and botocore's wheel is 15.7 MB: over the 10,485,760-byte per-file cap on
+# workspace-file import, so it cannot ride in the synced source that a no-egress Apps build
+# container installs from (app.yaml carries that measurement). It is the ONE wheel in the
+# closure that does not fit, and dropping it is what makes the other 65 shippable — a
+# 4-year-old botocore pin is the only version that would, and it constrains urllib3<1.27
+# against elasticsearch and requests.
+#
+# `SnowflakeRetriever._connect` imports the driver inside the method, so a pack with no
+# Snowflake source never reaches it and a pack that configures one fails at retrieval with
+# ImportError rather than at boot. Install it wherever a Snowflake backend is real:
+#
+#     pip install 'snowflake-connector-python>=3.7'
+#
+# (It is in `requirements-dev.txt`, so the suite and a laptop are unchanged.)
+
 # LLM and embeddings, both OpenAI-compatible (OpenAI, Databricks Model Serving, or any
 # compatible endpoint)
-openai>=1.50
+#
+# THE UPPER BOUND IS THE TESTED GENERATION, not caution. openai 3.x vendors
+# `httpx_aiohttp`, whose transport module reads `aiohttp.SocketTimeoutError` at import —
+# added in aiohttp 3.10, and this file pins `aiohttp~=3.9.5`. The crash is therefore at
+# IMPORT of `src/utils/llm_client.py`, before any config is read: `AttributeError: module
+# aiohttp has no attribute SocketTimeoutError`, which names aiohttp for a constraint openai
+# introduced. Measured on Apps deployment 01f1a5599b…; the suite's 3540 passes are against
+# openai 2.43.0. Raising this means raising aiohttp with it, under the server's own tests.
+openai>=1.50,<3
 
 # Vector search over whatever the embedding provider returns.
 #

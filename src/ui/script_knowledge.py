@@ -50,6 +50,7 @@ let pkAssistSession = "";
 let pkPlan = null;
 let pkPreview = null;
 let pkTrail = [];
+let pkProbes = [];
 let pkEdited = false;
 let pkEs = null;
 
@@ -179,6 +180,16 @@ function renderPackCounts(){
 }
 
 /* ---- opening and saving one file ---- */
+/* Which copy of this file is on screen. Not cosmetic: a draft and the shared version have the
+   same path and the same editor, so without it a caller reading their own text believes they are
+   reading what runs. `in_base === false` is the further case — a file that exists only as their
+   draft, which an administrator has never seen. */
+function draftSuffix(d){
+  if(!d || d.layer !== true) return "";
+  return " · your draft" + (d.state && d.state !== "clean" ? " (" + d.state + ")" : "")
+       + (d.in_base === false ? " · not in the shared pack" : "");
+}
+
 async function openPackFile(path){
   if(!confirmDiscard()) return;
   setText("pkStatus", "opening…");
@@ -193,7 +204,8 @@ async function openPackFile(path){
     pkFile.editable = editable;
     el("pkEditor").value = pkBaseline;
     el("pkEditor").readOnly = !editable;
-    setText("pkFileMeta", d.path+" · "+d.kind+" · "+fmtBytes(d.bytes)+" · "+d.lines+" lines");
+    setText("pkFileMeta", d.path+" · "+d.kind+" · "+fmtBytes(d.bytes)+" · "+d.lines+" lines"
+                          + draftSuffix(d));
     /* A file over the inline limit is shown, not hidden — but it must not be saveable from
        here. Round-tripping a few hundred kilobytes through a text area is how one gets
        truncated, and the file it would truncate is generated inventory nobody retypes. */
@@ -300,7 +312,13 @@ function packRefusal(status, d){
      but did not reach durable storage, so a restart discards them. Strictly worse than a
      refusal, because it looks exactly like a save until the restart — hence "err", not a
      warning. Absent means there is nothing to be durable ABOUT (a local deployment writes
-     straight to the durable copy), so it is not a state to report.  */
+     straight to the durable copy), so it is not a state to report;
+   * `layer === true`, WHERE the write landed — a draft of this caller's own, durable and
+     merged forward but with no effect on what a run does, which no status code says. And a
+     layered write's diagnostics are stamped `validate_scope: "base"`: they describe the files
+     on disk, so reported as they are for a base write they would read as a verdict on the text
+     just saved. Hence a different sentence and a warning rather than an error — the shared
+     pack's errors are not this draft's fault and are not this caller's to fix.  */
 function applyPackWrite(d, note){
   if(d.validate){
     pkDoc = pkDoc || {};
@@ -308,12 +326,19 @@ function applyPackWrite(d, note){
   }
   const v = d.validate || {};
   const lost = d.durable === false;
-  packResult(lost ? "err" : (v.errors ? "err" : (v.warnings ? "warn" : "ok")),
+  const baseScope = d.layer === true && d.validate_scope === "base";
+  const vClause = baseScope
+    ? (v.errors ? " · the shared pack has " + v.errors + " error(s) — your draft was checked against that, not as saved"
+       : (v.warnings ? " · the shared pack has " + v.warnings + " warning(s)" : ""))
+    : (v.errors ? " · the pack now has " + v.errors + " error(s) — see Check"
+       : (v.warnings ? " · " + v.warnings + " warning(s)" : ""));
+  const scope = writeScopeNote(d);
+  packResult(lost ? "err" : (v.errors ? (baseScope ? "warn" : "err") : (v.warnings ? "warn" : "ok")),
     esc(note)
     + (lost ? " · <strong>NOT saved durably</strong> — in effect now, lost on restart" : "")
     + (d.restart_required ? " · <strong>restart required</strong> to use it" : "")
-    + (v.errors ? " · the pack now has " + v.errors + " error(s) — see Check" :
-       (v.warnings ? " · " + v.warnings + " warning(s)" : "")));
+    + (scope ? " · " + scope : "")
+    + vClause);
   loadPack();
   pkDirty();
 }
@@ -764,6 +789,7 @@ async function loadAssistSession(){
     pkPlan = d.plan;
     pkPreview = d.preview;
     pkTrail = (d.trail||[]).map(t => ({type:"assist_tool", tool:t.tool, args:t.args, bytes:t.bytes}));
+    pkProbes = d.probes || [];
     renderAssistTrail();
     renderAssistModes(d);
     renderProposal();
@@ -789,11 +815,36 @@ function renderAssistModes(d){
   if(refused) setText("pkImageMode", "this endpoint cannot read images — attached images were NOT seen");
 }
 
+/* The measurements this session took, above the diff and not beside the trail.
+
+   The trail answers "what did it read"; this answers "what did it measure", and only the
+   second is provenance for a number in the ops below. Rendered in full — the whole
+   measurement, not a byte count — because that is the difference between a threshold an
+   operator can re-check and one they have to take on trust. A measurement that FAILED or
+   timed out is shown identically and on purpose: the assistant is required to fall back to a
+   question rather than a value, so a failed probe beside a proposed number is the one thing
+   worth looking for here. Nothing is rendered when nothing was measured, which is every
+   session that only read files. */
+function renderAssistProbes(){
+  if(!pkProbes.length) return "";
+  const rows = pkProbes.map(m => {
+    const args = m.args ? JSON.stringify(m.args) : "";
+    return '<details class="raw"><summary>'+esc((m.op||"")+" · "+(m.source||""))
+      + ' · '+esc(String(m.elapsed_s||0))+'s · '+esc(args)
+      + '</summary><pre class="mono">'+esc(m.result||"")+'</pre></details>';
+  });
+  return '<div class="banner">'+pkProbes.length+' live measurement(s) taken for this '
+    + 'proposal — every number below that came from one is re-checkable against it, and '
+    + 'anything that could NOT be measured must appear as a question rather than a value.'
+    + '</div>' + rows.join("");
+}
+
 function renderProposal(){
   const p = pkPreview;
   if(!p){ el("pkProposal").innerHTML = ""; show("pkProposalBar", false); return; }
   const blocked = (p.errors||[]).length;
   const parts = ['<div class="banner'+(blocked?" err":"")+'">'+esc(p.summary||"no summary")+'</div>'];
+  parts.push(renderAssistProbes());
   (p.questions||[]).forEach(q => {
     /* Surfaced prominently and on purpose: a question is the assistant saying it could
        not determine something. The alternative is a confident-looking op built on a
@@ -824,9 +875,11 @@ function renderProposal(){
     ((p.ops||[]).length + " file(s) will change · a restart is needed to use them"));
 }
 
-/* What the plan would do to the pack, measured on a candidate tree the server built. Two
-   readings, and neither is a substitute for the other: the validation delta says whether the
-   pack still loads, the dry run says whether the conditions would ever answer anything.
+/* What the plan would do to the pack, measured on a candidate tree the server built. Four
+   readings, and none is a substitute for another: the validation delta says whether the pack
+   still loads, the dry run says whether the conditions would ever answer anything, the
+   selection delta says which procedure would adjudicate, and the verdict delta says what any
+   of it does to the findings of the runs already on record.
 
    A check that did NOT run is rendered as a warning and never as silence. "No problems shown"
    and "nothing was measured" look identical otherwise, and the second is the one that lets a
@@ -862,6 +915,59 @@ function renderPlanChecks(c){
       + scope + ' · ' + d.runs_replayed + ' of ' + d.runs_available + ' run(s)'
       + (d.exercised ? '' : ' · NOTHING WAS EXERCISED')
       + '</summary><pre class="mono">'+esc(d.text||"")+'</pre></details>');
+  }
+  /* The third reading, and the only one that looks OUTSIDE the candidate pack: which
+     procedure each past incident would now be adjudicated by. A flip is usually the point of
+     the edit, so this gates nothing — it is the edit's blast radius.
+
+     An unmoved vocabulary is a PROOF and not an absence, so it renders as a plain statusline
+     while every other not-compared reason renders as a warning. The score is a function of
+     the titles and join keys alone, so identical ones cannot move a selection; "no corpus" or
+     "the pack would not load" mean nobody looked, which is the one that must not read as a
+     clean bill. */
+  if(c.selection_delta){
+    const s = c.selection_delta;
+    if(!s.compared){
+      const proven = !(s.vocabulary_changed||[]).length;
+      parts.push('<div class="diag '+(proven ? 'info' : 'warning')+'">'
+        + '<span class="diagsev">'+(proven ? 'unmoved' : 'not compared')+'</span>'
+        + '<span class="diagdetail">procedure selection: '
+        + esc(s.reason||"no reason given")+'</span></div>');
+    } else {
+      const flipped = (s.flips||[]).length + (s.flips_cut||0);
+      const lost = (s.flips||[]).filter(f => f.lost_recognition).length;
+      parts.push('<details class="raw"><summary>procedure selection · '
+        + flipped + ' of ' + s.scored + ' stored incident(s) select a different procedure'
+        + (lost ? ' · ' + lost + ' LOSE recognition' : '')
+        + '</summary><pre class="mono">'+esc(s.text||"")+'</pre></details>');
+    }
+  }
+  /* The fourth reading, and the only one about what the edit does to a FINDING: the same
+     stored evidence re-adjudicated under both packs, condition line by condition line. The
+     three above can all pass while a threshold moved by one changes what a report concludes
+     about a named person's conduct.
+
+     Same proof-versus-absence split as the selection delta, on this check's own surface: an
+     edit touching no ruleset spec, entity binding or data file cannot move a verdict, so
+     that renders `info`; every other not-compared reason means nobody looked. A determination
+     that became a different determination is called out separately from one that went quiet —
+     the second is a check that stopped answering, which is a different thing to act on. */
+  if(c.verdict_delta){
+    const v = c.verdict_delta;
+    if(!v.compared){
+      const proven = !(v.surface_changed||[]).length;
+      parts.push('<div class="diag '+(proven ? 'info' : 'warning')+'">'
+        + '<span class="diagsev">'+(proven ? 'unmoved' : 'not compared')+'</span>'
+        + '<span class="diagdetail">past findings: '
+        + esc(v.reason||"no reason given")+'</span></div>');
+    } else {
+      const moved = (v.changes||[]).length + (v.changes_cut||0);
+      parts.push('<details class="raw"><summary>past findings · '
+        + v.runs_changed + ' of ' + v.replayed + ' re-adjudicated run(s) read differently'
+        + (moved ? ' · ' + moved + ' line(s)' : '')
+        + (v.decided_flips ? ' · ' + v.decided_flips + ' DETERMINATION(S) CHANGED' : '')
+        + '</summary><pre class="mono">'+esc(v.text||"")+'</pre></details>');
+    }
   }
   return parts.join("");
 }

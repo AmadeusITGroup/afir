@@ -930,8 +930,8 @@ def test_the_ladder_measures_the_pack_not_the_renderers_own_clip():
 
     Its gates called `len(render_for_prompt(pack))` with no budget argument, so the
     renderer applied its DEFAULT budget and hard-clipped first: the length returned was
-    `min(true_length, _DEFAULT_CHAR_BUDGET)`, and the shipped
-    `correlation.evidence_char_budget` is exactly that default. Every gate compared
+    `min(true_length, _DEFAULT_CHAR_BUDGET)`, and the then-shipped
+    `correlation.evidence_char_budget` was exactly that default. Every gate compared
     `15000 <= 15000` and returned satisfied, making the whole ladder a no-op at the only
     budget anyone runs. Measured on job 4da14f65: a 21,828-char pack reported itself as
     fitting, `degraded` stayed False and the tail clip ate 5 of 9 sources in silence.

@@ -95,6 +95,15 @@ Both are pack-agnostic and go through the retrievers a real run builds. `pack_pr
 first, always: a *declared* source that built no retriever cannot answer anything, and that is
 not a fact about the data. Details and the four probe rules in `probing-live-data`.
 
+**If you are running as the pack assistant you can take these measurements yourself**: the
+`probe` tool is the same library, one `op` per row of that table, read-only at the seam. The
+budget is a handful of measurements for the whole session, so spend it on the value you are
+about to write down rather than on orientation — `read_file` and `search` are free. Three
+answers are *not* measurements and must never become one: a refusal, a failure and a timeout.
+Each of those leaves you exactly where you were without the tool, which is a `questions` entry
+naming the measurement to run. The one thing that must not happen is a number you did not
+measure appearing in an approved diff, where it is indistinguishable from one you did.
+
 ## Prefer the smallest edit
 
 Pack files are heavily commented and use YAML anchors, and both are load-bearing: the comment

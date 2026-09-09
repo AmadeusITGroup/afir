@@ -20,6 +20,7 @@ import yaml
 
 from src import config_store, report_delivery
 from src.main import _expand_env
+from src.storage import PrefixedStorage
 from src.utils.paths import REPO_ROOT
 
 
@@ -43,7 +44,7 @@ def cfg_dir(tmp_path, monkeypatch):
     )
     (tmp_path / "llm_config.yaml").write_text(
         "base_url: https://example.test/serving-endpoints\n"
-        "model: claude-opus-5\n"
+        "model: reasoning-endpoint\n"
         "api_key: sk-real-secret-value\n"
         "api_key_env: LLM_API_KEY\n"
         "temperature: 0.2\n"
@@ -347,9 +348,11 @@ def test_where_durable_state_lives_is_editable_from_the_config_surface():
         "storage.databricks.host",
         "storage.databricks.token_env",
         "storage.databricks.verify_ssl",
-        # All four destinations must be reachable from the form: `root` is how a mounted or
-        # external volume is chosen, and the `sql.*` trio is the database.
+        # Every destination must be reachable from the form: `root` is how a mounted or
+        # external volume is chosen, `dbfs.root` the workspace path that needs no UC grant,
+        # and the `sql.*` trio is the database.
         "storage.root",
+        "storage.dbfs.root",
         "storage.sql.dialect",
         "storage.sql.dsn_env",
         "storage.sql.table",
@@ -359,7 +362,18 @@ def test_where_durable_state_lives_is_editable_from_the_config_surface():
     # Every closed set selects behaviour, so a typo must be refused by the form rather than
     # resolved by the loader: an unrecognised backend silently reading as `local` is the
     # whole class of bug the mirror exists to prevent, arriving through the switch itself.
-    assert set(fields["storage.backend"].choices) == {"local", "databricks", "sql"}
+    assert set(fields["storage.backend"].choices) == {
+        "local",
+        "databricks",
+        "dbfs",
+        "sql",
+    }
+    # DBFS declares its DESTINATION and inherits the CONNECTION, so the two Databricks
+    # backends are one edit apart. A second host/token pair here would be a second thing to
+    # keep in step, and the one that stops being maintained is the one nobody is using —
+    # i.e. whichever the deployment switches to.
+    assert "storage.dbfs.host" not in fields
+    assert "storage.dbfs.token_env" not in fields
     assert set(fields["storage.mirror_config_and_pack"].choices) == {
         "auto",
         "always",
@@ -589,6 +603,40 @@ def test_the_two_output_budgets_that_fail_as_schema_errors_are_editable():
         assert config_store.FIELDS[path].applies == "restart", path
 
 
+def test_the_shipped_template_carries_a_real_identity_block(tmp_path, monkeypatch):
+    """Same rule as the storage block, and one extra: the two lists are SCALARS.
+
+    `patch_text` refuses a key that holds a block rather than orphaning its children, so an
+    administrator list shipped as a YAML sequence would be permanently unpatchable from the
+    form that offers it. Comma-separated is therefore the shipped shape, and
+    `src.identity` reads either — asserted in `test_identity.py`.
+    """
+    template = (REPO_ROOT / "config" / "templates" / "main_config.yaml").read_text()
+    monkeypatch.setattr(config_store, "config_dir", lambda: tmp_path)
+    (tmp_path / "main_config.yaml").write_text(template)
+
+    shipped = yaml.safe_load(template)["identity"]
+    # `auto` is the only default that leaves a laptop, a VM and an App Service exactly as
+    # they were: no ingress identity, one local administrator, nothing segregated.
+    assert shipped["mode"] == "auto"
+    assert shipped["admin_groups"] == "" and shipped["admin_users"] == ""
+    assert shipped["workspace_host"] == ""  # falls back to `databricks.host`
+    assert shipped["allow_self_elevation"] is True
+
+    report = config_store.apply_updates(
+        {
+            "identity.mode": "on",
+            "identity.admin_users": "someone@example.test, other@example.test",
+            "identity.validation_ttl_seconds": 60,
+        }
+    )
+    assert not report["skipped"], report["skipped"]
+    written = yaml.safe_load((tmp_path / "main_config.yaml").read_text())["identity"]
+    assert written["mode"] == "on"
+    assert written["admin_users"] == "someone@example.test, other@example.test"
+    assert written["validation_ttl_seconds"] == 60
+
+
 def test_the_shipped_template_carries_a_real_storage_block(tmp_path, monkeypatch):
     """A form cannot offer a field the file never mentions, so the block must be real.
 
@@ -693,6 +741,125 @@ def test_replace_file_rejects_unparsable_and_non_mapping_yaml(cfg_dir):
     with pytest.raises(ValueError, match="unknown"):
         config_store.replace_file("../../etc/passwd", "x: 1\n")
     assert (cfg_dir / "llm_config.yaml").read_text() == before
+
+
+# The three primitives a caller holding its OWN copy of a config file goes through.
+# `apply_updates` and `replace_file` write the shared tree; these three were split out of
+# them so a per-caller draft is patched and validated by the same code, and each carries a
+# guarantee that only shows up when the destination is not `config_dir()`.
+
+
+def test_patching_a_callers_own_copy_never_touches_the_file_on_disk(cfg_dir):
+    """`patch_text` is text in, text out — that is the whole reason it exists separately.
+
+    A draft is patched by handing in the draft's own text, so the two facts asserted here are
+    what make a layered write a draft rather than a write: the shared file is byte-identical
+    afterwards (no ``.bak`` either, since nothing was written), and ``from`` is read off the
+    text that was handed in — which is what lets a second edit build on the first instead of
+    silently forking from the base again.
+    """
+    on_disk = (cfg_dir / "main_config.yaml").read_text()
+    draft = on_disk.replace("threshold: 0.8", "threshold: 0.4")
+
+    new_text, changed, skipped = config_store.patch_text(
+        draft, "main_config.yaml", {"anomaly_detection.threshold": 0.55}
+    )
+
+    assert not skipped, skipped
+    assert [(c["path"], c["from"], c["to"]) for c in changed] == [
+        ("anomaly_detection.threshold", "0.4", "0.55")
+    ]
+    assert "threshold: 0.55" in new_text
+    assert (cfg_dir / "main_config.yaml").read_text() == on_disk
+    assert not (cfg_dir / "main_config.yaml.bak").exists()
+    # The `live`/`restart` tag comes from the field and not from the destination, which is
+    # what `#cfgDraftNote` tells a non-administrator: the tag describes the shared version.
+    assert changed[0]["applies"] == config_store.FIELDS["anomaly_detection.threshold"].applies
+
+
+def test_a_draft_that_would_not_parse_is_refused_rather_than_stored(cfg_dir):
+    """The refusal has to be here, because a layer's own text is the next merge's fork point.
+
+    `apply_updates` never writes unparsable YAML; a draft writer bypasses it entirely, so a
+    patcher bug would be stored and then merged forward — and the caller reads their draft
+    back through a YAML load, so it would come back as an empty document rather than as an
+    error. Raising is the only outcome that reaches the caller as a 400.
+    """
+    broken = "anomaly_detection:\n  threshold: 0.8\n  stray: [unclosed\n"
+    with pytest.raises(ValueError, match="main_config.yaml"):
+        config_store.patch_text(
+            broken, "main_config.yaml", {"anomaly_detection.threshold": 0.5}
+        )
+
+
+def test_group_by_file_is_what_keeps_a_key_out_of_the_wrong_draft(cfg_dir):
+    """The split is total, exact, and the ONLY thing checking a path against its file.
+
+    `patch_text` takes text and a name, so it cannot tell that the text it was handed is the
+    wrong file — an absent key is *inserted*, which is the second half asserted here. That
+    makes the routing load-bearing rather than a convenience: one draft blob per file, and a
+    misrouted path would land as a brand-new top-level key in somebody's other draft.
+    """
+    updates = {
+        "anomaly_detection.threshold": 0.5,
+        "identity.mode": "auto",
+        "temperature": 0.3,
+        "thinking_by_stage.correlation.mode": "adaptive",
+    }
+    grouped = config_store.group_by_file(updates)
+
+    assert set(grouped) == {"main_config.yaml", "llm_config.yaml"}
+    assert set(grouped["main_config.yaml"]) == {
+        "anomaly_detection.threshold",
+        "identity.mode",
+    }
+    assert set(grouped["llm_config.yaml"]) == {
+        "temperature",
+        "thinking_by_stage.correlation.mode",
+    }
+    # Every path lands under the file its own descriptor names, so the grouping cannot drop
+    # one: a dropped path reports neither `changed` nor `skipped`, which reads as a no-op.
+    assert sum(len(items) for items in grouped.values()) == len(updates)
+    for name, items in grouped.items():
+        for path in items:
+            assert config_store.FIELDS[path].file == name
+
+    # The misroute `group_by_file` is the only guard against.
+    misrouted, changed, _ = config_store.patch_text(
+        (cfg_dir / "main_config.yaml").read_text(), "main_config.yaml", {"temperature": 0.3}
+    )
+    assert changed[0]["inserted"] is True
+    assert "temperature: 0.3" in misrouted
+
+
+def test_validate_replacement_enforces_the_three_rules_without_writing(cfg_dir):
+    """A caller's own whole-file save is gated by exactly what `replace_file` is gated by.
+
+    Split out so a draft cannot hold YAML the shared tree would have refused — otherwise the
+    refusal arrives at whoever promotes the draft, who did not write the mistake. All three
+    rules are asserted here rather than through `replace_file`, because this is the entry
+    point a draft takes and it must reach none of the write path: no file changes, no
+    ``.bak``, and the parse is handed back so the caller need not load the text twice.
+    """
+    before = (cfg_dir / "llm_config.yaml").read_text()
+
+    with pytest.raises(ValueError, match="unknown"):
+        config_store.validate_replacement("../../etc/passwd", "x: 1\n")
+    with pytest.raises(ValueError, match=config_store.REDACTED):
+        config_store.validate_replacement(
+            "llm_config.yaml", f"api_key: {config_store.REDACTED}\n"
+        )
+    with pytest.raises(ValueError, match="invalid YAML"):
+        config_store.validate_replacement("llm_config.yaml", "key: [unclosed\n")
+    with pytest.raises(ValueError, match="mapping"):
+        config_store.validate_replacement("llm_config.yaml", "- a\n- list\n")
+
+    assert config_store.validate_replacement("llm_config.yaml", "model: m\n") == {"model": "m"}
+    # An empty file parses to None and is allowed: a draft may legitimately blank a file the
+    # base fills in, and the caller reads a `None` back rather than a refusal.
+    assert config_store.validate_replacement("llm_config.yaml", "") is None
+    assert (cfg_dir / "llm_config.yaml").read_text() == before
+    assert not (cfg_dir / "llm_config.yaml.bak").exists()
 
 
 # report_delivery — artifact paths
@@ -802,6 +969,150 @@ def test_artifact_inventory_reports_real_sizes(exports):
 def test_resolve_report_rejects_an_unknown_format(exports):
     with pytest.raises(ValueError):
         report_delivery.resolve_report("INC1", "docx")
+
+
+# report_delivery — the owner scope, which is a READ decision the write side already took
+
+
+@pytest.fixture
+def owned_exports(exports):
+    """One unowned incident at the shared root and one owned under ``users/<segment>/``.
+
+    The exact layout ``identity.owner_scoped`` produces, because the defect this fixture
+    exists for is that the write side is scoped and the read side was not: a per-caller
+    deployment wrote every report into the subtree and every reader resolved the root.
+    """
+    (exports / "fraud_report_SHARED.md").write_text("# shared\n")
+    (exports / "evidence_raw_SHARED.json").write_text('{"s": []}\n')
+    own = exports / "users" / "1234567890123456"
+    own.mkdir(parents=True)
+    (own / "fraud_report_OWNED.md").write_text("# owned\n")
+    (own / "fraud_report_OWNED.pdf").write_bytes(b"%PDF-1.4\n")
+    (own / "evidence_raw_OWNED.json").write_text('{"src": [{"a": 1}]}\n')
+    other = exports / "users" / "9999999999999999"
+    other.mkdir(parents=True)
+    (other / "fraud_report_STRANGER.md").write_text("# not yours\n")
+    (other / "evidence_raw_STRANGER.json").write_text('{"s": []}\n')
+    return exports
+
+
+MINE = "1234567890123456"
+
+
+def test_an_owned_report_is_unreachable_without_its_owner_and_served_with_it(
+    owned_exports,
+):
+    """The live defect, both directions in one test.
+
+    Every report a per-caller deployment produced 404'd through the API and the UI while
+    the Report tab listed it with a byte count — the report is the acceptance artifact, so
+    an unreachable one is the whole deliverable lost. Passing no segment must still fail,
+    or the fix is "search everything" and the segregation goes with it.
+    """
+    assert report_delivery.read_markdown("OWNED") is None
+    body, ctype, name = report_delivery.resolve_report("OWNED", "md", owners=[MINE])
+    assert body == b"# owned\n" and ctype == "text/markdown"
+    assert name == "fraud_report_OWNED.md"
+    assert report_delivery.read_pdf("OWNED", [MINE]) == b"%PDF-1.4\n"
+    data, _ct, _fn = report_delivery.resolve_evidence("OWNED", "raw", owners=[MINE])
+    assert b'"src"' in data
+    assert report_delivery.evidence_outline("OWNED", "raw", owners=[MINE])["groups"]
+
+
+def test_the_shared_root_is_read_first_and_needs_no_segment(owned_exports):
+    """A deployment that resolves no identity must read exactly what it read before.
+
+    Asserted as the unowned artifact resolving with an empty ``owners`` — the argument
+    defaults to it everywhere, so this is also what every pre-identity caller does.
+    """
+    assert report_delivery.read_markdown("SHARED") == "# shared\n"
+    body, _ct, _fn = report_delivery.resolve_report("SHARED", "md")
+    assert body == b"# shared\n"
+    assert report_delivery.resolve_evidence("SHARED", "raw")[0]
+
+
+def test_another_callers_artifact_is_never_reachable(owned_exports):
+    """The direction the fix must not widen. A segment nobody passed is never searched."""
+    for owners in ((), [MINE]):
+        assert report_delivery.read_markdown("STRANGER", owners) is None
+        with pytest.raises(FileNotFoundError):
+            report_delivery.resolve_report("STRANGER", "md", owners=owners)
+        with pytest.raises(FileNotFoundError):
+            report_delivery.resolve_evidence("STRANGER", "raw", owners=owners)
+
+
+def test_the_inventory_agrees_with_the_download_in_both_scopes(owned_exports):
+    """The button and the link must resolve the same way, by construction.
+
+    This is the half that made the defect invisible: the inventory matched the artifact's
+    BASENAME over a recursive walk, so it reported real byte counts for a file the reader
+    beside it could not open — and for other callers' files too. Its docstring already
+    promised the opposite: a greyed-out button is more accurate than a link that fails.
+    """
+    scoped = report_delivery.artifact_inventory("OWNED", owners=[MINE])["artifacts"]
+    assert scoped["report_md"]["exists"] is True
+    assert scoped["report_md"]["bytes"] == len("# owned\n")
+    assert scoped["evidence_transformed"]["exists"] is False
+
+    unscoped = report_delivery.artifact_inventory("OWNED")["artifacts"]
+    assert unscoped["report_md"]["exists"] is False
+    assert unscoped["report_md"]["bytes"] == 0
+
+    stranger = report_delivery.artifact_inventory("STRANGER", owners=[MINE])["artifacts"]
+    assert stranger["report_md"]["exists"] is False
+
+
+def test_the_incident_list_shows_the_shared_root_and_only_the_callers_own_subtree(
+    owned_exports,
+):
+    """A row here is an ID, which is the one thing a caller with no claim must not learn —
+    the same rule ``_lookup_job`` answers 404 for. The recursive walk leaked every
+    caller's incidents into every caller's Report tab."""
+    ids = {r["incident_id"] for r in report_delivery.list_incidents()}
+    assert ids == {"SHARED"}
+    ids = {r["incident_id"] for r in report_delivery.list_incidents(owners=[MINE])}
+    assert ids == {"SHARED", "OWNED"}
+    assert "STRANGER" not in ids
+    row = next(
+        r for r in report_delivery.list_incidents(owners=[MINE])
+        if r["incident_id"] == "OWNED"
+    )
+    assert row["has_report"] and row["has_pdf"]
+
+
+def test_owner_segments_enumerates_the_subtrees_and_nothing_else(owned_exports):
+    """The administrator's own scope on the incident-keyed routes, where there is no run in
+    hand to take an owner from. ``list_keys`` answers ROOT-relative keys whatever prefix it
+    is given, so reading its first path segment returns the literal ``users`` every time and
+    resolves to no segment at all — which is a silent 404 on every artifact."""
+    # Sorted, so the search order does not depend on the backend's listing order.
+    assert report_delivery.owner_segments() == [MINE, "9999999999999999"]
+
+
+def test_owner_segments_is_empty_where_nothing_is_owned(exports):
+    (exports / "fraud_report_SHARED.md").write_text("# shared\n")
+    assert report_delivery.owner_segments() == []
+
+
+def test_the_shared_listing_holds_no_owner_subtree_and_an_owners_holds_its_own(owned_exports):
+    """Asserted on the helper, because the two lister tests above cannot discriminate.
+
+    Two independent mechanisms keep another caller's artifact out of a listing — this
+    filter, and matching the ROOT-RELATIVE key rather than the basename — so either one
+    alone satisfies every route-level assertion and neither mutation kills one. Here the
+    filter's own contract is the claim: a recursive walk of the shared root returns every
+    owner subtree under it, and none of those belongs to whoever is listing.
+    """
+    backend = report_delivery._backend()
+    shared = dict(report_delivery._own_keys(backend, shared=True))
+    assert shared.keys() == {"fraud_report_SHARED.md", "evidence_raw_SHARED.json"}
+
+    own = PrefixedStorage(backend, f"users/{MINE}")
+    assert dict(report_delivery._own_keys(own, shared=False)).keys() == {
+        "fraud_report_OWNED.md",
+        "fraud_report_OWNED.pdf",
+        "evidence_raw_OWNED.json",
+    }
 
 
 def test_evidence_outline_bounds_the_preview_and_says_so(exports):
@@ -937,7 +1248,7 @@ def test_a_stage_thinking_block_is_created_when_the_file_has_no_such_key(cfg_dir
 
 
 def test_the_form_refuses_the_spelling_the_endpoint_rejects(cfg_dir):
-    """`enabled` is the Anthropic API's word for this and Databricks-served Opus 5 answers
+    """`enabled` is the vendor API's word for this and the Databricks-served model answers
     400 to it. The dropdown cannot offer it, and a PUT naming it must be refused rather than
     written and discovered on the next run."""
     _, errors = config_store.validate_updates(

@@ -1,7 +1,12 @@
-"""Retriever for an ES cluster reachable only through a Kibana gateway.
+"""Retriever for an ES cluster asked in Query DSL rather than ES|QL.
 
-Raw ES paths and ES|QL are blocked; ``POST /internal/search/es`` proxies Query DSL.
-Fields are discovered by sampling ``_source`` keys (field-caps is 404 here).
+Two ways in, chosen by ``gateway`` and differing only in ``_search``: through a Kibana
+gateway (``kibana``), where raw ES paths and ES|QL are blocked and ``POST
+/internal/search/es`` is the one proxy for DSL, or straight at a data node (``node``),
+where the network reaches 9200 but Kibana's own port does not. Everything else — schema
+sampling, the guards, the row cap — is the same, because the query language is the same.
+
+Fields are discovered by sampling ``_source`` keys (field-caps is 404 behind the gateway).
 The retriever, never the LLM, injects ``size``.
 """
 
@@ -14,7 +19,7 @@ import aiohttp
 
 from src.human_guidance import guidance_prompt_line
 from src.models.pydantic_models import EsQueryDsl, RetrievalQuery
-from src.retrievers.base import DataRetriever, publish_query
+from src.retrievers.base import (DataRetriever, publish_query, raise_for_status_with_reason)
 from src.retrievers.field_mapping import (event_time_column,
                                           form_split_bindings, incident_values,
                                           key_presence_values, map_entities,
@@ -54,6 +59,9 @@ _KIBANA_HEADERS = {
     "x-elastic-internal-origin": "Kibana",
     "Content-Type": "application/json",
 }
+# Node-direct: the two above are Kibana's, and ``x-elastic-internal-origin`` is what ES reads
+# to relax system-index restrictions — not ours to claim when we are the client.
+_NODE_HEADERS = {"Content-Type": "application/json"}
 # Per-index sample: coverage comes from the bucket count, not the per-index size.
 _SCHEMA_DOCS_PER_INDEX = 3
 _SCHEMA_INDEX_BUCKETS = 40
@@ -73,6 +81,9 @@ class KibanaRetriever(DataRetriever):
         self.last_generated_query = None
         self.last_field_map = None
         self.base_url = (config.get("url") or "").rstrip("/")
+        # How the cluster is addressed — see ``_search``. Defaults to the gateway, which is
+        # what every caller meant before a node-direct route existed.
+        self.gateway = config.get("gateway") or "kibana"
         self.index = config["index"]
         self.max_results = config.get("max_results", 500)
         self.timeout = config.get("timeout", 30)
@@ -116,7 +127,7 @@ class KibanaRetriever(DataRetriever):
                 aiohttp.TCPConnector(ssl=ssl_ctx) if ssl_ctx is not None else None
             )
             self._session = aiohttp.ClientSession(
-                headers=_KIBANA_HEADERS,
+                headers=_KIBANA_HEADERS if self.gateway == "kibana" else _NODE_HEADERS,
                 auth=auth,
                 connector=connector,
                 timeout=aiohttp.ClientTimeout(total=self.timeout),
@@ -124,11 +135,23 @@ class KibanaRetriever(DataRetriever):
         return self._session
 
     async def _search(self, body: Dict) -> Dict:
-        """POST a Query-DSL body through Kibana's Discover backend, return rawResponse."""
-        url = f"{self.base_url}/internal/search/es"
-        payload = {"params": {"index": self.index, "body": body}}
+        """POST a Query-DSL body and return the ES response.
+
+        Two addressings, one query language — which is the whole reason a node-direct route
+        lives here rather than in the ES|QL retriever: switching retrievers would switch
+        query languages and invalidate every pack ``query_hints`` written for DSL. Kibana's
+        Discover backend takes the body WRAPPED under ``params`` and answers with it under
+        ``rawResponse``; a data node takes ``POST /{index}/_search`` with the body as given
+        and answers with the response itself, which carries no such envelope.
+        """
+        if self.gateway == "kibana":
+            url = f"{self.base_url}/internal/search/es"
+            payload = {"params": {"index": self.index, "body": body}}
+        else:
+            url = f"{self.base_url}/{self.index}/_search"
+            payload = body
         async with self._get_session().post(url, json=payload) as resp:
-            resp.raise_for_status()
+            await raise_for_status_with_reason(resp)
             data = await resp.json()
         return data.get("rawResponse", data)
 

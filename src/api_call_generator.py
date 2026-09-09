@@ -6,8 +6,8 @@ from typing import Dict, List
 
 # Flat import, not package-qualified: `src/follow_up.py` reaches `correlation` through
 # the same module object this file does. Using `src.correlation` here would create a
-# second identity and trigger the dual-import trap described in CLAUDE.md.
-from correlation import select_correlation_spec
+# second identity, and the same class reached through both is not `isinstance` of itself.
+from correlation import select_correlation_spec_explained
 from src.follow_up import (
     harvest_follow_up,
     harvest_value_tuples,
@@ -104,10 +104,21 @@ class ApiCallGenerator:
             return ""
         try:
             if analysis is not None:
-                spec = select_correlation_spec(pack, analysis)
+                spec, basis = select_correlation_spec_explained(pack, analysis)
                 key = pack.ruleset_key_for(str((spec or {}).get("use_case", "") or ""))
                 if key:
                     return key
+                if basis.defaulted:
+                    # The planner is about to add the DEFAULT ruleset's declared sources as
+                    # hard dependencies for an incident no procedure recognised. It still
+                    # does — a plan is repairable and a missing source is not — but the
+                    # substitution is logged here rather than only at the verdict, because
+                    # this is where it starts costing scan time.
+                    logger.warning(
+                        "No procedure matched this incident; planning its data dependencies "
+                        "from the pack's default ruleset '%s'.",
+                        pack.default_ruleset_key(),
+                    )
             return str(pack.default_ruleset_key() or "")
         except Exception as exc:  # noqa: BLE001
             logger.warning(

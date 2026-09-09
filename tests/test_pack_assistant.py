@@ -1,6 +1,6 @@
 """The pack assistant: the tool loop, the plan guards, and all-or-nothing apply.
 
-No test in this suite calls a model (`tests/CLAUDE.md`). Beyond cost, the loop is what is under
+No test in this suite calls a model. Beyond cost, the loop is what is under
 test, and a real model makes the loop's behaviour depend on what it chose to do; every test below
 scripts the model's turns exactly, so a failure names a defect in the loop rather than a bad sample.
 
@@ -26,6 +26,7 @@ Every test runs against a COPY of the shipped packs under `tmp_path`. Nothing he
 `knowledge/`.
 """
 
+import asyncio
 import shutil
 from pathlib import Path
 
@@ -34,9 +35,12 @@ import pytest
 from src.knowledge import (
     pack_assistant,
     pack_dry_run,
+    pack_probe,
+    pack_selection_delta,
     pack_skills,
     pack_store,
     pack_validate,
+    pack_verdict_delta,
 )
 from src.knowledge.pack_assistant import EditOp, EditPlan, PackAssistant
 from src.utils.paths import REPO_ROOT
@@ -973,6 +977,72 @@ def dry_run_calls(monkeypatch):
     return calls
 
 
+@pytest.fixture
+def delta_calls(monkeypatch):
+    """`plan_checks`'s selection delta captured rather than run, for the same reason.
+
+    The real one reads the deployment's stored runs through `job_store`. Every plan in this
+    file inserts a comment, so the short-circuit means none of them reaches a store — which
+    is asserted below rather than assumed, because it is the whole reason this file does not
+    depend on a job history. `pack_selection_delta` has its own file.
+    """
+    calls = []
+
+    def fake_delta(base_dir, candidate_dir, **kwargs):
+        root = Path(candidate_dir)
+        calls.append(
+            {
+                "base": Path(base_dir),
+                "dir": root,
+                "kwargs": kwargs,
+                "files": {
+                    str(p.relative_to(root)): p.read_text(errors="replace")
+                    for p in sorted(root.rglob("*"))
+                    if p.is_file()
+                },
+            }
+        )
+        return pack_selection_delta.SelectionDelta(reason="captured")
+
+    monkeypatch.setattr(
+        pack_assistant.pack_selection_delta, "selection_delta_for_dirs", fake_delta
+    )
+    return calls
+
+
+@pytest.fixture
+def verdict_delta_calls(monkeypatch):
+    """`plan_checks`'s verdict delta captured rather than run, for the same reason again.
+
+    It is a separate fixture rather than a second branch inside `delta_calls` because the two
+    are separate measurements behind one flag: a test that neutralises the selection side and
+    silently neutralises this one too could not tell "the seam does not call it" from "the
+    seam calls it and it short-circuits". `pack_verdict_delta` has its own file.
+    """
+    calls = []
+
+    def fake_delta(base_dir, candidate_dir, **kwargs):
+        root = Path(candidate_dir)
+        calls.append(
+            {
+                "base": Path(base_dir),
+                "dir": root,
+                "kwargs": kwargs,
+                "files": {
+                    str(p.relative_to(root)): p.read_text(errors="replace")
+                    for p in sorted(root.rglob("*"))
+                    if p.is_file()
+                },
+            }
+        )
+        return pack_verdict_delta.VerdictDelta(reason="captured")
+
+    monkeypatch.setattr(
+        pack_assistant.pack_verdict_delta, "verdict_delta_for_dirs", fake_delta
+    )
+    return calls
+
+
 def _a_ruleset_with_an_inline_kind(packs, pack=PACK):
     """A use-case ruleset that declares a `kind:` inline, found rather than named.
 
@@ -1178,15 +1248,108 @@ def test_a_pack_root_edit_leaves_the_dry_run_unscoped(packs, dry_run_calls):
     assert dry_run_calls[0]["keys"] is None
 
 
-def test_the_apply_does_not_spend_a_dry_run_of_its_own(packs, dry_run_calls):
-    """The gate is "does this plan break the pack"; the dry run is an authoring read.
+def test_the_apply_spends_none_of_the_three_measurements_of_its_own(
+    packs, dry_run_calls, delta_calls, verdict_delta_calls
+):
+    """The gate is "does this plan break the pack"; the other three are authoring reads.
 
-    It gates nothing, so computing it here would spend a replay budget on every write to
-    produce a number no branch reads.
+    All three gate nothing, so computing them here would spend a replay budget and two
+    job-history reads on every write to produce numbers no branch consults. Asserted per
+    measurement rather than per flag, because the three sit behind TWO flags — `dry_run` and
+    `deltas`, which covers both deltas at once — so a check that only counted the flags could
+    not tell a skipped delta from a delta the seam stopped calling.
     """
     plan = EditPlan(ops=[patch_op(packs, CATALOG, 1, "# a comment")])
     assert pack_assistant.apply_plan(PACK, plan)["applied"] is True
     assert dry_run_calls == []
+    assert delta_calls == []
+    assert verdict_delta_calls == []
+
+
+def test_the_selection_delta_is_measured_against_the_candidate_tree(packs, delta_calls):
+    """Both trees, because the question is what the edit MOVED and not what it leaves.
+
+    The dry run reads the candidate alone; this one needs the before-state too, and it needs
+    the candidate's titles rather than the live pack's — pointed at the live tree it would
+    compare a pack against itself and report every plan as harmless.
+    """
+    rel, _key, _line = _a_ruleset_with_an_inline_kind(packs)
+    plan = EditPlan(ops=[_insert_comment_op(packs, rel, "# a scored edit")])
+    checks = pack_assistant.plan_checks(PACK, plan, dry_run=False)
+    assert checks["ran"] is True
+    assert len(delta_calls) == 1
+    assert delta_calls[0]["base"] == packs / PACK
+    assert delta_calls[0]["dir"] != packs / PACK
+    assert "# a scored edit" in delta_calls[0]["files"][rel]
+    assert checks["selection_delta"]["reason"] == "captured"
+    assert checks["selection_delta"]["compared"] is False
+
+
+def test_the_verdict_delta_is_measured_against_the_candidate_tree(
+    packs, verdict_delta_calls
+):
+    """Both trees again, and for a reason the selection delta does not share.
+
+    This one re-adjudicates the SAME stored evidence under each pack, so the two sides are
+    the comparison rather than one side plus a corpus — pointed at the live tree for both it
+    would replay one pack twice and report every plan as leaving every finding where it was,
+    which is the reassuring silence the module exists to prevent.
+    """
+    rel, _key, _line = _a_ruleset_with_an_inline_kind(packs)
+    plan = EditPlan(ops=[_insert_comment_op(packs, rel, "# an adjudicating edit")])
+    checks = pack_assistant.plan_checks(PACK, plan, dry_run=False)
+    assert checks["ran"] is True
+    assert len(verdict_delta_calls) == 1
+    assert verdict_delta_calls[0]["base"] == packs / PACK
+    assert verdict_delta_calls[0]["dir"] != packs / PACK
+    assert "# an adjudicating edit" in verdict_delta_calls[0]["files"][rel]
+    assert checks["verdict_delta"]["reason"] == "captured"
+    assert checks["verdict_delta"]["compared"] is False
+
+
+def test_an_edit_that_moves_no_spec_replays_no_run(packs, monkeypatch):
+    """The verdict delta's own short-circuit, asserted the way its sibling's is.
+
+    A replayed verdict is a function of the resolved ruleset specs, the pack data files and
+    the entity-to-column bindings — nothing else reaches the evaluator — so an edit leaving
+    all three alone cannot move a finding, and the comparison returns before it asks for a
+    corpus. Asserted by making the corpus read RAISE rather than by counting replays, because
+    a store that is merely unused and one that is unreachable look identical from a passing
+    test otherwise, and this is the other half of what keeps this file off the deployment's
+    job history.
+    """
+    monkeypatch.setattr(
+        pack_dry_run,
+        "stored_runs",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("replayed a run")),
+    )
+    plan = EditPlan(ops=[patch_op(packs, CATALOG, 1, "# a comment")])
+    checks = pack_assistant.plan_checks(PACK, plan, dry_run=False)
+    assert checks["ran"] is True
+    assert checks["verdict_delta"]["compared"] is False
+    assert checks["verdict_delta"]["surface_changed"] == []
+
+
+def test_an_edit_that_moves_no_title_reads_no_corpus(packs, monkeypatch):
+    """The common case costs nothing, and that is exact rather than a hope.
+
+    A score is a function of the playbook titles and join keys alone — including the
+    inverse-frequency weights, which are counts over those same token sets — so an edit that
+    leaves every one of them alone cannot move a selection, and the comparison short-circuits
+    before it asks for a corpus. Asserted by making a corpus read RAISE: a store that is
+    merely unused and one that is unreachable look identical from a passing test otherwise,
+    and this is what keeps every other test in this file off the deployment's job history.
+    """
+    monkeypatch.setattr(
+        pack_selection_delta,
+        "corpus",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("read the corpus")),
+    )
+    plan = EditPlan(ops=[patch_op(packs, CATALOG, 1, "# a comment")])
+    checks = pack_assistant.plan_checks(PACK, plan, dry_run=False)
+    assert checks["ran"] is True
+    assert checks["selection_delta"]["compared"] is False
+    assert checks["selection_delta"]["vocabulary_changed"] == []
 
 
 def test_the_baseline_is_re_read_when_the_pack_changed_underneath_it(packs):
@@ -1242,3 +1405,404 @@ async def test_the_shipped_library_really_reaches_a_real_session(packs):
     opening = str(client.tool_call_messages[0][-1]["content"])
     for skill in session.skills:
         assert f"--- skill: {skill['name']}" in opening
+
+
+# ------------------------------------------------------------------ the measurement lane
+# Eight tools now, and this one is the only one that leaves the machine. The lane is what
+# turns "probe before you declare" from an instruction the model cannot follow into one it
+# can, so what the tests below pin is not that a measurement is correct — `test_pack_probe.py`
+# owns that — but that every way a measurement can FAIL to happen is said out loud. The
+# failure this lane exists to prevent has one shape: an unmeasured number inside an approved
+# diff is indistinguishable from a measured one, and no file in the pack can catch it.
+
+
+class FakeProbe:
+    """Stands in for `pack_probe.Probe`. Echoes its arguments, deliberately.
+
+    A fake returning a fixed shape would pass for a lane that routed `column` into `table`,
+    or dropped `where` — so every answer here restates what it was asked, and the assertions
+    read that back. Recording the calls is the other half: a bound is only tested if the call
+    that should not have happened can be shown not to have happened.
+    """
+
+    def __init__(self, *, fail=None, hang=False, rows=0):
+        self.calls = []
+        self.closed = False
+        self._fail = fail
+        self._hang = hang
+        self._rows = rows
+
+    def sources(self):
+        return {"alerts": "sql", "sessions": "esql"}
+
+    def unavailable(self):
+        return {"ledger": "no credentials configured for this backend"}
+
+    def tables(self, source):
+        return [f"{source}_table"]
+
+    async def _answer(self, question):
+        self.calls.append(question)
+        if self._hang:
+            await asyncio.sleep(30)
+        if self._fail is not None:
+            raise self._fail
+        return pack_probe.Measurement(
+            question=question,
+            source="alerts",
+            ok=True,
+            rows=[{"n": i} for i in range(self._rows)],
+            elapsed_s=0.1,
+        )
+
+    async def count(self, source, table, predicate=None, question=""):
+        return await self._answer(f"count {source}/{table} where={predicate!r}")
+
+    async def values(self, source, table, column, top=20, predicate=None):
+        return await self._answer(f"values {source}/{table}.{column} top={top}")
+
+    async def population(self, source, table, column, predicate=None):
+        return await self._answer(f"population {source}/{table}.{column}")
+
+    async def sql(self, source, statement, question=""):
+        return await self._answer(f"sql {source}: {statement}")
+
+    async def close(self):
+        self.closed = True
+
+
+def lane_for(probe=None, *, opener=None, **bounds):
+    """A lane over a fake, with the three bounds explicit so no test depends on the shipped ones."""
+    settings = {"probes": 2, "row_cap": 3, "timeout_seconds": 0.2}
+    settings.update(bounds)
+    if opener is None:
+        target = probe if probe is not None else FakeProbe()
+
+        async def opener(*, pack_name=None, config=None):
+            return target
+
+    return pack_assistant.ProbeLane(
+        PACK,
+        config={
+            "knowledge": {
+                "assistant_probes": settings["probes"],
+                "assistant_probe_row_cap": settings["row_cap"],
+                "assistant_probe_timeout_seconds": settings["timeout_seconds"],
+            }
+        },
+        opener=opener,
+    )
+
+
+def test_every_op_the_lane_dispatches_is_offered_to_the_model(packs):
+    """The schema's enum and the lane's op table are the same set, in both directions.
+
+    An op in the table but not the enum is a measurement the model is never told it can
+    take; an op in the enum but not the table is one it will be refused for asking. Both
+    read to the operator as a model that would not measure.
+    """
+    schema = next(
+        t["function"]
+        for t in pack_assistant._tool_schemas()
+        if t["function"]["name"] == "probe"
+    )
+    assert set(schema["parameters"]["properties"]["op"]["enum"]) == set(
+        pack_assistant._PROBE_OPS
+    )
+    assert schema["parameters"]["required"] == ["op"]
+
+
+async def test_a_write_statement_is_refused_before_a_connection_is_opened(packs):
+    """Read-only is enforced at the seam, not asked for in the description.
+
+    A prompt instruction cannot be relied on to beat another prompt instruction, so the
+    refusal is `pack_probe`'s own guard — and it fires before the opener runs, which is why
+    the assertion is that the probe was never even built. The budget is untouched too: a
+    model tripping over this must still have every measurement left to do the real work with.
+    """
+    opened = []
+
+    async def opener(*, pack_name=None, config=None):
+        opened.append(pack_name)
+        return FakeProbe()
+
+    lane = lane_for(opener=opener)
+    out = await lane.run(
+        {"op": "sql", "source": "alerts", "statement": "DELETE FROM alerts"}
+    )
+    assert "refused" in out and "can only read" in out
+    assert opened == [], "a refused statement must not open a backend"
+    assert lane.spent == 0 and lane.records == []
+
+
+async def test_a_chained_statement_is_refused_rather_than_split(packs):
+    """`SELECT 1; DROP TABLE t` passes every leading-verb test there is."""
+    lane = lane_for()
+    out = await lane.run(
+        {"op": "sql", "source": "alerts", "statement": "SELECT 1; DROP TABLE alerts"}
+    )
+    assert "chains 2 statements" in out
+    assert lane.spent == 0
+
+
+async def test_the_budget_refuses_the_next_measurement_and_names_itself(packs):
+    """A spent budget degrades to the behaviour that predates this lane, and says so.
+
+    The one thing it must never do is answer with a number, so the refusal carries the
+    degrade text: write the measurement into `questions`, propose without the value.
+    """
+    probe = FakeProbe(rows=1)
+    lane = lane_for(probe, probes=2)
+    for _ in range(2):
+        assert "FAILED" not in await lane.run(
+            {"op": "count", "source": "alerts", "table": "t"}
+        )
+    out = await lane.run({"op": "count", "source": "alerts", "table": "t"})
+    assert "budget for this session is spent (2 measurement(s))" in out
+    assert "No measurement was taken" in out and "`questions`" in out
+    assert len(probe.calls) == 2, "the refused call must not reach the backend"
+
+
+async def test_a_zero_budget_disables_the_lane_without_opening_anything(packs):
+    """0 is the off switch, and off must be indistinguishable from the pre-lane behaviour."""
+    opened = []
+
+    async def opener(*, pack_name=None, config=None):
+        opened.append(pack_name)
+        return FakeProbe()
+
+    lane = lane_for(opener=opener, probes=0)
+    out = await lane.run({"op": "count", "source": "alerts", "table": "t"})
+    assert not lane.enabled
+    assert "disabled on this deployment" in out
+    assert "No measurement was taken" in out
+    assert opened == []
+
+
+async def test_the_discovery_call_costs_no_budget_and_names_what_cannot_answer(packs):
+    """`op='sources'` is how a probe stops being aimed at a source that cannot answer.
+
+    A declared source that built no retriever is the commonest reason a probe "finds
+    nothing", and that is a fact about the deployment rather than about the data. Free of
+    the budget because charging for it would push the model straight to guessing a source
+    name — the failure the call exists to prevent.
+    """
+    lane = lane_for(probes=1)
+    out = await lane.run({"op": "sources"})
+    assert "alerts: sql" in out and "targets=['alerts_table']" in out
+    assert "ledger: UNAVAILABLE — no credentials" in out
+    assert lane.spent == 0 and lane.remaining == 1
+
+
+async def test_a_backend_failure_reads_as_a_non_answer_and_never_as_zero(packs):
+    """The distinction this whole repo is organised around, at one more seam.
+
+    A failure and an empty result license opposite conclusions, and a probe that reported
+    the first as the second would put "0" into a declaration on the strength of a timeout.
+    """
+    lane = lane_for(FakeProbe(fail=ConnectionResetError("peer went away")))
+    out = await lane.run({"op": "count", "source": "alerts", "table": "t"})
+    assert "FAILED (ConnectionResetError: peer went away)" in out
+    assert "not an empty result" in out
+    assert lane.records[0]["op"] == "count", "a failure is still a recorded measurement"
+
+
+async def test_a_hang_is_bounded_by_the_lane_and_not_by_the_source(packs):
+    """A `primary` source is deliberately allowed two hours in a pipeline run.
+
+    Inheriting that here hangs one authoring turn for the afternoon. So the lane keeps its
+    own clock — and reports the timeout as a non-answer that says a real run may still
+    succeed, because the bound that fired is this lane's and not the source's.
+    """
+    lane = lane_for(FakeProbe(hang=True), timeout_seconds=0.05)
+    out = await lane.run({"op": "count", "source": "alerts", "table": "t"})
+    assert "did not finish inside this lane's 0s bound" in out
+    assert "NOT an empty result" in out and "a real run may well succeed" in out
+
+
+async def test_the_row_cap_says_that_it_cut(packs):
+    """A silently cut bucket list reads as the whole distribution."""
+    lane = lane_for(FakeProbe(rows=10), row_cap=3)
+    out = await lane.run(
+        {"op": "values", "source": "alerts", "table": "t", "column": "c"}
+    )
+    assert "... 7 further row(s) not shown" in out
+    assert "caps at 3" in out
+
+
+async def test_the_lane_passes_each_argument_to_its_own_place(packs):
+    """A lane that routed `column` into `table` would measure the wrong thing, quietly."""
+    probe = FakeProbe(rows=1)
+    lane = lane_for(probe, probes=4)
+    await lane.run(
+        {
+            "op": "values",
+            "source": "alerts",
+            "table": "the_table",
+            "column": "the_column",
+            "top": 7,
+        }
+    )
+    await lane.run(
+        {"op": "count", "source": "alerts", "table": "the_table", "where": "x = 1"}
+    )
+    assert probe.calls[0] == "values alerts/the_table.the_column top=7"
+    assert probe.calls[1] == "count alerts/the_table where='x = 1'"
+
+
+async def test_an_unopenable_backend_degrades_and_records_nothing(packs):
+    """No backend reachable is the normal case on a laptop, and it must not raise."""
+
+    async def opener(*, pack_name=None, config=None):
+        raise RuntimeError("no log_sources configured")
+
+    lane = lane_for(opener=opener)
+    out = await lane.run({"op": "count", "source": "alerts", "table": "t"})
+    assert "probe is unavailable: RuntimeError: no log_sources configured" in out
+    assert "No measurement was taken" in out
+    assert lane.records == []
+
+
+async def test_an_invented_op_is_answered_with_the_real_ones(packs):
+    """Same reasoning as an invented tool name: a bare refusal sends the model hunting."""
+    lane = lane_for()
+    out = await lane.run({"op": "truncate", "source": "alerts", "table": "t"})
+    assert "no probe op called 'truncate'" in out
+    for real in ("sources", "selectivity", "spread", "pair"):
+        assert real in out
+
+
+async def test_a_missing_argument_names_the_argument(packs):
+    lane = lane_for()
+    assert "needs a 'source'" in await lane.run({"op": "count", "table": "t"})
+    assert "also needs: table" in await lane.run({"op": "count", "source": "alerts"})
+    assert "also needs: left, right" in await lane.run(
+        {"op": "pair", "source": "alerts", "table": "t"}
+    )
+    assert lane.spent == 0
+
+
+async def test_the_synchronous_seam_cannot_probe_and_says_so(packs):
+    """`dispatch_tool` stays the sync seam, so no caller can measure by accident.
+
+    `probe` is in `_TOOLS` anyway, because that mapping is what an invented name is answered
+    with — a real tool missing from that list sends the model looking for a second spelling.
+    """
+    out = pack_assistant.dispatch_tool(PACK, "probe", {"op": "count"})
+    assert "not available in this context" in out
+    assert "No measurement was taken" in out
+    listed = pack_assistant.dispatch_tool(PACK, "made_up", {})
+    assert "probe" in listed
+
+
+async def test_a_measurement_rides_out_on_the_session_snapshot(packs):
+    """Provenance is the point: a threshold whose measurement is not on the artifact is
+    indistinguishable from one the model liked the look of.
+
+    Recorded beside `trail` rather than inside it because a trail entry keeps 400 characters,
+    and the operator reviewing the diff needs the whole measurement that justified the line.
+    """
+    probe = FakeProbe(rows=1)
+    client = FakeClient(
+        turns=[
+            FakeMessage(
+                tool_calls=[
+                    call(
+                        "probe",
+                        '{"op": "population", "source": "alerts", '
+                        '"table": "t", "column": "c"}',
+                    )
+                ]
+            ),
+            FakeMessage(content="ready"),
+        ],
+        plan=EditPlan(summary="a measured threshold"),
+    )
+    session = session_for()
+    await PackAssistant(client, probe_lane=lambda pack: lane_for(probe)).run(session)
+    assert session.status == "proposed"
+    assert [t["tool"] for t in session.trail] == ["probe"]
+    assert len(session.probes) == 1
+    record = session.probes[0]
+    assert record["op"] == "population" and record["source"] == "alerts"
+    assert record["args"]["column"] == "c"
+    assert "population alerts/t.c" in record["result"]
+    assert session.snapshot()["probes"] == session.probes
+    assert probe.closed, "the lane is closed when the session ends"
+    tool_turn = next(
+        m for m in client.plan_messages[-1] if m.get("role") == "tool"
+    )
+    assert "[probe 1 of 2 for this session]" in tool_turn["content"]
+
+
+async def test_a_session_that_never_probes_opens_no_backend(packs):
+    """The whole "only better, never worse" claim for this lane, as one assertion.
+
+    Every session before the lane existed did exactly this: read files, propose. If merely
+    having the lane constructed reached a source, the change would be a new failure mode on
+    every existing session rather than a new capability on the ones that ask for it.
+    """
+    opened = []
+
+    async def opener(*, pack_name=None, config=None):
+        opened.append(pack_name)
+        return FakeProbe()
+
+    client = FakeClient(
+        turns=[FakeMessage(tool_calls=[call("pack_summary", "{}")]), FakeMessage()],
+        plan=EditPlan(summary="no measurement needed"),
+    )
+    session = session_for()
+    await PackAssistant(
+        client, probe_lane=lambda pack: lane_for(opener=opener)
+    ).run(session)
+    assert session.status == "proposed"
+    assert opened == []
+    assert session.probes == []
+
+
+async def test_a_failed_session_still_closes_its_lane(packs):
+    """A session that failed is the one most likely to have opened a connection pool."""
+    probe = FakeProbe(rows=1)
+    lane = lane_for(probe)
+    client = FakeClient(
+        turns=[
+            FakeMessage(
+                tool_calls=[call("probe", '{"op": "count", "source": "a", "table": "t"}')]
+            ),
+            FakeMessage(),
+        ],
+        plan_error=RuntimeError("the endpoint gave up"),
+    )
+    session = session_for()
+    await PackAssistant(client, probe_lane=lambda pack: lane).run(session)
+    assert session.status == "failed"
+    assert probe.closed
+
+
+def test_the_bounds_fall_back_to_the_narrow_defaults_when_config_cannot_be_read(
+    packs, monkeypatch
+):
+    """An unreadable config must not widen a bound past what the operator chose.
+
+    Which direction the fallback goes is the whole decision: a lane that defaulted to a
+    bigger budget on a config it could not parse would run more measurements than anybody
+    asked for, on the deployment least likely to be watching.
+    """
+    monkeypatch.setattr(
+        pack_probe,
+        "load_main_config",
+        lambda: (_ for _ in ()).throw(OSError("no config on this deployment")),
+    )
+    lane = pack_assistant.ProbeLane(PACK)
+    assert lane.max_probes == pack_assistant.MAX_PROBES
+    assert lane.row_cap == pack_assistant.PROBE_ROW_CAP
+    assert lane.timeout_s == pack_assistant.PROBE_TIMEOUT_SECONDS
+
+
+def test_a_junk_bound_in_config_falls_back_rather_than_crashing_the_session(packs):
+    """A hand-edited config is a text file, and the lane is not the place to discover that."""
+    lane = pack_assistant.ProbeLane(
+        PACK, config={"knowledge": {"assistant_probes": "lots"}}
+    )
+    assert lane.max_probes == pack_assistant.MAX_PROBES

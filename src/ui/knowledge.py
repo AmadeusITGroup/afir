@@ -122,7 +122,12 @@ KNOWLEDGE_HTML = r"""    <div class="panel subbar">
         is what proves the engine itself never names this domain, and a pack without one breaks
         that guarantee for every pack installed.
       </div>
-      <div class="row">
+      <div class="banner" data-user-only hidden>
+        Creating a pack is an administrator's action. Editing one is not &#8212; every file in an
+        existing pack is yours to change, saved as your own draft. What is refused here is a
+        <em>new</em> pack, because a pack is what a run loads and there is one of those.
+      </div>
+      <div class="row" data-admin-only>
         <input id="pkNewName" placeholder="pack name (letters, digits, _ and -)" style="flex:1"/>
         <input id="pkNewVocab" placeholder="the domain's own nouns, comma separated" style="flex:2"/>
         <button class="btn primary" id="pkScaffold">+ Create pack</button>
@@ -134,7 +139,12 @@ KNOWLEDGE_HTML = r"""    <div class="panel subbar">
         none of them &#8212; a half-applied change leaves a pack broken in a way neither version
         would explain. Existing files are replaced, with their previous version kept.
       </div>
-      <div class="row">
+      <div class="banner" data-user-only hidden>
+        Importing writes files into the shared pack, so it is an administrator's action. To bring
+        in your own version of a file, open it in the editor and paste the text: that lands in
+        your drafts.
+      </div>
+      <div class="row" data-admin-only>
         <input type="file" id="pkImportFiles" multiple accept=".yaml,.yml,.md,.txt"/>
         <input id="pkImportPrefix" placeholder="destination folder inside the pack (optional)" style="flex:1"/>
         <button class="btn primary" id="pkImport" disabled><svg class="ico"><use href="#i-upload"/></svg> Import selected</button>
@@ -168,9 +178,15 @@ KNOWLEDGE_HTML = r"""    <div class="panel subbar">
       </div>
       <div id="pkTrail"></div>
       <div id="pkProposal"></div>
+      <div class="banner" data-user-only hidden>
+        Anyone may ask, read the proposal and read its diff. Only an administrator can have the
+        assistant write it: an assistant plan touches several files at once, and a partly applied
+        one is the state neither version explains. Copy a proposed file into the editor and save
+        it there to keep it as your own draft.
+      </div>
       <div class="row" id="pkProposalBar" hidden>
-        <button class="btn primary" id="pkApply"><svg class="ico"><use href="#i-check"/></svg> Apply these edits</button>
-        <label class="toggle"><input type="checkbox" id="pkAllowDelete"/> also allow deletions</label>
+        <button class="btn primary" id="pkApply" data-admin-only><svg class="ico"><use href="#i-check"/></svg> Apply these edits</button>
+        <label class="toggle" data-admin-only><input type="checkbox" id="pkAllowDelete"/> also allow deletions</label>
         <button class="btn" id="pkEditFirst" title="Change the proposed text before it is written"><svg class="ico"><use href="#i-edit"/></svg> Edit first</button>
         <button class="btn danger" id="pkRejectPlan"><svg class="ico"><use href="#i-x"/></svg> Send back</button>
         <span class="statusline" id="pkApplyStatus"></span>

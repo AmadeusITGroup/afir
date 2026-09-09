@@ -1328,7 +1328,7 @@ async def test_the_scaffold_literal_really_reaches_its_own_handler(client, packs
 
 
 class ScriptedClient:
-    """A minimal stand-in for `LLMClient` — see `tests/CLAUDE.md`: never a real model.
+    """A minimal stand-in for `LLMClient`: no test in this suite calls a real model.
 
     `plan` is what `structured_output` returns. `turns` scripts `tool_call`; empty means
     the model asks for nothing, which is the loop's own fallback path.

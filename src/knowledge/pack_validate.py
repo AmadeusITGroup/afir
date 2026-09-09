@@ -111,6 +111,54 @@ def condition_kinds() -> Set[str]:
     return _CORPUS_CACHE["kinds"]
 
 
+def inquiry_triggers() -> Tuple[str, ...]:
+    """Condition results an ``open_questions`` entry may trigger on, from ``src/inquiry.py``.
+
+    Derived for ``link_directions``' reason: ``src/inquiry.py`` imports ``correlation`` at module
+    level, so importing it here would fail. Unlocatable yields ``()``, turning the check off.
+    """
+    if "inquiry_triggers" not in _CORPUS_CACHE:
+        found: Tuple[str, ...] = ()
+        try:
+            text = (REPO_ROOT / "src" / "inquiry.py").read_text(encoding="utf-8")
+        except OSError:
+            text = ""
+        m = re.search(r"\nINQUIRY_TRIGGERS[^=]*=\s*\(([^)]*)\)", text)
+        if m:
+            found = tuple(re.findall(r'"([a-z_]+)"', m.group(1)))
+        if not found:
+            logger.warning(
+                "Could not derive INQUIRY_TRIGGERS from src/inquiry.py; "
+                "open-question trigger checks will be skipped."
+            )
+        _CORPUS_CACHE["inquiry_triggers"] = found
+    return _CORPUS_CACHE["inquiry_triggers"]
+
+
+def verdict_classes() -> Tuple[str, ...]:
+    """Every ``verdict_class`` the rollup can stamp, derived from its own assignments.
+
+    Derived rather than listed because the class set is what an ``open_questions`` trigger and
+    a report's note prefixes are both matched against, and a hand-kept copy here would keep
+    accepting a class the rollup stopped stamping. Unlocatable yields ``()``.
+    """
+    if "verdict_classes" not in _CORPUS_CACHE:
+        try:
+            text = (REPO_ROOT / "src" / "correlation.py").read_text(encoding="utf-8")
+        except OSError:
+            text = ""
+        found = tuple(
+            sorted(set(re.findall(r'verdict_class\s*=\s*"([a-z_]+)"', text)))
+        )
+        if not found:
+            logger.warning(
+                "Could not derive the verdict classes from src/correlation.py; "
+                "open-question verdict-class checks will be skipped."
+            )
+        _CORPUS_CACHE["verdict_classes"] = found
+    return _CORPUS_CACHE["verdict_classes"]
+
+
 def link_directions() -> Tuple[str, ...]:
     """The causal axis values an ``entry_signals`` declaration may name, from ``src/links.py``.
 
@@ -2502,8 +2550,25 @@ def _check_correlation_specs(
         title = str(front.get("title", "") or path.stem)
         specs.append((rel, title, block.get("keys")))
     counts["correlation_specs"] = len(specs)
-    # With one spec the score is moot: the engine returns the only candidate regardless, so a
-    # lone title's vocabulary discriminates nothing and reporting it would be noise.
+    if len(specs) == 1:
+        # Info, not a defect: one procedure is a legitimate pack. But its selection is not a
+        # match — inverse spec frequency makes every token of a lone title score (1-1)/1 = 0,
+        # so the engine returns the only candidate whatever the incident says. Worth stating
+        # because the second procedure added is where a title starts having to discriminate.
+        diags.append(
+            _diag(
+                "info",
+                "spec-title-unscored",
+                f"{specs[0][1]}: this pack declares one correlation spec, so it adjudicates "
+                "every incident without its title ever being scored",
+                path=specs[0][0],
+                hint="nothing to fix; adding a second procedure is what makes the title a "
+                "discriminator, and that is the point to measure selection against real "
+                "incident summaries",
+            )
+        )
+    # Below two specs the weak-token check is moot: a lone title's vocabulary discriminates
+    # nothing, so weighting it at maximum costs nothing and reporting it would be noise.
     if len(specs) < 2:
         return
 
@@ -2956,6 +3021,15 @@ def _check_rulesets(
     decoded = _decoded_table_paths(catalog)
     projected = _projected_paths(catalog)
     renames = _projection_renames(catalog)
+    # The declared entity TYPES, for the checks that ask whether a run could ever hold a value
+    # of the type a declaration names. Empty turns those checks off rather than reporting every
+    # type as unknown — a pack with no glossary is already reported once by `_check_glossary`.
+    glossary = yaml_docs.get("entity_glossary.yaml")
+    entity_types = {
+        str(e.get("type", "") or "").strip()
+        for e in ((glossary or {}).get("entities") or [])
+        if isinstance(e, dict) and str(e.get("type", "") or "").strip()
+    }
 
     n_rulesets = 0
     n_conditions = 0
@@ -2977,6 +3051,7 @@ def _check_rulesets(
     #: set is not known until the loop has finished.
     origins: Dict[str, Tuple[str, str]] = {}
     n_entry_signals = 0
+    n_open_questions = 0
     for rel, use_case in files:
         doc = yaml_docs.get(rel)
         if not isinstance(doc, dict):
@@ -3024,6 +3099,8 @@ def _check_rulesets(
             origins[str(key)] = (rel, text)
             signals = spec.get("entry_signals")
             n_entry_signals += len(signals) if isinstance(signals, list) else 0
+            questions = spec.get("open_questions")
+            n_open_questions += len(questions) if isinstance(questions, list) else 0
             checked_lists, checked_projected = _check_one_ruleset(
                 spec,
                 raw,
@@ -3034,6 +3111,7 @@ def _check_rulesets(
                 root=root,
                 physical=physical,
                 pack_data=pack_data,
+                entity_types=entity_types,
                 forms=forms or {},
                 decoded=decoded,
                 projected=projected,
@@ -3047,6 +3125,7 @@ def _check_rulesets(
     counts["field_path_lists"] = n_path_lists
     counts["projected_path_lists"] = n_projected_lists
     counts["entry_signals"] = n_entry_signals
+    counts["open_questions"] = n_open_questions
     # After the loop, with every key known: an escalation override names a source procedure,
     # and a ruleset declared further down in the same file is a valid name.
     for rkey, spec in resolved.items():
@@ -3060,6 +3139,7 @@ def _check_rulesets(
             diags=diags,
         )
     _check_default_ruleset(root, yaml_docs, declared_keys, diags)
+    _check_adjudication_policy(root, yaml_docs, declared_keys, diags)
     _check_link_graph(root, catalog, resolved, diags, counts)
 
 
@@ -3124,6 +3204,111 @@ def _check_default_ruleset(
             )
 
 
+def _check_adjudication_policy(
+    root: Path,
+    yaml_docs: Dict[str, Any],
+    declared_keys: Set[str],
+    diags: List[Dict[str, Any]],
+) -> None:
+    """``adjudication_policy`` must be a value the loader knows, and ``abstain`` needs a label.
+
+    Same two halves as ``default_ruleset`` and for the same reason — the loader reads it off the
+    flat-root file only, and an unrecognised value falls back to ``default``, so the pack looks
+    like it took a decision it did not. The third check is specific to this key: abstaining
+    means relabelling a verdict to the ruleset's own ``reject`` label, and a ruleset that
+    declares none cannot abstain at all. Error, because the pack then silently keeps
+    adjudicating under the default ruleset — precisely what it asked not to do.
+    """
+    for rel in sorted(yaml_docs):
+        if rel != "rulesets.yaml" and not re.fullmatch(
+            r"use_cases/[^/]+/rules\.yaml", rel
+        ):
+            continue
+        doc = yaml_docs.get(rel)
+        if not isinstance(doc, dict):
+            continue
+        raw = doc.get("adjudication_policy")
+        if raw is None or not str(raw).strip():
+            continue
+        declared = str(raw).strip()
+        text = (root / rel).read_text(encoding="utf-8", errors="replace")
+        line = _find_key_line(text, "adjudication_policy")
+        if rel != "rulesets.yaml":
+            diags.append(
+                _diag(
+                    "error",
+                    "adjudication-policy-not-at-pack-root",
+                    "adjudication_policy is only read from the pack root's rulesets.yaml, "
+                    f"so declaring it in {rel} does nothing",
+                    path=rel,
+                    line=line,
+                    hint="move it to rulesets.yaml at the pack root, beside default_ruleset",
+                )
+            )
+            continue
+        if declared.lower() not in ("default", "abstain"):
+            diags.append(
+                _diag(
+                    "error",
+                    "adjudication-policy-unknown",
+                    f"adjudication_policy is {declared!r}, which the loader does not know",
+                    path=rel,
+                    line=line,
+                    detail="accepted values: default, abstain",
+                    hint="an unknown value reads as 'default', so an incident no procedure "
+                    "matched is still adjudicated under the default ruleset",
+                )
+            )
+            continue
+        if declared.lower() != "abstain":
+            continue
+        without = sorted(
+            key
+            for key in declared_keys
+            if not str(
+                ((_rulesets_for(yaml_docs).get(key) or {}).get("labels") or {}).get(
+                    "reject", ""
+                )
+                or ""
+            ).strip()
+        )
+        if without:
+            diags.append(
+                _diag(
+                    "error",
+                    "abstain-without-reject-label",
+                    f"adjudication_policy: abstain, but {len(without)} ruleset(s) declare no "
+                    "'reject' label, so there is no word to abstain in",
+                    path=rel,
+                    line=line,
+                    detail=", ".join(without),
+                    hint="add labels.reject to each ruleset that may adjudicate an "
+                    "unselected incident; without it the engine keeps the default ruleset's "
+                    "verdict and only annotates it",
+                )
+            )
+
+
+def _rulesets_for(yaml_docs: Dict[str, Any]) -> Dict[str, Any]:
+    """``{ruleset key: spec}`` across the flat root and every use case, use_cases winning.
+
+    Unresolved shared-check imports and all: this reads declarations, not behaviour.
+    """
+    out: Dict[str, Any] = {}
+    for rel in sorted(yaml_docs):
+        if rel != "rulesets.yaml" and not re.fullmatch(
+            r"use_cases/[^/]+/rules\.yaml", rel
+        ):
+            continue
+        doc = yaml_docs.get(rel)
+        verdicts = (doc or {}).get("verdicts") if isinstance(doc, dict) else None
+        if isinstance(verdicts, dict):
+            for key, spec in verdicts.items():
+                if isinstance(spec, dict):
+                    out[str(key)] = spec
+    return out
+
+
 def _evaluable(conditions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """The conditions that can ever resolve to ``pass`` or ``fail``.
 
@@ -3145,6 +3330,7 @@ def _check_one_ruleset(
     root: Path,
     physical: Set[str],
     pack_data: Dict[str, Any],
+    entity_types: Set[str],
     forms: Dict[str, Dict[str, Any]],
     decoded: Dict[str, List[str]],
     projected: Dict[str, List[str]],
@@ -3216,8 +3402,16 @@ def _check_one_ruleset(
     # `entry_signals` is excluded: a signal naming a source is not a condition reading it.
     # Walking it would report a sibling procedure's name as `unknown-ruleset-source` and
     # suppress `orphan-logical-source`. Its own check is `entry-signal-unknown-source`.
+    # `open_questions` is excluded for the mirror-image reason: an inquiry's source is asked
+    # with one bounded probe of its own, so declaring one must NOT make it a hard dependency
+    # retrieved on every run. Its own check is `open-question-unknown-source`.
     _walk_source_refs(
-        {k: v for k, v in spec.items() if k not in ("sources", "entry_signals")}, used
+        {
+            k: v
+            for k, v in spec.items()
+            if k not in ("sources", "entry_signals", "open_questions")
+        },
+        used,
     )
     if isinstance(declared, dict):
         for logical in sorted(used - set(declared) - physical):
@@ -3346,6 +3540,25 @@ def _check_one_ruleset(
         text=text,
         declared=declared if isinstance(declared, dict) else {},
         physical=physical,
+        diags=diags,
+    )
+
+    # --- this procedure's own open questions ----------------------------------
+    # The other axis, and validated here for the same reason: a dropped declaration reads
+    # exactly like a procedure that declared nothing.
+    _check_open_questions(
+        spec,
+        key=key,
+        rel=rel,
+        text=text,
+        condition_ids={
+            str(c.get("id", "") or "").strip()
+            for c in conditions
+            if str(c.get("id", "") or "").strip()
+        },
+        declared=declared if isinstance(declared, dict) else {},
+        physical=physical,
+        entities=entity_types,
         diags=diags,
     )
 
@@ -4319,6 +4532,260 @@ def _check_entry_signals(
                         "name the rows that mean this procedure's fraud — a `where` clause, or "
                         "a `min_rows` a normal run does not reach; a selector this broad makes "
                         "the signal a fact about retrieval rather than about the evidence"
+                    ),
+                )
+            )
+
+
+def _check_open_questions(
+    spec: Dict[str, Any],
+    *,
+    key: str,
+    rel: str,
+    text: str,
+    condition_ids: Set[str],
+    declared: Dict[str, Any],
+    physical: Set[str],
+    entities: Set[str],
+    diags: List[Dict[str, Any]],
+) -> None:
+    """Validate the questions a ruleset declares about its OWN evidence (``open_questions``).
+
+    Every way to get one wrong is silent in the same way: ``pack.open_questions`` DROPS an entry
+    the engine cannot read, and a dropped question is indistinguishable from a procedure that
+    declared none — so each drop reason is an error here.
+
+    * ``id`` / a trigger / ``ask.source`` / a ``meaning`` per outcome: the four the accessor
+      drops on.
+    * ``when.condition`` must name a TOP-LEVEL condition of this ruleset. A composite's child is
+      not one: the parent renders the single report line, so a trigger naming a child can never
+      fire.
+    * ``when.result`` must be in the engine's trigger vocabulary, and ``when.verdict_class`` in
+      the rollup's — a value outside either never matches, so the question is never raised.
+    * ``ask.scope_entity`` with no glossary entry is a warning: nothing binds the value, so the
+      question reports ``unreachable`` on every run.
+    * An empty ``ask.question`` is a warning — the source plus the scope is still a real ask, but
+      a probe of it carries no question text for the planner to shape a query from.
+    """
+    entries = spec.get("open_questions")
+    if entries is None:
+        return
+    line = _find_key_line(text, "open_questions")
+    if not isinstance(entries, list):
+        diags.append(
+            _diag(
+                "error",
+                "open-question-not-a-list",
+                f"ruleset {key!r} declares `open_questions` as {type(entries).__name__}, "
+                "not a list, so every question it declares is ignored and this procedure "
+                "reports nothing it could not settle",
+                path=rel,
+                line=line,
+            )
+        )
+        return
+    triggers = inquiry_triggers()
+    classes = verdict_classes()
+    seen_ids: Set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            diags.append(
+                _diag(
+                    "error",
+                    "open-question-not-a-mapping",
+                    f"ruleset {key!r} has an `open_questions` item that is not a mapping "
+                    "and is ignored whole",
+                    path=rel,
+                    line=line,
+                )
+            )
+            continue
+        question_id = str(entry.get("id", "") or "").strip()
+        at = _find_id_line(text, question_id) if question_id else line
+        label = question_id or "(unnamed)"
+        if not question_id:
+            diags.append(
+                _diag(
+                    "error",
+                    "open-question-no-id",
+                    f"ruleset {key!r} declares an open question with no `id`, so it is "
+                    "DROPPED — there would be nothing for a report to cite and nothing an "
+                    "operator could ask to have settled",
+                    path=rel,
+                    line=line,
+                    hint="give it a stable id; a report quotes it verbatim",
+                )
+            )
+        elif question_id in seen_ids:
+            diags.append(
+                _diag(
+                    "warning",
+                    "open-question-duplicate-id",
+                    f"ruleset {key!r} declares two open questions with id {question_id!r}, "
+                    "so a reported one cannot be traced back to one declaration",
+                    path=rel,
+                    line=at,
+                )
+            )
+        seen_ids.add(question_id)
+
+        # --- the trigger ------------------------------------------------------
+        when = entry.get("when")
+        when = when if isinstance(when, dict) else {}
+        condition = str(when.get("condition", "") or "").strip()
+        want_class = str(when.get("verdict_class", "") or "").strip()
+        if not condition and not want_class:
+            diags.append(
+                _diag(
+                    "error",
+                    "open-question-no-trigger",
+                    f"open question {label!r} declares neither `when.condition` nor "
+                    "`when.verdict_class`, so it is DROPPED — a question is raised by "
+                    "something this run's own results showed, and there is nothing here for "
+                    "the engine to read",
+                    path=rel,
+                    line=at,
+                    hint="`when: {condition: <a condition id>, result: unknown}`",
+                )
+            )
+        elif condition and condition_ids and condition not in condition_ids:
+            diags.append(
+                _diag(
+                    "error",
+                    "open-question-unknown-condition",
+                    f"open question {label!r} triggers on condition {condition!r}, which is "
+                    f"not a top-level condition of ruleset {key!r} — no subject carries a "
+                    "result for it, so the question can never be raised",
+                    path=rel,
+                    line=at,
+                    hint=(
+                        "name a condition in this ruleset's own `conditions:` list; a "
+                        "composite's CHILD is not one, because the parent renders the single "
+                        "result a subject carries"
+                    ),
+                )
+            )
+        result = str(when.get("result", "") or "unknown").strip().lower()
+        if triggers and result not in triggers:
+            diags.append(
+                _diag(
+                    "error",
+                    "open-question-unknown-result",
+                    f"open question {label!r} triggers on `when.result` {result!r}, which is "
+                    f"not one of {', '.join(triggers)} — no condition ever reads that, so the "
+                    "question can never be raised",
+                    path=rel,
+                    line=at,
+                )
+            )
+        if want_class and classes and want_class not in classes:
+            diags.append(
+                _diag(
+                    "error",
+                    "open-question-unknown-verdict-class",
+                    f"open question {label!r} triggers on verdict class {want_class!r}, which "
+                    f"the rollup never stamps (it stamps {', '.join(classes)}), so the "
+                    "question can never be raised",
+                    path=rel,
+                    line=at,
+                )
+            )
+
+        # --- the ask ----------------------------------------------------------
+        ask = entry.get("ask")
+        ask = ask if isinstance(ask, dict) else {}
+        source = str(ask.get("source", "") or "").strip()
+        if not source:
+            diags.append(
+                _diag(
+                    "error",
+                    "open-question-no-source",
+                    f"open question {label!r} declares no `ask.source`, so it is DROPPED — "
+                    "there is nothing to put the question to",
+                    path=rel,
+                    line=at,
+                )
+            )
+        elif source not in declared and source not in physical:
+            # Resolvable neither way: the accessor passes an unknown name through, so the
+            # probe asks a source no backend answers and the question reports `unanswered`
+            # for a reason that is a typo rather than an environment gap.
+            diags.append(
+                _diag(
+                    "error",
+                    "open-question-unknown-source",
+                    f"open question {label!r} would ask {source!r}, which is neither in this "
+                    "ruleset's `sources:` map nor a source the catalog declares — it can "
+                    "never be retrieved, so the question can never be settled",
+                    path=rel,
+                    line=at,
+                    hint=(
+                        "use this ruleset's own LOGICAL name, or the catalog's physical "
+                        "name; either way the source is NOT added to every run — it is asked "
+                        "with one bounded probe, or read for free if the run retrieved it"
+                    ),
+                )
+            )
+        if not str(ask.get("question", "") or "").strip():
+            diags.append(
+                _diag(
+                    "warning",
+                    "open-question-no-question-text",
+                    f"open question {label!r} declares no `ask.question`, so a report prints "
+                    "its id where the question should be and a probe of it carries no text "
+                    "for the query planner to shape a request from",
+                    path=rel,
+                    line=at,
+                    hint=(
+                        "one sentence naming what would be looked for; `{value}` and "
+                        "`{entity}` are substituted with the scope this run holds"
+                    ),
+                )
+            )
+        scope_entity = str(ask.get("scope_entity", "") or "").strip()
+        if scope_entity and entities and scope_entity not in entities:
+            diags.append(
+                _diag(
+                    "warning",
+                    "open-question-unknown-scope-entity",
+                    f"open question {label!r} is scoped by {scope_entity!r}, which this pack's "
+                    "glossary does not declare — no run will hold a value of that type, so the "
+                    "question reports `unreachable` every time instead of being asked",
+                    path=rel,
+                    line=at,
+                    hint=(
+                        "name an entity type the glossary declares, or leave `scope_entity` "
+                        "out to inherit this ruleset's own subject entity"
+                    ),
+                )
+            )
+
+        # --- the meanings -----------------------------------------------------
+        # The one check this lane exists for. A count with no declared meaning is the failure
+        # class the whole repo is organised against, and the three outcomes are not
+        # interchangeable: rows, no rows, and no answer license three different next steps.
+        raw_meaning = entry.get("meaning")
+        raw_meaning = raw_meaning if isinstance(raw_meaning, dict) else {}
+        missing = [
+            outcome
+            for outcome in ("rows", "empty", "unanswered")
+            if not str(raw_meaning.get(outcome, "") or "").strip()
+        ]
+        if missing:
+            diags.append(
+                _diag(
+                    "error",
+                    "open-question-missing-meaning",
+                    f"open question {label!r} declares no `meaning` for "
+                    f"{', '.join(missing)}, so it is DROPPED — an outcome with no declared "
+                    "meaning is a row count nobody can act on, and an unlabelled empty "
+                    "result is the failure this lane exists to report",
+                    path=rel,
+                    line=at,
+                    hint=(
+                        "`meaning: {rows: ..., empty: ..., unanswered: ...}` — what it means "
+                        "if the source has matching rows, if it has none, and if it does not "
+                        "answer at all"
                     ),
                 )
             )

@@ -260,6 +260,80 @@ the operator sees what the pack would do *after* the change and not before it �
 now refuses a plan that **introduces** a validation error (not one that inherits a
 pre-existing one, or a pack already failing could never be repaired through this surface).
 
+**`plan_checks` is four readings over that one candidate tree**, and the reason there are four
+is that each one is blind to the next: `pack_validate` (will the engine read the declaration),
+`pack_dry_run` (does the ruleset decide anything over rows that really came back),
+`pack_selection_delta` (which procedure would adjudicate) and `pack_verdict_delta` (what the
+edit does to the findings already on record). Only the first gates: the other three are
+warning-severity by construction, because a moved selection or a moved finding is usually the
+*point* of the edit and "is this move correct" is a judgement no arithmetic settles. `apply_plan`
+runs the validation alone (`dry_run=False`, `deltas=False`) — spending a replay budget and two
+corpus reads on every write to produce numbers no branch consults is a cost the preview already
+paid, and `tests/test_pack_assistant.py` pins each of the three as skipped rather than counting
+the two flags.
+
+### `pack_selection_delta.py` — which procedure would adjudicate, before and after
+
+`pack_validate` and `pack_dry_run` both read the **candidate pack in isolation**, and neither can
+see the one side effect an authoring edit has on every procedure at once: which ruleset adjudicates
+is a keyword score over the playbook titles and join keys, so adding a use case — or rewording one
+title — silently re-scores every incident the pack has ever seen. That failure is invisible by
+construction, because the losing procedure's conditions still resolve against real rows and every
+stage reports success.
+
+So this is a **difference and it needs both sides**: the same corpus scored under the base pack's
+specs and under the candidate's, and the runs whose selected procedure moved are named. Three
+properties, each because the alternative fails quietly:
+
+* **One scorer, not two.** Every score comes from `correlation.select_correlation_spec_explained`
+  through a duck-typed pack and analysis. A re-implementation here would drift, and the tie-break
+  on the secondary hypotheses is exactly the detail a copy loses.
+* **An unchanged vocabulary cannot move a selection**, so an edit leaving every title and key alone
+  short-circuits *before* reading the corpus. Most pack edits are that edit, and a check costing
+  seconds on every save is a check that gets turned off.
+* **No corpus means silence, not a clean result.** `compared` is the field to read first; an empty
+  `flips` with `compared=False` is a silence, and reporting "0 flipped" on a deployment with no
+  stored runs would read as a guarantee.
+
+`scripts/measure_playbook_selection.py` is now a thin CLI over the same functions, so the number in
+the preview and the number an author measures offline come from one implementation.
+
+### `pack_verdict_delta.py` — what the edit does to the findings already on record
+
+The three checks above can all pass while a reworded field path, a threshold moved by one, or a
+check imported under the other polarity changes what a report **concludes about a named person's
+conduct**. This one re-adjudicates the same stored evidence under both packs and diffs the
+per-subject, per-condition lines — the comparison one makes between two runs of one incident,
+made here between two packs over one run. Four properties:
+
+* **Base replay against candidate replay, never candidate against the RECORDED verdict.** A stored
+  run's evidence sidecar is flattened and carries neither `row_caps` nor `keyed_sources`, so a
+  replay legitimately reaches a weaker reading than the run did. Diffed against the recording that
+  is a regression on every line; diffed against the base pack's replay of the same rows it cancels
+  exactly, because both sides suffer it identically. The one caveat that does **not** cancel is
+  stated in `limits`: a condition reading `unknown` for the replay's own reasons reads `unknown`
+  under both packs, so an edit meant to fix such a check shows no change.
+* **An identical replay surface cannot move a verdict.** The surface is exactly three things — the
+  resolved ruleset specs, the `data/` files, and the entity→column bindings read through
+  `field_priors_for` — so an edit leaving all three alone short-circuits with zero IO. And
+  `replay_surface` **raises** on a pack it cannot read rather than returning an empty surface, which
+  would compare equal to the other side's empty one and short-circuit as "nothing moved"; the caller
+  degrades to `surface_changed=("unknown",)` and compares anyway.
+* **The comparison is proved able to disagree with itself first.** The base pack replays the first
+  run twice, and unless the two agree the delta is **withheld**. Without that control, a condition
+  reading the clock reports the author's edit as the cause of a change it did not make. One extra
+  replay for the whole check, not one per run.
+* **A `decided_flip` is reported apart from a transition through `unknown`** — pass↔fail is a
+  changed finding, a check that stopped answering is a broken one, and the remedies differ.
+
+Same posture as its sibling: pure, read-only, never raises, `compared` first, `python -m
+src.knowledge.pack_verdict_delta <base> <candidate>` as the CLI, and `scripts/replay_saved_
+verdicts.py` unchanged as the whole-corpus instrument. Tests: `tests/test_pack_verdict_delta.py`
+for the module, `tests/test_pack_assistant.py` for the seam — where the short-circuit is asserted by
+making the corpus read **raise**, because a store that is merely unused and one that is unreachable
+look identical from a passing test otherwise, and that is what keeps the editor's suite off the
+deployment's job history.
+
 ### `pack_assistant.py` — propose, never write
 
 `LLMClient.tool_call` is **one round and executes nothing**, so the agent loop is ours;
@@ -267,13 +341,31 @@ there was no example in the repo to copy, and the `messages` annotation actively
 (widened `List[Dict[str, str]]` → `List[Dict[str, Any]]`, since a tool round-trip carries a
 `tool_calls` *list* value).
 
-Seven read-only tools — `list_files`, `read_file`, `search`, `pack_summary`, `validate`,
-`read_skill` (below) and `dry_run` — and **no write tool at all**, which is what makes "nothing touches
+Eight read-only tools — `list_files`, `read_file`, `search`, `pack_summary`, `validate`,
+`dry_run`, `probe` (below) and `read_skill` (below) — and **no write tool at all**, which is what
+makes "nothing touches
 disk until the operator approves" structural rather than procedural. That list is pinned as
 a closed set in `test_pack_skills.py` rather than screened for names containing *write* or
 *patch*: a shadow run watched the model call **`edit_file`**, and a substring screen only
 ever covers the names somebody thought of. `dispatch_tool` answers an invented name by
-listing the real ones, which is what let that session recover and still propose a plan. `pack_summary` is the anti-hallucination tool:
+listing the real ones, which is what let that session recover and still propose a plan.
+
+**`probe` is the eighth and the only one that leaves the machine**, and it is admitted on exactly
+the terms the other seven are: it delegates to `pack_probe`, whose read-only posture is
+*structural* — the first token checked against a closed verb tuple and a `;`-chain refused rather
+than split — checked at the lane's seam before a connection is opened and again inside `Probe.ask`,
+never as a sentence in a tool description, because a prompt cannot beat another prompt. It exists
+because until it did, the method skills said *probe before you declare* and the model's only
+recourse was to write the measurement into `questions` for a human to take, so the loop never
+closed. Three structural bounds: a per-plan probe count, a row cap and a timeout, all three
+config-readable (`knowledge.assistant_probes` / `_probe_row_cap` / `_probe_timeout_seconds`, where
+`0` probes disables the lane); every probe recorded on the session snapshot, so the preview shows
+*what was measured to justify this line*; and the engine opened **lazily**, on the first probe that
+gets past its checks — a session that never probes builds no retriever and reaches no backend. When
+no backend is reachable the probe is refused and the plan degrades to today's `questions` behaviour,
+**never to a guessed number**.
+
+`pack_summary` is the anti-hallucination tool:
 it returns the entity types, source names, ruleset keys, shared-check ids, the 20 kinds the
 evaluator actually dispatches and the 3 that honour `expected_label` — which is what stops
 the model inventing a `kind` that `pack_validate` would then flag as an error. It reads the

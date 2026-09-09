@@ -92,6 +92,7 @@ SPRITE_HTML = r"""  <svg width="0" height="0" style="position:absolute" aria-hid
       <symbol id="i-chevron" viewBox="0 0 24 24"><path d="M9 5.5 15.5 12 9 18.5"/></symbol>
       <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M4.5 12h14"/><path d="M13.5 7 18.5 12l-5 5"/></symbol>
       <symbol id="i-signal" viewBox="0 0 24 24"><path d="M4 15.5a5.5 5.5 0 0 1 7.5-1"/><path d="M2 11.5a10.5 10.5 0 0 1 14.5-1.5"/><circle cx="12" cy="19" r="1.4" fill="currentColor" stroke="none"/></symbol>
+      <symbol id="i-user" viewBox="0 0 24 24"><circle cx="12" cy="8" r="3.8"/><path d="M4.5 20.5a7.5 7.5 0 0 1 15 0"/></symbol>
     </defs>
   </svg>
 """
@@ -147,6 +148,7 @@ RAIL_HTML = r"""  <button class="railopen" id="railOpen" aria-label="Show the na
           <button class="railsublink" data-for="config" data-sub="form">Form</button>
           <button class="railsublink" data-for="config" data-sub="raw">Raw YAML</button>
           <button class="railsublink" data-for="config" data-sub="io">Import / export</button>
+          <button class="railsublink" data-for="config" data-sub="creds">My credentials</button>
         </div>
       </div>
       <div class="railgroup">
@@ -193,6 +195,12 @@ HEADER_HTML = r"""  <header>
       <button class="jobtag" id="jobtag" aria-haspopup="dialog" aria-expanded="false" title="Run controls for this job — pause, retry, cancel, override a stage output" hidden></button>
       <div class="spacer"></div>
       <button class="btn small" id="jobsToggle" aria-haspopup="dialog" aria-expanded="false" title="Every live job — attach this page to another one"><svg class="ico"><use href="#i-jobs"/></svg> Jobs</button>
+      <!-- Who the platform says you are. HIDDEN in the markup and shown only when
+           /api/v1/whoami reports `enforced`, so the page inherits the platform-neutrality
+           guarantee the resolver has: on a laptop, a VM, an App Service or a Databricks App
+           nothing here appears at all, because there is nobody to be segregated from and a
+           chip reading "admin" would be answering a question that was never asked. -->
+      <button class="btn small" id="idBtn" aria-haspopup="dialog" aria-expanded="false" title="Who you are here, and where your edits land" hidden><svg class="ico"><use href="#i-user"/></svg> <span id="idBtnText">you</span></button>
       <button class="svcdot" id="svcDot" title="Checking the service…"><svg class="ico"><use href="#i-signal"/></svg><span id="svcText">checking</span></button>
       <span class="clock" id="clock">00:00</span>
     </div>
@@ -208,11 +216,14 @@ HEADER_HTML = r"""  <header>
 #: panel is here rather than inside Investigate because a gate can open while the operator is
 #: reading the report or editing config, and it holds the run until answered. It stays in the
 #: flow rather than becoming a modal: the job at a gate is to read the stage output first, and a
-#: dialog that must be dismissed to see the evidence turns a review into a guess. The two
+#: dialog that must be dismissed to see the evidence turns a review into a guess. The three
 #: popovers are global because their triggers are in the topbar.
 GLOBAL_HTML = r"""    <div class="pop" id="jobsPop" role="dialog" aria-label="Jobs" hidden>
       <div class="pophead">
-        <h2><svg class="ico"><use href="#i-jobs"/></svg> Jobs <span class="sub">newest first — click a row to attach</span></h2>
+        <!-- The scope note is empty until whoami says the list is filtered. A jobs list that
+             silently shows a subset reads as a list of every job there is, and the operator's
+             next move ("nobody is running anything") is wrong in a way nothing corrects. -->
+        <h2><svg class="ico"><use href="#i-jobs"/></svg> Jobs <span class="sub">newest first — click a row to attach</span> <span class="sub" id="jobsScope"></span></h2>
         <button class="popicon" id="jobsPopExpand" title="Widen this panel"><svg class="ico"><use href="#i-expand"/></svg></button>
         <button class="popicon" id="jobsPopClose" title="Close (Esc)"><svg class="ico"><use href="#i-x"/></svg></button>
       </div>
@@ -320,6 +331,38 @@ GLOBAL_HTML = r"""    <div class="pop" id="jobsPop" role="dialog" aria-label="Jo
         <div id="lnkBudget"></div>
         <div id="lnkModes"></div>
       </div>
+    </div>
+
+    <!-- You, and your drafts. Hung off the identity chip, so it is unreachable wherever the
+         chip is hidden. Three things it answers, and each is a question the rest of the page
+         cannot: WHO the platform says you are and WHY you have the role you have (a reader who
+         cannot see the reason has nothing to act on); where your edits LAND, since a 200 does
+         not distinguish "everyone now runs this" from "your own copy of it"; and which files
+         you are carrying a draft of — with the way back to the base, which is also the only
+         way out of a merge conflict a release left in your text.
+
+         The elevation row exists because the two proxy paths carry different amounts of
+         identity: the browser forwards a validated NAME and no token, so an owner arrives
+         indistinguishable from a reader and this is how they show otherwise. Their own token,
+         validated against the name the platform already asserted, never stored. -->
+    <div class="pop" id="idPop" role="dialog" aria-label="You and your drafts" hidden>
+      <div class="pophead">
+        <h2><svg class="ico"><use href="#i-user"/></svg> You <span class="sub" id="idWho"></span></h2>
+        <button class="popicon" id="idPopClose" title="Close (Esc)"><svg class="ico"><use href="#i-x"/></svg></button>
+      </div>
+      <div class="banner" id="idWhy"></div>
+      <div class="row" id="idElevateRow" hidden>
+        <input id="idToken" type="password" placeholder="your own workspace token — proves your groups, never stored" style="flex:1;min-width:14rem"/>
+        <button class="btn small" id="idElevate"><svg class="ico"><use href="#i-check"/></svg> Prove my groups</button>
+        <span class="statusline" id="idElevateStatus"></span>
+      </div>
+      <div class="row">
+        <span class="statusline"><strong>Your drafts</strong></span>
+        <button class="btn small" id="idOverlayRefresh"><svg class="ico"><use href="#i-refresh"/></svg> Refresh</button>
+        <div class="spacer"></div>
+        <span class="statusline" id="idOverlayStatus"></span>
+      </div>
+      <div id="idOverlayRows"></div>
     </div>
 
     <!-- Transient outcomes. Never the ONLY record of anything: every call site keeps its

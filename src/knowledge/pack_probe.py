@@ -905,28 +905,46 @@ def _flatten(value: Any, prefix: str = "") -> List[str]:
     return [prefix] if prefix else []
 
 
-# ------------------------------------------------------------------------------- CLI
+# --------------------------------------------------------------------- rendering + CLI
+
+
+def render(obj: Any, *, max_rows: int = TOP_VALUES) -> str:
+    """One measurement as text, for a terminal or a tool result.
+
+    A cut row list SAYS it was cut. The row cap is the same class of bound as a retriever's
+    ``max_results``, and this module's whole posture is that ``N rows`` and ``N rows, and
+    there were more`` are different findings — so the caller reading twenty buckets of a
+    hundred has to be told which of the two it is holding.
+    """
+    if isinstance(obj, Measurement):
+        lines = [str(obj)]
+        shown = obj.rows[: max(0, int(max_rows))]
+        lines += [f"    {json.dumps(row, default=str)}" for row in shown]
+        if len(obj.rows) > len(shown):
+            lines.append(
+                f"    ... {len(obj.rows) - len(shown)} further row(s) not shown "
+                f"(this rendering caps at {max_rows})"
+            )
+        if obj.query:
+            lines.append(f"    query: {obj.query}")
+        return "\n".join(lines)
+    if isinstance(obj, Comparison):
+        return str(obj)
+    if isinstance(obj, dict):
+        out = []
+        for key, value in obj.items():
+            if isinstance(value, Measurement):
+                out.append(f"  {key}: {value.summary()}")
+            elif isinstance(value, Comparison):
+                out.append(f"  {key}: {value.verdict()}")
+            else:
+                out.append(f"  {key}: {value}")
+        return "\n".join(out)
+    return str(obj)
 
 
 def _print(obj: Any) -> None:
-    if isinstance(obj, Measurement):
-        print(str(obj))
-        for row in obj.rows[:TOP_VALUES]:
-            print(f"    {json.dumps(row, default=str)}")
-        if obj.query:
-            print(f"    query: {obj.query}")
-        return
-    if isinstance(obj, Comparison):
-        print(str(obj))
-        return
-    if isinstance(obj, dict):
-        for key, value in obj.items():
-            if isinstance(value, (Measurement, Comparison)):
-                print(f"  {key}: {value.summary() if isinstance(value, Measurement) else value.verdict()}")
-            else:
-                print(f"  {key}: {value}")
-        return
-    print(obj)
+    print(render(obj))
 
 
 async def _run(args) -> int:

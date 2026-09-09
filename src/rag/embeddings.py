@@ -183,6 +183,7 @@ class DatabricksEmbeddingProvider(EmbeddingProvider):
         *,
         host: str = "",
         token: str = "",
+        token_env: str = "",
         auth=None,
         verify_ssl: bool = True,
         **kwargs,
@@ -190,6 +191,9 @@ class DatabricksEmbeddingProvider(EmbeddingProvider):
         super().__init__(model, **kwargs)
         self._host = (host or "").rstrip("/")
         self._static_token = token or ""
+        # The NAME, kept beside the value: a caller who replaced this credential is looked up
+        # by name, and the value alone cannot say which one it came from.
+        self._token_env = (token_env or "").strip()
         self._auth = auth
         self._verify_ssl = bool(verify_ssl)
         if not self._host and auth is not None:
@@ -206,6 +210,15 @@ class DatabricksEmbeddingProvider(EmbeddingProvider):
             self._ctx.verify_mode = ssl.CERT_NONE
 
     def _token(self) -> str:
+        if self._token_env:
+            try:
+                from src.user_secrets import personal_value
+
+                own = personal_value(self._token_env)
+                if own:
+                    return own
+            except Exception as exc:  # noqa: BLE001 — an override may never fail a retrieval
+                logger.debug("Personal credential lookup failed: %s", exc)
         if self._auth is not None:
             try:
                 live = self._auth.token()
@@ -323,6 +336,7 @@ def build_embedding_provider(rag_config: Optional[dict] = None, auth=None):
             model,
             host=str(cfg.get("embedding_host") or "").strip(),
             token=os.environ.get(token_env, "") if token_env else "",
+            token_env=token_env,
             auth=auth,
             verify_ssl=bool(cfg.get("embedding_verify_ssl", True)),
             **common,

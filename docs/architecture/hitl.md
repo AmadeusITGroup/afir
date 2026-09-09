@@ -377,6 +377,33 @@ the thing to ask whether it hallucinated an entity.
   whole population is blank promises nothing, and a spilled list counts what it dropped.
   (3) **`_rendered_len` measures the UNCLIPPED pack** — gating on the clipped length makes the
   whole ladder a no-op at the only budget anyone runs.
+- **One degradation is charged once, and a designed path is not a degradation at all.**
+  Four correlation signals stacked to *exactly* 1.0 on live runs — `evidence_clipped` 0.3 +
+  `verdict_degraded` 0.3 + `brief_degraded` 0.3 + `narration_skipped` 0.1 — reporting health
+  0.00 for a stage whose verdict, conditions and sources were all intact. Two of those four
+  were not findings:
+  - `brief.degraded` is seeded with `bool(verdict.degraded)` and only ever OR-ed with its own
+    two causes (a decisive check's input dropped by retrieval, a scope sweep that could not
+    widen — `usecases/base.py`), so it is a **superset** by construction. Firing both codes
+    charged one missing-data fact twice. `brief_degraded` now fires only where the verdict is
+    *not* degraded, which is the only case where it carries information the other code doesn't;
+    when it is entailed, the suppression is logged.
+  - Empty `findings` has two causes and only one is a defect. The volume gate choosing the
+    deterministic plan is a **configured choice** (`correlation.llm_max_records` /
+    `llm_max_sources`), `summary_text` still flows downstream and no verdict reads `findings` —
+    so it is logged, not charged. Narration that *ran* and came back empty is the defect, and
+    the two are indistinguishable from the result alone: the module records which path it took
+    (`last_narration`), the run copies it onto `ctx.stage_facts` (the module is shared across
+    jobs, so its attribute holds whichever run finished last), and an **unrecorded** path is
+    still charged — unknown is not "designed".
+- **A limit the operator configured is not a defect of the stage that hit it.**
+  `source_truncated` sat at 0.25, midway to gating on its own, for a source that came back at
+  exactly the `max_results` the operator set. A capped source *answered*; what a cap costs is
+  certainty about the count, and that is already carried everywhere the count is read (the
+  evidence pack, the brief, `scope_status`, the report's evidence-limits section). It stays a
+  deduction — "N rows" and "N rows, and there were more" are different findings — but at 0.1,
+  the tier of the other configured-limit signals (`detection_truncated_retried`,
+  `narration_truncated_retried`), so truncation pauses a run only when it is pervasive.
 - **Every weight and threshold is config-overridable** (`stage_gates.weights`,
   `stage_gates.threshold`, `stage_gates.stages.<name>.threshold`) because the default
   0.6 is a starting point to calibrate against observed runs, not a measured constant.
@@ -429,10 +456,21 @@ weights* over the empty sources instead of their count, `0.0` means an empty res
 valid ANSWER and fires nothing at all, and an undeclared pack scores exactly as before.
 Two properties matter beyond the number. The domain judgement stays out of `src/` — the
 engine never names a source. And **the discount is visible**: the reason string appends
-`— discounted as expected/valid: automated_users (no row means … a HUMAN actor); …`,
-because a silently smaller penalty is one the operator cannot check, and the whole point of
-a deterministic score is that it can be checked. A malformed `health_weight` is logged and
-ignored (counts in full) rather than allowed to break a scorer that runs on every stage.
+`— discounted as partly expected: payment_alerts (card-tender only); …`, because a silently
+smaller penalty is one the operator cannot check, and the whole point of a deterministic score
+is that it can be checked. A malformed `health_weight` is logged and ignored (counts in full)
+rather than allowed to break a scorer that runs on every stage.
+
+**And a source excluded from the arithmetic is excluded from the SENTENCE.** The reason
+listed every empty source under one heading and appended the discount note after it, capped
+at five names each — so a live run read *"3 of 8 source(s) returned zero rows: psa_raw_access,
+automated_users, admin_history"* with the note that two of those three were expected trailing
+behind a name cap, and an operator reasonably read the check that succeeded by coming back
+empty as the penalty. The headline now counts and names only the sources that are actually
+charged; the `health_weight == 0` ones follow in their own clause — *"N further source(s)
+ANSWERED by being empty and are not counted here"* — with the `meaning` beside each. Same
+arithmetic, and the same three groups a pack can declare (charged in full, discounted, answered)
+now read as three groups.
 
 **And the score is not where the reader looks.** The declaration was honoured by the scorer
 and by nothing else, so the same emptiness reached the report as a bare `0 record(s)` —
@@ -705,9 +743,15 @@ Writes are atomic: temp file → **parsed back** → `os.replace`, with the prev
 version kept as `.prev` (and read as a fallback). A truncated write that happens to be
 valid JSON is indistinguishable from a real job doc at load time.
 
-Job **files** outlive the in-memory TTL (`jobs.retention_days`, default 14 vs. 1 hour):
-evicting a finished job from memory must not destroy a record an auditor wants next
-week. Config: `jobs.{persist,dir,max_evidence_mb,retention_days}`.
+Job **files** outlive the in-memory TTL (`jobs.retention_days`, default 14 days vs.
+`jobs.completed_ttl_seconds`, default 3600): evicting a finished job from memory must not
+destroy a record an auditor wants next week. **And it must not remove it from the list either**
+— the TTL bounds memory, not visibility, so `_prune` keeps a compact row (`live: false`,
+bounded by `jobs.history_max_items`) and naming the id rehydrates the whole document through
+`JobManager.hydrate` → `JobStore.load_one`. Before that, submitting one run erased every
+finished run from `GET /api/v1/jobs` while the documents sat untouched, which reads as a run
+that was deleted. Config:
+`jobs.{persist,dir,max_evidence_mb,retention_days,completed_ttl_seconds,history_max_items}`.
 
 ---
 

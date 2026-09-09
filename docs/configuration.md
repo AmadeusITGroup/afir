@@ -236,7 +236,7 @@ Controls the correlation and verdict stage.
 | `llm_max_records` | live | 2000 | Volume gate: above this the deterministic plan is used and the LLM is skipped. |
 | `llm_max_sources` | live | 6 | Source gate for the same decision. |
 | `discovery_key_filter` | live | `strict` | How aggressively join keys are discovered when no playbook overrides: `strict`, `cardinality`, or `both`. |
-| `evidence_char_budget` | live | 15000 | Character budget for the evidence pack fed to anomaly detection and report generation. The pack degrades (aggregates harder) to fit this before reaching the LLM stages. |
+| `evidence_char_budget` | live | 80000 | Character budget for the evidence pack fed to anomaly detection and report generation. The pack degrades (aggregates harder) to fit this before reaching the LLM stages, so a budget below what a run actually renders costs adjudicated values and scores `evidence_clipped`. A ceiling, not a target: a full 41-source investigation renders at ~37,000 chars and a small one costs far less. The engine's own fallback where the key is absent stays 15,000. |
 
 #### `correlation.links`
 

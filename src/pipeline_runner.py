@@ -12,6 +12,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from export_results import ResultExporter
 from human_guidance import render_guidance
+from identity import owner_of, owner_scoped
 from job_queue import JobQueue, QueueFull
 from job_store import EVIDENCE_KEYS
 from link_children import child_budget, child_incident, plan_child_spawns
@@ -20,6 +21,11 @@ from links import compose_referral
 from models.pydantic_models import (AnomalyItem, CorrelationResult,
                                     RetrievalQuery, UnderstandingResult)
 from notifications import emitter
+# Package-qualified deliberately: a flat import would be a second module object with its own
+# installed store, so the runner would resolve nobody's personal credentials while main() and
+# the HTTP layer resolved everybody's.
+from src.user_secrets import (current_segment, reset_current_segment,
+                              set_current_segment)
 from stage_health import (score_stage, stage_gate_enabled,
                           stage_gate_on_timeout, stage_gate_timeout)
 from utils.paths import exports_dir
@@ -27,7 +33,10 @@ from utils.paths import exports_dir
 logger = logging.getLogger(__name__)
 
 _EVENT_HISTORY_CAP = 500  # replay buffer cap per job
-_JOB_TTL_SECONDS = 3600   # terminal-job in-memory TTL
+_JOB_TTL_SECONDS = 3600   # terminal-job in-memory TTL, default for jobs.completed_ttl_seconds
+#: How many pruned runs keep a compact row in memory. Bounds the list, not the store:
+#: the documents outlive this at `jobs.retention_days` and rehydrate on demand.
+_HISTORY_MAX_ITEMS = 2000
 # Source's backend query generated; source is still `running`. Not a lifecycle status.
 _QUERY_READY = "query_ready"
 
@@ -37,6 +46,16 @@ _PASS_STAGES = ("query_generation", "log_retrieval")
 _LAST_PASS_STAGE = _PASS_STAGES[-1]
 #: Hard bound; prevents a mis-authored pack from looping on a self-qualifying harvest.
 DEFAULT_MAX_RETRIEVAL_PASSES = 3
+
+
+def _as_int(value, default: int) -> int:
+    """``value`` as int, or ``default``; a typo must not silently become 0."""
+    if value is None or isinstance(value, bool):
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def max_retrieval_passes(config) -> int:
@@ -312,6 +331,10 @@ class Job:
             "current_stage": self.current_stage,
             "description": self.incident.get("description"),
             "extended_retrieval": bool(self.incident.get("extended_retrieval")),
+            # Who asked for this run, projected so a single-job read is attributable on its
+            # own — the list endpoint is not the only place an admin looks.
+            "owner": owner_of(self.incident),
+            "owner_name": self.incident.get("owner_name"),
             # Queue position omitted: it changes as the backlog drains; list and batch
             # endpoints report the live value.
             "batch_id": self.incident.get("batch_id"),
@@ -403,9 +426,11 @@ def _adjudicating_ruleset_key(ctx: JobContext) -> Tuple[str, str]:
     understanding = ctx.outputs.get("understanding")
     analysis = getattr(understanding, "analysis", None)
     correlation = ctx.modules.get("correlation")
+    unselected = False
     if analysis is not None and correlation is not None:
         try:
-            spec = correlation._playbook_correlation_spec(analysis)
+            spec, basis = correlation._playbook_correlation_spec_explained(analysis)
+            unselected = bool(getattr(basis, "defaulted", False))
             key = pack.ruleset_key_for(str((spec or {}).get("use_case", "") or ""))
             if key:
                 return key, "the matched playbook's use case"
@@ -416,7 +441,14 @@ def _adjudicating_ruleset_key(ctx: JobContext) -> Tuple[str, str]:
                 exc,
             )
     try:
-        return pack.default_ruleset_key(), "the pack's default ruleset"
+        # The reason distinguishes the two ways the default is reached, because an operator
+        # reading "the pack's default ruleset" cannot tell a pack with one procedure from an
+        # incident no procedure recognised.
+        return pack.default_ruleset_key(), (
+            "the pack's default ruleset, because NO procedure matched this incident"
+            if unselected
+            else "the pack's default ruleset"
+        )
     except Exception:  # noqa: BLE001
         return "", "the pack could not name a default ruleset"
 
@@ -711,7 +743,8 @@ async def _run_correlation(ctx: JobContext):
         return None
     logs = ctx.outputs["logs"]
     understanding = ctx.outputs["understanding"]
-    return await ctx.modules["correlation"].analyze(
+    module = ctx.modules["correlation"]
+    result = await module.analyze(
         logs,
         understanding,
         guidance=_guidance(ctx, "correlation"),
@@ -723,6 +756,34 @@ async def _run_correlation(ctx: JobContext):
         ),
         link_modes=dict(ctx.link_modes or {}),  # passed each call so gate-rejection re-run keeps it
     )
+    _record_procedure_selection(ctx, module)
+    return result
+
+
+def _record_procedure_selection(ctx: JobContext, module) -> None:
+    """Write how THIS run's procedure was chosen, and which narration path ran, onto ctx.
+
+    Never raises. Same reason as `_record_dependency_findings`: the correlation module is
+    shared across jobs, so its `last_selection` / `last_narration` attributes hold whichever
+    run finished most recently.
+    """
+    try:
+        facts = ctx.stage_facts.get("correlation")
+        facts = dict(facts) if isinstance(facts, dict) else {}
+        mode = getattr(module, "last_narration", None)
+        if isinstance(mode, str) and mode:
+            facts["narration"] = mode
+        basis = getattr(module, "last_selection", None)
+        if hasattr(basis, "to_dict"):
+            facts["procedure_selection"] = basis.to_dict()
+        ctx.stage_facts["correlation"] = facts
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Could not record how this run's procedure was selected (%s: %s); stage health "
+            "falls back to the shared module's attribute, which may hold another run's answer.",
+            type(exc).__name__,
+            exc,
+        )
 
 
 async def _run_anomaly_detection(ctx: JobContext):
@@ -781,7 +842,7 @@ def _run_export(ctx: JobContext):
             },
             "anomalies": [a.model_dump() for a in anomalies],
         },
-        storage=ctx.modules.get("artifact_storage"),
+        storage=owner_scoped(ctx.modules.get("artifact_storage"), incident),
     )
     exports = exports_dir()
     json_path = str(exports / f"incident_{incident['id']}.json")
@@ -1134,6 +1195,22 @@ def _summ_correlation(o):
                 )[0],
                 "degraded": bool(getattr(brief, "degraded", False)),
             }
+
+    # Read back off the notes the annotation wrote (correlation._annotate_procedure_selection)
+    # rather than off `ctx.stage_facts`: `_summ_correlation` sees only the result, and deriving
+    # it here means the UI states exactly what the report states, never a second computation of
+    # the same fact that can disagree with it. One run-level line, not one per subject: the
+    # remedy (`pinned_use_case`) is run-level too.
+    def _unselected_note(res) -> str:
+        holders = list(
+            getattr(getattr(res, "verdict", None), "subjects", None) or []
+        ) + ([getattr(res, "brief", None)] if getattr(res, "brief", None) else [])
+        for holder in holders:
+            for note in getattr(holder, "notes", None) or []:
+                if isinstance(note, str) and note.startswith("procedure_unselected="):
+                    return _prose(note.split("=", 1)[1])
+        return ""
+
     # The advisory lane. Carried in the summary so an operator can act from here.
     # state rides verbatim: the four states must not collapse to a boolean anywhere.
     _links = getattr(o, "links", None)
@@ -1208,6 +1285,49 @@ def _summ_correlation(o):
         if isinstance(_links, list)
         else []
     )
+    # The other advisory lane. Same posture, and the five states ride verbatim for the same
+    # reason: an unasked question must never render as an answered one.
+    _inquiries = getattr(o, "inquiries", None)
+
+    def _scope_values(f):
+        vals = getattr(f, "scope_values", None)
+        return [_clip(v, 120) for v in vals] if isinstance(vals, list) else []
+
+    inquiries_view = (
+        [
+            {
+                "id": _clip(getattr(f, "id", ""), 120),
+                "state": _clip(getattr(f, "state", ""), 40),
+                "question": _prose(getattr(f, "question", "")),
+                "source": _clip(getattr(f, "source", ""), 120),
+                "trigger": _prose(getattr(f, "trigger", "")),
+                "trigger_condition": _clip(getattr(f, "trigger_condition", ""), 120),
+                "trigger_result": _clip(getattr(f, "trigger_result", ""), 40),
+                "scope_entity": _clip(getattr(f, "scope_entity", ""), 80),
+                "scope_values": _counted(_scope_values(f))[0],
+                "scope_value_count": len(_scope_values(f)),
+                # The pack's own sentence for the outcome. Without it the count below is a
+                # number nobody can act on, which is the whole reason the lane declares it.
+                "meaning": _prose(getattr(f, "meaning", "")),
+                "rows_matched": (
+                    getattr(f, "rows_matched", 0)
+                    if isinstance(getattr(f, "rows_matched", None), int)
+                    else 0
+                ),
+                # A count at its cap is a floor, not a total.
+                "row_cap_hit": bool(getattr(f, "row_cap_hit", False)),
+                # probe_spent=False on an answered question is the free rung, not a refusal.
+                "probe_spent": bool(getattr(f, "probe_spent", False)),
+                "probe_note": _prose(getattr(f, "probe_note", "")),
+                "gap_reason": _prose(getattr(f, "gap_reason", "")),
+                "advisory_note": _prose(getattr(f, "advisory_note", "")),
+                "note": _prose(getattr(f, "note", "")),
+            }
+            for f in _counted(_inquiries)[0]
+        ]
+        if isinstance(_inquiries, list)
+        else []
+    )
     return {
         "record_count": getattr(o, "record_count", 0),
         "resolved_correlation_keys": [_key_view(k) for k in _counted(resolved)[0]],
@@ -1226,6 +1346,10 @@ def _summ_correlation(o):
         "links": links_view,
         # True total beside the bounded list.
         "link_count": len(_links) if isinstance(_links, list) else 0,
+        "inquiries": inquiries_view,
+        "inquiry_count": len(_inquiries) if isinstance(_inquiries, list) else 0,
+        # Empty on every run whose procedure was chosen, which is every run today.
+        "procedure_unselected": _unselected_note(o),
     }
 
 
@@ -1399,7 +1523,7 @@ class JobManager:
         event_emitter,
         modules=None,
         config=None,
-        ttl_seconds=_JOB_TTL_SECONDS,
+        ttl_seconds=None,
         store=None,
     ):
         self.stages = stages
@@ -1407,11 +1531,23 @@ class JobManager:
         self.emitter = event_emitter
         self.modules = modules or {}
         self.config = config or {}
-        self.ttl_seconds = ttl_seconds
+        jobs_cfg = self.config.get("jobs") or {}
+        # An explicit argument wins (0 and -1 are meaningful, so `is None` and not falsiness).
+        self.ttl_seconds = (
+            ttl_seconds
+            if ttl_seconds is not None
+            else _as_int(jobs_cfg.get("completed_ttl_seconds"), _JOB_TTL_SECONDS)
+        )
+        self.history_max_items = _as_int(
+            jobs_cfg.get("history_max_items"), _HISTORY_MAX_ITEMS
+        )
         # Optional durable store. None keeps the manager in-memory (classic blocking
         # endpoints, existing tests).
         self.store = store
         self._jobs: Dict[str, Job] = {}
+        # Compact rows of runs evicted by _prune, so the TTL bounds MEMORY and not the
+        # operator's history. Rehydrated from the store on demand, one read per click.
+        self._history: Dict[str, dict] = {}
         # Reads its bounds from self.config on every call, so a width change applies to the next admission.
         self.queue = JobQueue(self.config)
         # Per-process child-run counter for the rung-4 backstop. Not persisted:
@@ -1593,6 +1729,35 @@ class JobManager:
     def get_job(self, job_id) -> Optional[Job]:
         return self._jobs.get(job_id)
 
+    def hydrate(self, job_id) -> Optional[Job]:
+        """The job, reloading it from the store if the TTL has evicted it. One read, on demand.
+
+        Deliberately not folded into `get_job`, which is on the hot control paths: a run
+        that is not in memory is not startable, and only a READ should pay for a fetch.
+        """
+        job = self._jobs.get(job_id)
+        if job is not None or self.store is None:
+            return job
+        try:
+            doc = self.store.load_one(str(job_id))
+        except Exception as exc:  # noqa: BLE001 — a read must not fail the request
+            logger.debug("Could not read persisted job %s: %s", job_id, exc)
+            return None
+        if not doc:
+            return None
+        try:
+            job = self.import_job(doc)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Persisted job %s could not be rehydrated: %s", job_id, exc)
+            return None
+        self._history.pop(str(job_id), None)
+        logger.info(
+            "Rehydrated job %s (status=%s) from the store on demand.",
+            job.job_id,
+            job.status.value,
+        )
+        return job
+
     # -- the run queue -----------------------------------------------------
 
     def submit_job(self, job: Job) -> bool:
@@ -1752,6 +1917,9 @@ class JobManager:
             "batch_id": str(batch_id),
             "total": len(jobs),
             "counts": counts,
+            # A batch is a label on its jobs, so its owner is theirs; taken from the first
+            # rather than asserted, and empty when they disagree, which nothing creates.
+            "owner": owner_of(jobs[0].incident),
             "done": sum(counts.get(s.value, 0) for s in _TERMINAL_STATUSES),
             "jobs": [
                 {
@@ -1799,27 +1967,44 @@ class JobManager:
             "already_finished": already,
         }
 
+    def _job_row(self, job) -> dict:
+        """One compact row for the list endpoints. Also the shape `_prune` keeps."""
+        return {
+            "job_id": job.job_id,
+            "incident_id": job.incident.get("id"),
+            "status": job.status.value,
+            "run_mode": job.run_mode.value,
+            "current_stage": job.current_stage,
+            "created_at": job.created_at,
+            "updated_at": job.updated_at,
+            # Stage waiting on a human, so a list view can show "needs you".
+            "awaiting_stage": (job.open_gate or {}).get("stage"),
+            "batch_id": job.incident.get("batch_id"),
+            # Who asked for this run. Carried in the row so the list endpoint can
+            # narrow to one caller without re-reading every job.
+            "owner": owner_of(job.incident),
+            "owner_name": job.incident.get("owner_name"),
+            # 1-based place in the backlog; 0 for anything not waiting. Read live here
+            # rather than stored on the job, so it cannot go stale as the queue drains.
+            "queue_position": self.queue.position(job.job_id),
+            # Whether the run is still held in memory. A `false` row answers reads from the
+            # store, so an operator can tell "finished a while ago" from "gone".
+            "live": True,
+        }
+
     def list_jobs(self) -> List[dict]:
-        """Compact list of all live jobs (newest first) for GET /api/v1/jobs."""
-        rows = [
-            {
-                "job_id": job.job_id,
-                "incident_id": job.incident.get("id"),
-                "status": job.status.value,
-                "run_mode": job.run_mode.value,
-                "current_stage": job.current_stage,
-                "created_at": job.created_at,
-                "updated_at": job.updated_at,
-                # Stage waiting on a human, so a list view can show "needs you".
-                "awaiting_stage": (job.open_gate or {}).get("stage"),
-                "batch_id": job.incident.get("batch_id"),
-                # 1-based place in the backlog; 0 for anything not waiting. Read live here
-                # rather than stored on the job, so it cannot go stale as the queue drains.
-                "queue_position": self.queue.position(job.job_id),
-            }
-            for job in self._jobs.values()
-        ]
-        rows.sort(key=lambda r: r["created_at"], reverse=True)
+        """Compact list of jobs (newest first) for GET /api/v1/jobs.
+
+        Includes runs the TTL has evicted from memory, which are still in the store: a
+        finished investigation vanishing from the list on someone else's submission reads
+        as a run that was deleted.
+        """
+        rows = [self._job_row(job) for job in self._jobs.values()]
+        live = {row["job_id"] for row in rows}
+        rows.extend(
+            row for job_id, row in self._history.items() if job_id not in live
+        )
+        rows.sort(key=lambda r: r["created_at"] or "", reverse=True)
         return rows
 
     def list_open_gates(self) -> List[dict]:
@@ -1832,6 +2017,7 @@ class JobManager:
                 # The job's own status, so a client can tell an answerable gate from one
                 # on a run that has since ended.
                 "status": job.status.value,
+                "owner": owner_of(job.incident),
                 **job.open_gate,
             }
             for job in self._jobs.values()
@@ -1841,7 +2027,12 @@ class JobManager:
         return rows
 
     def _prune(self):
-        """Drop terminal in-memory jobs older than the TTL; the persisted copy has its own retention via JobStore.prune."""
+        """Evict terminal in-memory jobs older than the TTL, keeping each one's compact row.
+
+        The TTL bounds how much a long-lived process holds, not how far back the operator
+        can see: the row stays listable and the document stays in the store under its own
+        retention (`JobStore.prune`), so `_hydrate` can answer a read of either.
+        """
         now = time.time()
         stale = [
             jid
@@ -1850,7 +2041,20 @@ class JobManager:
             and (now - job.created_ts) > self.ttl_seconds
         ]
         for jid in stale:
-            self._jobs.pop(jid, None)
+            job = self._jobs.pop(jid, None)
+            if job is None:
+                continue
+            row = self._job_row(job)
+            row["live"] = False
+            row["queue_position"] = 0
+            self._history[jid] = row
+        # Newest kept: an operator looking back looks back from now.
+        while len(self._history) > max(0, self.history_max_items):
+            oldest = min(
+                self._history,
+                key=lambda k: self._history[k].get("created_at") or "",
+            )
+            self._history.pop(oldest, None)
 
     # -- events ------------------------------------------------------------
 
@@ -2052,6 +2256,53 @@ class JobManager:
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "Could not record the automatic link escalations for job %s (%s).",
+                job.job_id,
+                exc,
+            )
+            return recorded
+
+    def _record_inquiry_probes(self, job: Job, result: Any) -> int:
+        """Record one durable entry per open-question probe this run spent. Never raises.
+
+        Same reason as the link escalations above: the engine spent a retrieval nobody clicked
+        for, and a spend with no record is a spend nobody can audit. Only the questions that cost
+        a probe are recorded — a refusal is on the finding and costs nothing.
+        """
+        recorded = 0
+        try:
+            inquiries = getattr(result, "inquiries", None)
+            if not isinstance(inquiries, list):
+                return 0
+            for finding in inquiries:
+                if not bool(getattr(finding, "probe_spent", False)):
+                    continue
+                note = str(getattr(finding, "probe_note", "") or "no note was recorded")
+                detail = (
+                    f"open question '{getattr(finding, 'id', '') or '?'}' spent one probe of "
+                    f"'{getattr(finding, 'source', '') or '?'}' and settled as "
+                    f"'{getattr(finding, 'state', '') or '?'}': {note} — this run's verdict, its "
+                    "severity and its stage health were not read from it and did not move"
+                )
+                job.record_intervention(
+                    "inquiry_probed",
+                    stage="correlation",
+                    detail=detail,
+                    actor="engine",
+                )
+                recorded += 1
+            if recorded:
+                job.touch()
+                self._persist(job)
+                logger.info(
+                    "Recorded %d open-question probe(s) for job %s; the advisory lane asked and "
+                    "the verdict did not read any of it.",
+                    recorded,
+                    job.job_id,
+                )
+            return recorded
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Could not record the open-question probes for job %s (%s).",
                 job.job_id,
                 exc,
             )
@@ -2313,6 +2564,15 @@ class JobManager:
         job.status = JobStatus.RUNNING
         job.touch()
         self._emit(job, "job_status", status=job.status.value, message="Job running")
+        # Whose personal credentials this run uses, taken from the run's OWNER and not from
+        # whoever started this loop: a job submitted by one caller and resumed, retried or
+        # restored by an administrator is still the submitter's run, and it must not silently
+        # start using the administrator's token half way through.
+        # An unowned run — every run of a deployment that resolves no identity — keeps whatever
+        # the caller who started this loop was bound to, which there is the one operator.
+        segment_token = set_current_segment(
+            owner_of(job.incident) or current_segment()
+        )
         try:
             index = start_index
             # while, not range: a follow-up pass registers its own keys into job.stage_keys
@@ -2525,6 +2785,7 @@ class JobManager:
                 # Advisory lane record: before the gate so the reviewer sees what was spent.
                 if stage.name == "correlation":
                     self._record_automatic_escalations(job, result)
+                    self._record_inquiry_probes(job, result)
 
                 # Approval gate: after the stage produced output, so the human reviews
                 # the result (unlike the step wait, which grants permission to start).
@@ -2595,6 +2856,7 @@ class JobManager:
             self._persist(job)
             raise
         finally:
+            reset_current_segment(segment_token)
             # A stale loop must not hand away the slot the newer loop is running on.
             if job._run_gen == generation:
                 job._loop_live = False
@@ -3075,6 +3337,40 @@ class JobManager:
             self._reset_stage_for_retry(job, index)
         self._start_loop(job, index)
 
+    def _reset_run(self, job: Job):
+        """Clear every recorded outcome for a whole-pipeline re-run. Interventions and
+        gate_history survive: decisions already taken stand."""
+        job.context.outputs.clear()
+        job._failed_index = None
+        job._stopped_index = None
+        job._cancel_stage_flag = False
+        job._cancel_all_flag = False
+        job._cancel_event.clear()
+        job._pause_event.set()
+        job._step_event.clear()
+        # Follow-up pass keys are derived from results this re-run discards; reset
+        # to the fixed stage list so stale `pending` keys do not persist.
+        job.stage_statuses = {name: StageStatus.PENDING for name in job.stage_names}
+        job.stage_keys = list(job.stage_names)
+        job.context.pass_outputs.clear()
+        job.context.current_pass = 1
+        job.stage_durations.clear()
+        job.stage_summaries.clear()
+        job.stage_health.clear()
+        job.stage_started_at.clear()
+        job.error = None
+        job.current_stage = None
+        self._reset_event_history(job, "retry_all")
+
+    async def _reset_all_after_cancel(self, job: Job):
+        """Wait (bounded) for the cancelled loop to unwind, then reset and re-run from 0."""
+        for _ in range(100):
+            if not job._loop_live:
+                break
+            await asyncio.sleep(0.05)
+        self._reset_run(job)
+        self._start_loop(job, 0)
+
     def _cancel_without_a_loop(self, job: Job):
         """Apply cancel to a job with no running loop (restored or stage-cancelled)."""
         # Discard any open gate so the approvals inbox does not list a cancelled job.
@@ -3227,11 +3523,13 @@ class JobManager:
         elif action == "retry_stage":
             index = self._retry_index(job, stage, pass_number)
             target = job.stage_keys[index]
-            if job.stage_statuses.get(target) == StageStatus.RUNNING or (
-                self._stage_record_key(job, job.current_stage) == target
-                and job._loop_live
-            ):
-                # Running: cancel first, then re-run after the cancel lands.
+            # A live loop anywhere in the pipeline has to be stopped, not just one sitting on
+            # the target: _run_gen retires a stale loop at a stage BOUNDARY, so a second loop
+            # started beside it shares job.context, job.current_stage and current_pass until
+            # the first finishes its in-flight stage, and the two then interleave.
+            if job._loop_live or job.stage_statuses.get(target) == StageStatus.RUNNING:
+                # Cancel first, then re-run once the cancel lands.
+                on_target = self._stage_record_key(job, job.current_stage) == target
                 job._cancel_stage_flag = True
                 job._cancel_event.set()
                 job._pause_event.set()
@@ -3241,7 +3539,12 @@ class JobManager:
                 job.record_intervention(
                     "retry_stage",
                     stage=split_pass_key(target)[0],
-                    detail=_pass_detail(target, "running stage cancelled and re-run"),
+                    detail=_pass_detail(
+                        target,
+                        "running stage cancelled and re-run"
+                        if on_target
+                        else "run stopped and rewound to stage",
+                    ),
                 )
                 self._reset_stage_for_retry(job, index)
                 asyncio.ensure_future(self._restart_after_cancel(job, index))
@@ -3271,9 +3574,11 @@ class JobManager:
             if target not in job.stage_statuses:
                 raise ValueError(f"Unknown stage '{stage or target}'")
             index = job.stage_keys.index(target)
-            # Skipping a running stage must stop it; otherwise it finishes later and
-            # writes its output over a pipeline that has moved past it.
-            skipping_live = job._loop_live and (
+            # A running stage must stop, or it finishes later and writes its output over a
+            # pipeline that has moved past it — and that is true of a loop live on ANY stage,
+            # not only on the one being skipped, since starting from index+1 beside it leaves
+            # two loops on one Job until the first reaches a boundary.
+            skipping_live = job._loop_live or (
                 job.stage_statuses[target] == StageStatus.RUNNING
             )
             if skipping_live:
@@ -3322,33 +3627,23 @@ class JobManager:
                 job._pause_event.set()
                 self._start_loop(job, index + 1)
         elif action == "retry_all":
-            job.context.outputs.clear()
-            job._failed_index = None
-            job._stopped_index = None
-            job._cancel_stage_flag = False
-            job._cancel_all_flag = False
-            job._cancel_event.clear()
-            job._pause_event.set()
-            job._step_event.clear()
-            # Follow-up pass keys are derived from results this re-run discards; reset
-            # to the fixed stage list so stale `pending` keys do not persist.
-            job.stage_statuses = {name: StageStatus.PENDING for name in job.stage_names}
-            job.stage_keys = list(job.stage_names)
-            job.context.pass_outputs.clear()
-            job.context.current_pass = 1
-            job.stage_durations.clear()
-            job.stage_summaries.clear()
-            job.stage_health.clear()
-            job.stage_started_at.clear()
-            job.error = None
-            job.current_stage = None
-            # interventions and gate_history survive retry_all; decisions already taken stand.
-            self._reset_event_history(job, "retry_all")
             job.record_intervention(
                 "retry_all", detail="analyst re-ran the whole pipeline"
             )
-            job._run_gen += 1
-            asyncio.ensure_future(self.run_job(job))
+            if job._loop_live:
+                # The reset below replaces job.stage_statuses and empties job.context; a loop
+                # still inside a stage writes into both, so it would mark a stage of the FRESH
+                # run completed off the old one's result. Stop it, then reset.
+                job._cancel_stage_flag = True
+                job._cancel_event.set()
+                job._pause_event.set()
+                job._step_event.set()
+                if job._current_task is not None and not job._current_task.done():
+                    job._current_task.cancel()
+                asyncio.ensure_future(self._reset_all_after_cancel(job))
+            else:
+                self._reset_run(job)
+                self._start_loop(job, 0)
         else:
             raise ValueError(f"Unknown control action: {action}")
 

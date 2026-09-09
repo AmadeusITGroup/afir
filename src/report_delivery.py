@@ -11,6 +11,16 @@ exists whichever way the app is configured and for any past job.
 HTML is rendered server-side by :func:`markdown_to_html`; the app must work with no
 egress. :func:`_safe_id` rejects rather than sanitises: a path traversal resolving to
 a real readable object would answer 200 with content it was never meant to serve.
+
+**Every read is scoped by the same `owners` argument, because the WRITE side is scoped
+and the read side is not the same decision.** `identity.owner_scoped` sends an owned
+run's artifacts to `users/<segment>/`, so a reader resolving only the shared root 404s
+on every run a per-caller deployment produced. `owners` names the segments the caller
+may be shown, the shared root is tried FIRST (one call, byte-identical for a deployment
+that resolves no identity), and a segment nobody passed is never searched — so the
+caller's own view is a superset of what they could see before and never of somebody
+else's. Nothing here decides who that is: the handler resolves it from the run's own
+owner or from the caller, both of which it has already checked.
 """
 
 import html
@@ -18,9 +28,9 @@ import json
 import logging
 import os
 import re
-from typing import Optional, Tuple
+from typing import Iterable, List, Optional, Sequence, Tuple
 
-from src.storage import LocalStorage, StorageBackend
+from src.storage import LocalStorage, PrefixedStorage, StorageBackend
 from src.utils.paths import exports_dir
 
 logger = logging.getLogger(__name__)
@@ -43,6 +53,76 @@ def set_storage(storage: Optional[StorageBackend]) -> None:
 
 def _backend() -> StorageBackend:
     return _STORAGE if _STORAGE is not None else LocalStorage(root=exports_dir())
+
+
+def _views(owners: Sequence[str] = ()) -> List[StorageBackend]:
+    """The views an artifact may be read from, shared root first then each owner's own.
+
+    Order is the guarantee: a deployment that stamps no owner passes no segment, hits on
+    the first view and makes exactly the one call it made before this argument existed.
+    """
+    from src.identity import owner_prefix
+
+    backend = _backend()
+    views = [backend]
+    for segment in owners:
+        prefix = owner_prefix(str(segment or ""))
+        if prefix:
+            views.append(PrefixedStorage(backend, prefix))
+    return views
+
+
+def _read_text(key: str, owners: Sequence[str]) -> Optional[str]:
+    for view in _views(owners):
+        body = view.get_text(key)
+        if body is not None:
+            return body
+    return None
+
+
+def _read_bytes(key: str, owners: Sequence[str]) -> Optional[bytes]:
+    for view in _views(owners):
+        body = view.get_bytes(key)
+        if body is not None:
+            return body
+    return None
+
+
+def owner_segments() -> List[str]:
+    """Every segment that owns an artifact here, for the one caller who may see all of them.
+
+    Enumerated rather than passed in, because an administrator reading a finished run by
+    INCIDENT id has no run in hand to take the owner from — and `_visible` already shows
+    them every row, so a list they cannot then open is the defect one route over. Sorted so
+    the search order does not depend on the backend's listing order.
+    """
+    from src.identity import USER_PREFIX
+
+    # `list_keys` answers ROOT-relative keys whatever prefix it was given, so the prefix is
+    # stripped here rather than assumed away — reading `key.split("/")[0]` off this listing
+    # returns the literal "users" for every row and resolves to no segment at all.
+    head = f"{USER_PREFIX}/"
+    found = set()
+    for obj in _backend().list_keys(USER_PREFIX):
+        rest = obj.key[len(head) :] if obj.key.startswith(head) else ""
+        segment = rest.split("/", 1)[0] if "/" in rest else ""
+        if segment:
+            found.add(segment)
+    return sorted(found)
+
+
+def _own_keys(view: StorageBackend, shared: bool) -> Iterable[Tuple[str, object]]:
+    """`(key, obj)` for the artifacts this view owns, never a nested view's.
+
+    ``list_keys`` walks recursively, so the shared root also returns every owner subtree
+    under it. Those belong to whoever the handler named, not to whoever is listing, so the
+    shared root keeps only its own flat entries — which is also what makes the key the
+    thing matched here: the basename this used to match is identical across subtrees.
+    """
+    for obj in view.list_keys(""):
+        if shared and "/" in obj.key:
+            continue
+        yield obj.key, obj
 
 
 #: What ``?format=`` accepts on the report endpoint. ``view`` is the UI's format: the
@@ -99,12 +179,13 @@ def evidence_path(incident_id: str, kind: str) -> str:
     return os.path.join(str(exports_dir()), evidence_key(incident_id, kind))
 
 
-def artifact_inventory(incident_id: str) -> dict:
+def artifact_inventory(incident_id: str, owners: Sequence[str] = ()) -> dict:
     """What actually exists on disk for this incident, with sizes.
 
     The UI checks this before drawing download buttons: a greyed-out button with a
     byte count is more accurate than a link that fails, because ``_write_readable_reports``
-    is best-effort by design.
+    is best-effort by design. So it reads the same ``owners`` the download does, or the
+    button reports a byte count for an artifact the link cannot reach.
     """
     ident = _safe_id(incident_id)
     items = {
@@ -115,9 +196,12 @@ def artifact_inventory(incident_id: str) -> dict:
         "export_json": f"incident_{ident}.json",
         "export_csv": f"incident_{ident}.csv",
     }
-    backend = _backend()
-    # One listing, not six existence probes: on a remote backend each probe is a round trip.
-    sizes = {obj.name: obj.size for obj in backend.list_keys("")}
+    # One listing per view, not six existence probes each: on a remote backend every probe
+    # is a round trip. First view wins, matching the order the readers resolve in.
+    sizes: dict = {}
+    for index, view in enumerate(_views(owners)):
+        for key, obj in _own_keys(view, shared=index == 0):
+            sizes.setdefault(key, obj.size)
     out = {}
     for name, key in items.items():
         exists = key in sizes
@@ -129,7 +213,7 @@ def artifact_inventory(incident_id: str) -> dict:
     return {"incident_id": ident, "artifacts": out}
 
 
-def list_incidents(limit: int = 200) -> list:
+def list_incidents(limit: int = 200, owners: Sequence[str] = ()) -> list:
     """Incidents with an artifact on disk, newest first.
 
     Every id recovered from a filename goes back through :func:`_safe_id`; anything that
@@ -137,6 +221,10 @@ def list_incidents(limit: int = 200) -> list:
     that interpolates it. Per-artifact sizes are :func:`artifact_inventory`'s job; doing
     them here would mean six stat calls per row for a list whose only purpose is to be
     clicked.
+
+    Scoped by ``owners`` for a stronger reason than the readers: a row here is an id, and
+    an id another caller's run produced is the one thing a caller with no claim on it must
+    not learn — the same rule ``_lookup_job`` answers 404 for.
     """
     patterns = (
         (re.compile(r"^fraud_report_(.+)\.md$"), "report"),
@@ -144,9 +232,10 @@ def list_incidents(limit: int = 200) -> list:
         (re.compile(r"^incident_(.+)\.json$"), "export"),
     )
     found: dict = {}
-    listing = _backend().list_keys("")
-    for obj in listing:
-        name = obj.name
+    listing = []
+    for index, view in enumerate(_views(owners)):
+        listing.extend(_own_keys(view, shared=index == 0))
+    for name, obj in listing:
         for pattern, kind in patterns:
             match = pattern.match(name)
             if not match:
@@ -175,12 +264,12 @@ def list_incidents(limit: int = 200) -> list:
     return rows[: max(0, int(limit))]
 
 
-def read_markdown(incident_id: str) -> Optional[str]:
-    return _backend().get_text(report_key(incident_id, "md"))
+def read_markdown(incident_id: str, owners: Sequence[str] = ()) -> Optional[str]:
+    return _read_text(report_key(incident_id, "md"), owners)
 
 
-def read_pdf(incident_id: str) -> Optional[bytes]:
-    return _backend().get_bytes(report_key(incident_id, "pdf"))
+def read_pdf(incident_id: str, owners: Sequence[str] = ()) -> Optional[bytes]:
+    return _read_bytes(report_key(incident_id, "pdf"), owners)
 
 
 def sections_from_report(report) -> Optional[list]:
@@ -212,7 +301,9 @@ def sections_from_report(report) -> Optional[list]:
     return None
 
 
-def resolve_report(incident_id: str, fmt: str, report=None) -> Tuple[bytes, str, str]:
+def resolve_report(
+    incident_id: str, fmt: str, report=None, owners: Sequence[str] = ()
+) -> Tuple[bytes, str, str]:
     """Return ``(body, content_type, filename)`` for one report format.
 
     Raises :class:`FileNotFoundError` when the artifact does not exist, so the endpoint
@@ -224,7 +315,7 @@ def resolve_report(incident_id: str, fmt: str, report=None) -> Tuple[bytes, str,
         )
     ident = _safe_id(incident_id)
     if fmt == "pdf":
-        data = read_pdf(ident)
+        data = read_pdf(ident, owners)
         if data is None:
             raise FileNotFoundError("no PDF report for this incident")
         return data, _CONTENT_TYPES["pdf"], f"fraud_report_{ident}.pdf"
@@ -234,7 +325,7 @@ def resolve_report(incident_id: str, fmt: str, report=None) -> Tuple[bytes, str,
             # Fall back to the Markdown so `json` is never simply unavailable: a
             # single-section document carrying the rendered text is a worse answer than
             # real sections, but a much better one than a 404 for a report that exists.
-            md = read_markdown(ident)
+            md = read_markdown(ident, owners)
             if md is None:
                 raise FileNotFoundError("no report for this incident")
             sections = [{"section_title": "Report", "content": md}]
@@ -242,7 +333,7 @@ def resolve_report(incident_id: str, fmt: str, report=None) -> Tuple[bytes, str,
             {"incident_id": ident, "sections": sections}, indent=2, default=str
         ).encode("utf-8")
         return body, _CONTENT_TYPES["json"], f"fraud_report_{ident}.json"
-    md = read_markdown(ident)
+    md = read_markdown(ident, owners)
     if md is None:
         raise FileNotFoundError("no Markdown report for this incident")
     if fmt == "md":
@@ -260,16 +351,20 @@ def resolve_report(incident_id: str, fmt: str, report=None) -> Tuple[bytes, str,
     )
 
 
-def resolve_evidence(incident_id: str, kind: str) -> Tuple[bytes, str, str]:
+def resolve_evidence(
+    incident_id: str, kind: str, owners: Sequence[str] = ()
+) -> Tuple[bytes, str, str]:
     """Return ``(body, content_type, filename)`` for one evidence artifact."""
     ident = _safe_id(incident_id)
-    data = _backend().get_bytes(evidence_key(ident, kind))
+    data = _read_bytes(evidence_key(ident, kind), owners)
     if data is None:
         raise FileNotFoundError(f"no {kind} evidence for this incident")
     return data, "application/json", f"evidence_{kind}_{ident}.json"
 
 
-def evidence_outline(incident_id: str, kind: str, max_rows: int = 25) -> dict:
+def evidence_outline(
+    incident_id: str, kind: str, max_rows: int = 25, owners: Sequence[str] = ()
+) -> dict:
     """A bounded, browsable preview of an evidence artifact for the UI.
 
     A full evidence download can be tens of megabytes. The outline carries per-source
@@ -277,7 +372,7 @@ def evidence_outline(incident_id: str, kind: str, max_rows: int = 25) -> dict:
     full artifact. Nothing is hidden: the preview is bounded, not the artifact.
     """
     ident = _safe_id(incident_id)
-    blob = _backend().get_text(evidence_key(ident, kind))
+    blob = _read_text(evidence_key(ident, kind), owners)
     if blob is None:
         raise FileNotFoundError(f"no {kind} evidence for this incident")
     size = len(blob.encode("utf-8"))

@@ -33,6 +33,22 @@ _ENQUEUE_WAIT_SECONDS = 30.0
 _HTTP_TIMEOUT = 120
 
 
+def _normalise_host(value: str) -> str:
+    """A URL ``requests`` can actually use.
+
+    A host with no scheme raises ``MissingSchema`` inside the blanket ``except`` every call
+    below is wrapped in, which reads as a transport error — the same ``HTTP -1`` an absent
+    token produces, on a store that is otherwise correctly configured. The platform's
+    injected ``DATABRICKS_HOST`` is not guaranteed to carry one. An explicit ``http://`` is
+    left alone: the contract suite's fake servers are plain HTTP on localhost, and silently
+    upgrading a scheme somebody wrote is a different decision from supplying a missing one.
+    """
+    host = (value or "").strip().rstrip("/")
+    if not host or "://" in host:
+        return host
+    return f"https://{host}"
+
+
 @dataclass
 class _Pending:
     """One queued write. ``text`` and ``blob`` are mutually exclusive."""
@@ -76,14 +92,22 @@ class DatabricksStorage(StorageBackend):
         # Defaults to True; App containers see the public certificate chain, unlike log-source backends.
         self._verify_ssl = bool(cfg.get("verify_ssl", True))
         self._auth = cfg.get("auth")
+        #: What to call `self._auth` in a log line. Recorded where the object is adopted, not
+        #: where it is used: `_sdk_auth` assigns to `self._auth`, so from `_token`'s first
+        #: branch a token the SDK resolved is indistinguishable from a configured one.
+        self._auth_channel = "configured auth" if self._auth is not None else ""
+        #: Set once `try_build_auth` has been attempted, so a workspace with no SDK pays for
+        #: the import and the probe once rather than on every blob.
+        self._sdk_auth_tried = False
+        #: Which channel last answered `_token()`, reported once when it changes. Not probed
+        #: at construction: `_sdk_auth` would reach the machine's own credentials from inside
+        #: every test that builds a backend, and the boot line below says so rather than guessing.
+        self._token_channel: Optional[str] = None
         configured_host = str(cfg.get("host") or "").strip().rstrip("/")
-        self._host = configured_host or self._resolve_host()
+        # Normalised at the one place every channel converges on, configured or resolved.
+        self._host = _normalise_host(configured_host or self._resolve_host())
 
-        self._root = (
-            f"/Volumes/{self._catalog}/{self._schema}/{self._volume}"
-            if self._catalog
-            else ""
-        )
+        self._root = self._resolve_root(cfg)
 
         #: Queued writes, newest payload per key; insertion-ordered so the writer drains oldest-first.
         self._pending: Dict[str, _Pending] = {}
@@ -99,11 +123,8 @@ class DatabricksStorage(StorageBackend):
         self._session_lock = threading.Lock()
         self._fatal: Optional[str] = None
 
-        if not self._catalog:
-            self._fatal = (
-                "storage.databricks.catalog is not set, so there is no Volume path to "
-                "write to"
-            )
+        if not self._root:
+            self._fatal = self._no_root_reason()
         elif not self._host:
             self._fatal = (
                 "no Databricks host could be resolved (set storage.databricks.host or "
@@ -119,12 +140,60 @@ class DatabricksStorage(StorageBackend):
         )
         self._writer.start()
         logger.info(
-            "Databricks storage: %s (verify_ssl=%s, writer thread started)",
+            "%s storage: %s on %s (verify_ssl=%s, token from %s, writer thread started)",
+            self.kind,
             self._root or "<unconfigured>",
+            self._host or "<no host resolved>",
             self._verify_ssl,
+            self._token_channels(),
         )
 
+    def _token_channels(self) -> str:
+        """Which bearer-token channels could answer, without asking any of them.
+
+        The boot line named only the root, so a store that writes nothing logged identically
+        to a working one and the two causes of ``HTTP -1`` — an unresolvable host and an
+        unobtainable token — were indistinguishable from the log. This says which channels
+        exist; :meth:`_note_token_channel` then says which one actually answered.
+        """
+        channels = []
+        if self._auth is not None:
+            channels.append(self._auth_channel or "configured auth")
+        if os.environ.get(self._token_env):
+            channels.append(self._token_env)
+        # Unknowable without building it, and an App's only channel, so it is always a
+        # candidate rather than a claim.
+        channels.append("SDK auth (per call)")
+        return ", ".join(channels)
+
+    def _note_token_channel(self, channel: str) -> None:
+        """Report the channel that answered, once, and again only if it changes.
+
+        A channel that changes mid-run is worth a line of its own: it means a configured
+        token stopped working and the SDK took over, or the reverse.
+        """
+        if channel == self._token_channel:
+            return
+        self._token_channel = channel
+        logger.info("%s storage: bearer token from %s", self.kind, channel)
+
     # -- configuration -----------------------------------------------------
+
+    def _resolve_root(self, cfg: dict) -> str:
+        """The remote directory every key hangs off, or ``""`` when unconfigured.
+
+        A seam rather than an expression because :class:`~src.storage.dbfs.DbfsStorage`
+        reuses everything below it and differs in this and four HTTP calls.
+        """
+        if not self._catalog:
+            return ""
+        return f"/Volumes/{self._catalog}/{self._schema}/{self._volume}"
+
+    def _no_root_reason(self) -> str:
+        """Why :meth:`_resolve_root` answered nothing, for the operator's log line."""
+        return (
+            "storage.databricks.catalog is not set, so there is no Volume path to write to"
+        )
 
     def _resolve_host(self) -> str:
         """The workspace URL, preferring SDK resolution so an App needs no configured host.
@@ -140,27 +209,71 @@ class DatabricksStorage(StorageBackend):
             value = os.environ.get(var)
             if value:
                 return value.strip().rstrip("/")
-        try:
-            from src.utils.databricks_auth import try_build_auth
-
-            auth = try_build_auth()
-            if auth is not None:
-                self._auth = auth
+        auth = self._sdk_auth()
+        if auth is not None:
+            try:
                 return str(auth.host).rstrip("/")
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("SDK auth unavailable for storage: %s", exc)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("SDK auth could not report a host: %s", exc)
         return ""
+
+    def _sdk_auth(self):
+        """The unified-auth object, built at most once. ``None`` when the SDK is absent."""
+        if self._auth is None and not self._sdk_auth_tried:
+            self._sdk_auth_tried = True
+            try:
+                from src.utils.databricks_auth import try_build_auth
+
+                self._auth = try_build_auth()
+                if self._auth is not None:
+                    self._auth_channel = "SDK auth"
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("SDK auth unavailable for storage: %s", exc)
+        return self._auth
 
     def _token(self) -> Optional[str]:
         """A currently-valid bearer token, resolved per call so a short-lived OAuth token never expires cached."""
         if self._auth is not None:
             try:
-                return self._auth.token()
+                token = self._auth.token()
+                self._note_token_channel(self._auth_channel or "configured auth")
+                return token
             except Exception as exc:  # noqa: BLE001
                 logger.debug(
                     "SDK token refresh failed; trying the static token: %s", exc
                 )
-        return os.environ.get(self._token_env)
+        static = os.environ.get(self._token_env)
+        if static:
+            self._note_token_channel(self._token_env)
+            return static
+        # AN APP HAS NO PAT, and reaching here does not mean it is misconfigured. `host` is
+        # answered by the platform's injected `DATABRICKS_HOST` (or a configured value), so
+        # `_resolve_host` returns before it ever builds auth and `self._auth` stays None —
+        # leaving the static env var as the only candidate, which an App must never set
+        # (`DATABRICKS_TOKEN` beside the injected OAuth vars makes the SDK refuse both).
+        # Without this the backend answers -1 to every call while the app logs storage as
+        # configured, and the loss shows up one restart later as vanished approvals.
+        auth = self._sdk_auth()
+        if auth is None:
+            return None
+        try:
+            token = auth.token()
+            self._note_token_channel(self._auth_channel or "SDK auth")
+            return token
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("SDK token refresh failed and no static token is set: %s", exc)
+            return None
+
+    def _no_token_reason(self) -> str:
+        """Why there is no bearer token, naming both channels rather than only the env var.
+
+        An App fails here with `DATABRICKS_TOKEN` correctly unset, so a message about that
+        variable sends the reader to change the one thing that must not change.
+        """
+        return (
+            f"no bearer token: {self._token_env} is unset and SDK auth is unavailable "
+            "(in a Databricks App the injected OAuth credentials should supply it)"
+        )
 
     @property
     def root(self) -> Optional[str]:
@@ -177,7 +290,7 @@ class DatabricksStorage(StorageBackend):
             return -1, b""
         token = self._token()
         if not token:
-            self._note_error(f"{self._token_env} is not set")
+            self._note_error(self._no_token_reason())
             return -1, b""
         session = self._get_session()
         # Quoted because a key may carry characters legal in safe_key and special in a

@@ -7,11 +7,14 @@ from unittest.mock import AsyncMock
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
+from src.config_store import REDACTED
 from src.incident_input import (
     IncidentInputInterface,
+    _audit_changes,
     _pass_number,
     validate_incident,
 )
+from src.knowledge.pack import EntityDef, KnowledgePack, SourceDef
 from src.utils.rate_limiter import AsyncRateLimiter
 
 
@@ -106,6 +109,7 @@ async def test_the_deep_health_answer_is_opt_in_and_names_the_credential():
             "status",
             "llm_credential",
             "pack",
+            "pack_detail",
             "jobs",
             "pipeline",
             "storage",
@@ -123,6 +127,7 @@ async def test_the_deep_health_answer_is_opt_in_and_names_the_credential():
         assert deep["sources_unavailable"] is None
         assert deep["retrieval_cache"] is None
         assert deep["run_queue"] is None
+        assert deep["pack"] is None and deep["pack_detail"] is None
 
         # Wired but with no usable credential is the amber state the dot exists for.
         class _Client:
@@ -167,6 +172,29 @@ async def test_index_serves_console_ui():
         assert "Fraud Investigation Console" in body
         assert "EventSource" in body
         assert "stage_output" in body
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_the_named_alias_serves_the_same_page_and_needs_no_identity():
+    """`/afir` exists so a bookmark says what it opens under a proxy prefix that does not.
+
+    Both spellings, because no trailing-slash normalisation middleware is installed, and
+    both unauthenticated like `/` — the page has to load before it can say who the caller
+    is, and an alias that 403s where the canonical path loads is worse than no alias.
+    """
+    iface = IncidentInputInterface(_config())
+    client = await _client(iface)
+    try:
+        canonical = await (await client.get("/")).text()
+        for path in ("/afir", "/afir/"):
+            resp = await client.get(path)
+            assert resp.status == 200, path
+            assert resp.content_type == "text/html", path
+            assert await resp.text() == canonical, path
+        assert "/afir" in iface._UNAUTHENTICATED_PATHS
+        assert "/afir/" in iface._UNAUTHENTICATED_PATHS
     finally:
         await client.close()
 
@@ -534,6 +562,68 @@ async def test_deep_health_reports_which_sources_cannot_be_queried():
         await client.close()
 
 
+@pytest.mark.asyncio
+async def test_deep_health_reports_whether_the_pack_LOADED_not_whether_it_is_named():
+    """The widest silent degrade of the four, and the one a configured name cannot see.
+
+    ``load_knowledge_pack`` answers a directory it cannot read with an *empty* pack and one
+    ``logger.warning``, so a ``pack_dir`` that did not ship — or is still the template's
+    placeholder — leaves every stage running and answering nothing: no glossary to extract
+    entities with, no catalog to pick a source from, no ruleset to adjudicate. Reading the
+    configured name would report that as healthy, because the name is set either way.
+
+    The counts are the answer rather than a bare boolean, because a pack that loaded still
+    has to be checked for the ruleset a verdict needs, and only a number says so.
+    """
+    iface = IncidentInputInterface(_config())
+    client = await _client(iface)
+    try:
+        # What `load_knowledge_pack` returns for a directory that is not there.
+        iface.knowledge_pack = KnowledgePack(name="a_domain")
+        deep = await (await client.get("/health?deep=1")).json()
+        assert deep["pack"] is False, "an empty pack is a degradation, not a null"
+        assert "0 sources" in deep["pack_detail"]
+        assert "every condition reads" in deep["pack_detail"]
+        # Still up: a run will complete and explain nothing, which is what makes it easy
+        # to miss and the reason it is on the dot at all.
+        assert deep["status"] == "ok"
+
+        iface.knowledge_pack = KnowledgePack(
+            name="a_domain",
+            entities=[EntityDef(type="user")],
+            sources=[SourceDef(name="auth_events")],
+        )
+        deep = await (await client.get("/health?deep=1")).json()
+        assert deep["pack"] is True
+        # Loaded and still worth reading: no ruleset means no deterministic verdict.
+        assert "0 rulesets" in deep["pack_detail"]
+        assert "1 entities, 1 sources" in deep["pack_detail"]
+
+        # And the count is of the RULESETS and not of the rules file's top-level keys. Sizing
+        # `pack.rulesets` reported "2" for a pack shipping three procedures and would report
+        # the same 2 for a pack shipping one — a number that moves with nothing is worse than
+        # no number, because a reader checking whether their procedure shipped is reassured.
+        iface.knowledge_pack = KnowledgePack(
+            name="a_domain",
+            entities=[EntityDef(type="user")],
+            sources=[SourceDef(name="auth_events")],
+            rulesets={
+                "verdicts": {"first": {}, "second": {}, "third": {}},
+                "default_ruleset": "first",
+            },
+        )
+        deep = await (await client.get("/health?deep=1")).json()
+        assert "3 rulesets" in deep["pack_detail"]
+
+        # A pack object whose contents are not sized must not take the endpoint with it.
+        iface.knowledge_pack = SimpleNamespace(name="hostile", entities=object())
+        deep = await (await client.get("/health?deep=1")).json()
+        assert deep["status"] == "ok"
+        assert deep["pack"] is False
+    finally:
+        await client.close()
+
+
 # --- the run queue, batches, and three config-reading rules ------------------
 
 
@@ -688,3 +778,40 @@ def test_set_live_writes_only_a_direct_child_of_each_segment():
     assert not iface._set_live("jobs.width", 4)
     assert live["jobs"]["nested"]["width"] == 1
     assert not iface._set_live("no_such_section.key", 1)
+
+
+def test_audit_changes_redacts_a_secret_shaped_key_both_ways():
+    """The patcher's change records carry `from` and `to` verbatim, because the operator reads
+    them back in the response. The journal keeps the same records for months and every
+    administrator may read it, so a credential must not survive the trip.
+
+    Prospective by design: no field descriptor is secret-shaped today (the form offers
+    `api_key_env`, never `api_key`), so this guard is what keeps adding one from turning an
+    append-only file into a credential store.
+    """
+    out = _audit_changes([
+        {"path": "llm.api_key", "from": "sk-old", "to": "sk-new", "applies": "restart"},
+        {"path": "storage.sql.dsn", "from": "postgres://u:p@h/db", "to": "x"},
+        {"path": "llm.api_key_env", "from": "OLD", "to": "NEW"},
+    ])
+    assert out[0] == {"path": "llm.api_key", "from": REDACTED, "to": REDACTED,
+                      "applies": "restart"}
+    assert out[1]["from"] == REDACTED and out[1]["to"] == REDACTED
+    # An env-var NAME is not a secret; redacting it would hide the one thing worth recording.
+    assert out[2] == {"path": "llm.api_key_env", "from": "OLD", "to": "NEW"}
+
+
+def test_audit_changes_bounds_one_value_and_says_how_long_it_was():
+    """A pasted certificate would push a day's other entries out of a bounded buffer."""
+    (out,) = _audit_changes([{"path": "identity.admin_users", "from": "", "to": "x" * 5000}])
+    assert len(out["to"]) < 300 and "5000 chars" in out["to"]
+    # An absent side is omitted rather than recorded as an empty string: an inserted key had
+    # no previous value, which is not the same as having had a blank one.
+    assert "from" not in _audit_changes([{"path": "a.b", "from": None, "to": "1"}])[0]
+
+
+def test_audit_changes_keeps_a_number_a_number():
+    """A threshold read back as "0.8" and one read back as 0.8 are the same edit, and a
+    reader comparing two entries must not have to guess which."""
+    (out,) = _audit_changes([{"path": "anomaly_detection.threshold", "from": 0.8, "to": 0.5}])
+    assert out["from"] == 0.8 and out["to"] == 0.5

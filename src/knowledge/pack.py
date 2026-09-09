@@ -540,6 +540,38 @@ class KnowledgePack(BaseModel):
             )
         return keys[0] if keys else ""
 
+    def adjudication_policy(self) -> str:
+        """What to do when no procedure was selected: ``default`` (adjudicate anyway) or ``abstain``.
+
+        Declared beside ``default_ruleset`` in the flat-root rules file, because it decides
+        what that declaration is *for*::
+
+            adjudication_policy: abstain
+
+        ``default`` — the shipped value, and what every pack did before this key existed —
+        adjudicates an unselected incident under ``default_ruleset_key()`` and says so.
+        ``abstain`` converts that verdict to the ruleset's own ``reject`` label instead, which
+        a pack should only ask for once it has procedures for the incidents it expects: a
+        reject is a routing decision back to the detector's owner, not a finding.
+
+        An unrecognised value reads as ``default`` and logs, because the failure mode of
+        guessing ``abstain`` is a pack that stops adjudicating for a typo; ``pack_validate``
+        reports it as an error.
+        """
+        raw = str((self.rulesets or {}).get("adjudication_policy", "") or "").strip().lower()
+        if not raw:
+            return "default"
+        if raw in ("default", "abstain"):
+            return raw
+        logger.warning(
+            "Pack %r declares adjudication_policy=%r, which is neither 'default' nor "
+            "'abstain'; adjudicating an unselected incident under the default ruleset, as a "
+            "pack declaring nothing does.",
+            self.name,
+            raw,
+        )
+        return "default"
+
     def ruleset_key_for(self, use_case: str) -> str:
         """The ruleset key a use-case name selects, or ``""`` when it selects none.
 
@@ -845,6 +877,95 @@ class KnowledgePack(BaseModel):
             }
             if per_source:
                 out["from"] = per_source
+        return out
+
+    def open_questions(self, key: str = "") -> List[Dict[str, Any]]:
+        """Open questions a ruleset declares about its OWN evidence, in declaration order.
+
+        The other axis from ``entry_signals``: that one says how a SIBLING procedure would
+        show up here, this one says what THIS procedure could not settle and which one further
+        source would say something about it. Entry shape and its keys:
+        docs/architecture/knowledge-pack-authoring.md §2.5.3.
+
+        ``ask.source`` resolves through this ruleset's ``sources:`` map and is NOT a hard
+        dependency: an inquiry is asked with one bounded probe of its own, never by adding a
+        source to every run of the procedure.
+
+        Returns ``[]`` on absence. An entry is DROPPED when it has no ``id``, no trigger the
+        engine can read (a condition id or a verdict class), no source to ask, or no meaning
+        for every outcome — each of those makes the entry unaskable or unlabelled, and an
+        unlabelled outcome is the failure class this repo is organised against.
+        """
+        spec = self.ruleset_spec(key) or {}
+        declared = spec.get("open_questions")
+        if not isinstance(declared, list):
+            return []
+        raw_map = spec.get("sources")
+        logical = (
+            {str(k): str(v) for k, v in raw_map.items()}
+            if isinstance(raw_map, dict)
+            else {}
+        )
+        out: List[Dict[str, Any]] = []
+        for entry in declared:
+            if not isinstance(entry, dict):
+                continue
+            question_id = str(entry.get("id", "") or "").strip()
+            when = entry.get("when") if isinstance(entry.get("when"), dict) else {}
+            ask = entry.get("ask") if isinstance(entry.get("ask"), dict) else {}
+            raw_meaning = (
+                entry.get("meaning") if isinstance(entry.get("meaning"), dict) else {}
+            )
+            condition = str(when.get("condition", "") or "").strip()
+            verdict_class = str(when.get("verdict_class", "") or "").strip()
+            declared_source = str(ask.get("source", "") or "").strip()
+            source = logical.get(declared_source, declared_source)
+            meaning = {
+                outcome: str(raw_meaning.get(outcome, "") or "").strip()
+                for outcome in ("rows", "empty", "unanswered")
+            }
+            missing = [outcome for outcome, text in meaning.items() if not text]
+            if (
+                not question_id
+                or not (condition or verdict_class)
+                or not source
+                or missing
+            ):
+                logger.warning(
+                    "Ruleset %r declares an open question the engine cannot read and it is "
+                    "DROPPED (id=%r, when.condition=%r, when.verdict_class=%r, ask.source=%r, "
+                    "meaning missing for %s). Without an id there is nothing for a report to "
+                    "cite, without a trigger it can never be raised, without a source there is "
+                    "nothing to ask, and an outcome with no declared meaning is a number nobody "
+                    "can act on.",
+                    key or "(default)",
+                    entry.get("id"),
+                    condition,
+                    verdict_class,
+                    declared_source,
+                    ", ".join(missing) or "nothing",
+                )
+                continue
+            out.append(
+                {
+                    "id": question_id,
+                    "condition": condition,
+                    # Default `unknown`, and deliberately: an open question is what a check
+                    # that could not answer leaves behind. A pack wanting the other polarity
+                    # says so. Not validated against the engine's result vocabulary here —
+                    # `pack_validate` is where an author sees the typo.
+                    "result": str(when.get("result", "") or "unknown").strip().lower(),
+                    "verdict_class": verdict_class,
+                    "source": source,
+                    "question": str(ask.get("question", "") or "").strip(),
+                    "scope_entity": str(ask.get("scope_entity", "") or "").strip(),
+                    # Always present; empty means "every row the probe returned", one shape
+                    # for the consumer as with an entry signal's `where`.
+                    "where": [c for c in (ask.get("where") or []) if isinstance(c, dict)],
+                    "meaning": meaning,
+                    "note": str(entry.get("note", "") or "").strip(),
+                }
+            )
         return out
 
     def related_playbooks(self, playbook_id: str) -> List[Dict[str, str]]:

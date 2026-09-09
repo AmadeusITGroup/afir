@@ -17,6 +17,16 @@ def running_as_databricks_app() -> bool:
     return bool(str(os.getenv("DATABRICKS_APP_PORT") or "").strip())
 
 
+def running_on_databricks_driver() -> bool:
+    """True when this process is the driver of a Databricks cluster.
+
+    ``DATABRICKS_RUNTIME_VERSION`` is set by the runtime image and by nothing a laptop has.
+    Distinct from :func:`running_as_databricks_app`: a driver reached through the driver
+    proxy has a caller identity forwarded to it, which a local run does not.
+    """
+    return bool(str(os.getenv("DATABRICKS_RUNTIME_VERSION") or "").strip())
+
+
 def resolve_mode(configured, *, platform_default: bool) -> bool:
     """Read an ``auto`` / on / off tri-state, defaulting to the platform's answer.
 

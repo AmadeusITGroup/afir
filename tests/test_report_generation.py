@@ -3600,3 +3600,375 @@ async def test_the_link_section_is_there_exactly_once_on_the_NARRATED_path_too(
     # And the ruled-out candidate is a finding on this path as well: a narrated report is the
     # one an operator actually reads, so silence here would be the defect in its usual place.
     assert "checked, and excluded" in out
+
+
+# --- The ADVISORY lane, other axis: what THIS procedure could not settle ----------------
+#
+# A link asks whether another procedure applies. An open question asks what the adjudicating
+# procedure left unanswered about its own subject — which makes it the more tempting of the two
+# to read as evidence the verdict has merely not folded in yet. Five states, and the pair easiest
+# to lose is `empty` against `unanswered`: an empty answer is a reading against a meaning the
+# pack declared in advance, while a non-answer is a credential or catalog gap. Rendered as one
+# silence they license opposite next steps, so each state's reachability is asserted.
+
+
+def _inquiry(state, **kw):
+    """One assessed open question, with only the fields that state would really carry."""
+    from src.models.pydantic_models import InquiryFinding
+
+    base = {"id": f"q_{state}", "state": state, "question": f"Was it {state}?"}
+    base.update(kw)
+    return InquiryFinding(**base)
+
+
+def _inquiry_correlation(*inquiries):
+    corr = CorrelationResult()
+    corr.inquiries = list(inquiries)
+    return corr
+
+
+def test_all_five_open_question_states_render_and_the_two_SILENCES_are_told_apart():
+    """Each state gets its own heading, and the two blank answers are different findings.
+
+    The order is asserted and it is not cosmetic: actionable first, so a reader who stops halfway
+    has seen the questions somebody can still act on. What the block prose has to carry is the
+    distinction the states exist for — `empty` is an answer the procedure declared a meaning for,
+    `unanswered` is an environment fault where re-reading the same rows supplies nothing.
+    """
+    sec = ReportGenerationModule._inquiries_section(
+        _inquiry_correlation(
+            _inquiry(
+                "unreachable",
+                scope_entity="refund_claim",
+                gap_reason="this run holds no value of it",
+            ),
+            _inquiry(
+                "unanswered",
+                source="handover_register",
+                meaning="still unknown, and the remedy is a credential",
+            ),
+            _inquiry(
+                "empty",
+                source="handover_register",
+                rows_matched=0,
+                meaning="nothing recorded a handover for this subject anywhere",
+            ),
+            _inquiry("not_asked", scope_entity="shipment", scope_values=["RT48192043"]),
+            _inquiry(
+                "answered",
+                source="sessions",
+                rows_matched=4,
+                meaning="the handover was recorded elsewhere",
+            ),
+        )
+    )
+    md = ReportGenerationModule.render_markdown([sec], {"id": "INC-Q"})
+    headings = [
+        "ASKED AND ANSWERED (1)",
+        "STILL OPEN (1)",
+        "ASKED AND THE SOURCE HAD NOTHING (1)",
+        "ASKED AND THE SOURCE DID NOT ANSWER (1)",
+        "NOT ASKABLE FROM THIS EVIDENCE (1)",
+    ]
+    for heading in headings:
+        assert heading in md, (heading, md)
+    positions = [md.index(h) for h in headings]
+    assert positions == sorted(positions), md
+    # The two silences, each under its own heading and each naming what would resolve it.
+    assert "an empty answer and a question nobody asked are otherwise the same silence" in md
+    assert "the remedy is the environment" in md
+    # And the unreachable one names the value it would have needed, which is a fact about the
+    # declaration rather than about this incident.
+    assert "would be asked about a refund_claim value, and this run holds none" in md
+
+
+def test_an_answer_is_reported_WITH_the_meaning_the_procedure_declared():
+    """A count with no meaning invites the reader to supply their own, which is the whole defect.
+
+    Both directions are asserted from one section, because the pack declares a meaning per
+    outcome: four rows and zero rows are different readings of the same question, and each has to
+    arrive beside its own sentence rather than beside a shared one.
+    """
+    sec = ReportGenerationModule._inquiries_section(
+        _inquiry_correlation(
+            _inquiry(
+                "answered",
+                rows_matched=4,
+                meaning="the handover was recorded elsewhere, so the gap has an explanation",
+                trigger="condition example_stub read unknown",
+                source="sessions",
+            ),
+            _inquiry(
+                "empty",
+                rows_matched=0,
+                meaning="nothing recorded a handover for this subject anywhere",
+            ),
+        )
+    )
+    md = ReportGenerationModule.render_markdown([sec], {"id": "INC-Q"})
+    assert "rows matching it: 4" in md
+    assert (
+        "what the procedure says that means: the handover was recorded elsewhere" in md
+    )
+    assert "rows matching it: 0" in md
+    assert "nothing recorded a handover for this subject anywhere" in md
+    # Why it was raised, because a question with no trigger reads as one somebody typed.
+    assert "why it was raised: condition example_stub read unknown" in md
+    assert "the source that would answer it: sessions" in md
+
+
+def test_a_CAPPED_answer_says_its_count_is_a_floor_TWICE():
+    """`4 rows` and `4 rows, and there were more` license different next steps.
+
+    Stated on the question itself and again in the lane's cost summary, and that is deliberate
+    rather than duplication: the summary is what a reader skimming the headings sees, the line is
+    what the reader who stopped at one question sees, and the truncation is a property of the
+    query in both places.
+    """
+    sec = ReportGenerationModule._inquiries_section(
+        _inquiry_correlation(
+            _inquiry("answered", rows_matched=500, row_cap_hit=True, meaning="recorded")
+        )
+    )
+    md = ReportGenerationModule.render_markdown([sec], {"id": "INC-Q"})
+    assert "rows matching it: 500 (a floor — the rows read were capped)" in md
+    assert "the count below is a floor and not a total" in md
+    # And an uncapped answer claims nothing of the kind.
+    clean = ReportGenerationModule.render_markdown(
+        [
+            ReportGenerationModule._inquiries_section(
+                _inquiry_correlation(_inquiry("answered", rows_matched=500))
+            )
+        ],
+        {"id": "INC-Q"},
+    )
+    assert "a floor" not in clean, clean
+
+
+def test_what_the_LANE_COST_is_stated_once_even_when_it_spent_nothing():
+    """The free rung is half this lane and reads as a spend unless the report says otherwise.
+
+    An operator deciding whether to authorise more looking needs the number, and "no query was
+    spent" is the answer they are least likely to assume — so it is printed rather than implied
+    by the absence of a cost line, which is the silence this whole lane is organised against.
+    """
+    free = ReportGenerationModule.render_markdown(
+        [
+            ReportGenerationModule._inquiries_section(
+                _inquiry_correlation(
+                    _inquiry("answered", rows_matched=1, meaning="recorded"),
+                    _inquiry("empty", rows_matched=0, meaning="not recorded"),
+                )
+            )
+        ],
+        {"id": "INC-Q"},
+    )
+    assert "COST — none of these 2 question(s) cost a query" in free
+    assert "2 of them were settled at no retrieval cost" in free
+
+    spent = ReportGenerationModule.render_markdown(
+        [
+            ReportGenerationModule._inquiries_section(
+                _inquiry_correlation(
+                    _inquiry(
+                        "answered",
+                        rows_matched=1,
+                        meaning="recorded",
+                        probe_spent=True,
+                        probe_note="one query spent on handover_register",
+                    ),
+                    _inquiry("not_asked", scope_entity="shipment"),
+                )
+            )
+        ],
+        {"id": "INC-Q"},
+    )
+    assert "COST — 1 of these 2 question(s) cost one bounded query each" in spent
+    # After the verdict and outside the conditions' own sources: the two facts that make the
+    # spend safe, and neither is derivable from the count.
+    assert "made after the verdict was already decided" in spent
+    assert "outside every source the conditions read" in spent
+    assert "what it cost: one query spent on handover_register" in spent
+    # A refusal is a coded row and never a silence, so the reason rides on the same field.
+    refused = ReportGenerationModule.render_markdown(
+        [
+            ReportGenerationModule._inquiries_section(
+                _inquiry_correlation(
+                    _inquiry(
+                        "not_asked",
+                        scope_entity="shipment",
+                        scope_values=["RT48192043"],
+                        gap_reason="budget: no inquiry probe was available on this run",
+                    )
+                )
+            )
+        ],
+        {"id": "INC-Q"},
+    )
+    assert "why it is not settled: budget: no inquiry probe was available" in refused
+
+
+def test_the_open_question_section_says_in_its_OWN_words_that_it_is_not_the_verdict():
+    """Two independent signals, because either alone fails a real reader.
+
+    The title, for the reader who skims a table of contents, and the preamble, for the one who
+    starts reading at the heading. The preamble names the three things an advisory finding would
+    move if it were wired in — verdict, severity, stage health — and says the reading is against
+    a meaning declared in advance, because a question left open is the row most easily taken for
+    a negative finding.
+    """
+    sec = ReportGenerationModule._inquiries_section(
+        _inquiry_correlation(_inquiry("not_asked", scope_entity="shipment"))
+    )
+    assert "advisory" in sec["section_title"].lower()
+    assert "not part of the verdict" in sec["section_title"].lower()
+    md = ReportGenerationModule.render_markdown([sec], {"id": "INC-Q"})
+    assert "ADVISORY, and addressed to a human" in md
+    assert "was read by any condition" in md
+    assert "stage health" in md
+    assert "a meaning the procedure wrote down in advance" in md
+    assert "a question that stayed open is not a negative finding" in md
+
+
+def test_no_open_question_is_the_normal_answer_and_renders_NOTHING():
+    """A pack that declares no `open_questions:` produces the report it produced before.
+
+    Every branch that could put an empty heading in the artifact: none at all, an empty list, a
+    non-list, no correlation, and a MagicMock — which is what the rest of this file hands these
+    builders, and whose every attribute is truthy.
+    """
+    assert ReportGenerationModule._inquiries_section(None) is None
+    assert ReportGenerationModule._inquiries_section(CorrelationResult()) is None
+    assert ReportGenerationModule._inquiries_section(_inquiry_correlation()) is None
+    mock = MagicMock()
+    assert ReportGenerationModule._inquiries_section(mock) is None
+    assert ReportGenerationModule._inquiries_of(mock) == []
+    for junk in ("not a list", 7, object()):
+        loose = MagicMock()
+        loose.inquiries = junk
+        loose.brief = None
+        assert ReportGenerationModule._inquiries_of(loose) == []
+        assert ReportGenerationModule._inquiries_section(loose) is None
+
+
+def test_the_open_questions_are_read_from_the_BRIEF_when_the_result_carries_none():
+    """The same list rides on both; a degraded or imported result may carry only one."""
+    corr = CorrelationResult()
+    corr.inquiries = []
+    corr.brief = MagicMock()
+    corr.brief.inquiries = [_inquiry("not_asked", id="q_from_brief")]
+    assert [f.id for f in ReportGenerationModule._inquiries_of(corr)] == ["q_from_brief"]
+    sec = ReportGenerationModule._inquiries_section(corr)
+    assert "q_from_brief" in ReportGenerationModule.render_markdown([sec], {"id": "INC-Q"})
+
+
+def test_the_open_question_vocabulary_has_ONE_home_and_an_unknown_state_still_RENDERS():
+    """The renderer's prose table must cover `src.inquiry.INQUIRY_STATES` exactly.
+
+    Two claims, and the second is why the first is not enough: a state added upstream with no
+    entry here would render as silence, which is the one failure the five blocks exist to
+    prevent — so it prints under its own raw name and this test fails loudly instead.
+    """
+    from src.inquiry import INQUIRY_STATES
+
+    rendered = tuple(
+        state for state, _, _ in ReportGenerationModule._INQUIRY_STATE_BLOCKS
+    )
+    assert rendered == INQUIRY_STATES, (rendered, INQUIRY_STATES)
+    sec = ReportGenerationModule._inquiries_section(
+        _inquiry_correlation(_inquiry("some_future_state"))
+    )
+    md = ReportGenerationModule.render_markdown([sec], {"id": "INC-Q"})
+    assert "SOME FUTURE STATE (1)" in md
+    assert "Was it some_future_state?" in md
+
+
+@pytest.mark.asyncio
+async def test_the_open_question_section_survives_a_DOWN_narration_model_exactly_once(
+    tmp_path,
+):
+    """Built by the deterministic loop, so it runs on both branches — and must not double.
+
+    The count is what is asserted rather than the presence, because adding it to
+    `_fallback_sections` as well would emit it twice on exactly the degraded path it exists to
+    survive. And its place in the order is part of the claim: with "what may be done", after the
+    authorised actions and after the other advisory lane, so both lanes sit below everything the
+    verdict stands behind.
+    """
+    config = {"output_format": "txt", "output_path": str(tmp_path)}
+    llm = MagicMock()
+    llm.max_tokens = 4096
+    llm.structured_output = AsyncMock(side_effect=TimeoutError("down"))
+    module = ReportGenerationModule(config, llm)
+
+    corr = _verdict_correlation()
+    corr.inquiries = [
+        _inquiry("empty", rows_matched=0, meaning="nothing recorded it anywhere"),
+        _inquiry("unreachable", scope_entity="refund_claim"),
+    ]
+    out = await module.generate(
+        {"id": "INC-Q-DOWN"},
+        _understanding(),
+        {"record_lake": [{}]},
+        [_anomaly("a", 0.5)],
+        correlation=corr,
+    )
+    assert module.last_fallback_used is True, "the premise: narration was down"
+    titles = [s.get("section_title") for s in json.loads(out)]
+    assert titles.count(ReportGenerationModule._SEC_INQUIRIES) == 1, titles
+    assert "nothing recorded it anywhere" in out
+    assert titles.index(ReportGenerationModule._SEC_INQUIRIES) > titles.index(
+        ReportGenerationModule._SEC_ACTIONS
+    ), titles
+
+
+@pytest.mark.asyncio
+async def test_the_open_question_section_is_there_exactly_once_on_the_NARRATED_path_too(
+    tmp_path,
+):
+    """The other branch of the same requirement, and not the same test twice.
+
+    A narrated run is where duplication is most likely, because `_ensure_complete_sections`
+    keyword-matches titles into the backfill — a title close enough to one of the narrated ones
+    would arrive twice here and never in the fallback test above. It is also the report an
+    operator actually reads, so a declared meaning going missing here is the defect in its usual
+    place.
+    """
+    config = {"output_format": "txt", "output_path": str(tmp_path)}
+    llm = MagicMock()
+    llm.max_tokens = 4096
+    llm.structured_output = AsyncMock(
+        return_value=InvestigationReport(
+            sections=[
+                {"section_title": t, "content": "c"}
+                for t in ReportGenerationModule._REQUIRED_SECTIONS
+            ]
+        )
+    )
+    module = ReportGenerationModule(config, llm)
+
+    corr = _verdict_correlation()
+    corr.inquiries = [
+        _inquiry("answered", rows_matched=2, meaning="recorded elsewhere after all")
+    ]
+    # Both advisory lanes at once, because they are built by adjacent calls in one loop and a
+    # section that swallowed its sibling would be invisible in a report that carried only one.
+    corr.links = [_link("probed_negative", evidence_note="checked, and excluded")]
+    out = await module.generate(
+        {"id": "INC-Q-OK"},
+        _understanding(),
+        {"record_lake": [{}]},
+        [_anomaly("a", 0.5)],
+        correlation=corr,
+    )
+    assert module.last_fallback_used is False, "the premise: narration succeeded"
+    titles = [s.get("section_title") for s in json.loads(out)]
+    assert titles.count(ReportGenerationModule._SEC_INQUIRIES) == 1, titles
+    assert "recorded elsewhere after all" in out
+    assert titles.count(ReportGenerationModule._SEC_LINKS) == 1, titles
+    assert "checked, and excluded" in out
+    # In that order: the other procedure first, then what this one left open, which is the order
+    # a reader needs — the second lane is about the verdict they have just read.
+    assert titles.index(ReportGenerationModule._SEC_INQUIRIES) > titles.index(
+        ReportGenerationModule._SEC_LINKS
+    ), titles

@@ -505,7 +505,8 @@ async def test_a_response_without_finish_reason_still_works():
 
 # --- a parameter the endpoint will never accept is a fact, not a transient error ---
 #
-# Opus 5 arrived refusing `temperature` outright, and that 400 is deterministic: the three
+# The served model arrived refusing `temperature` outright, and that 400 is deterministic:
+# the three
 # inner retries resent the identical rejected parameter and the JSON fallback resent it too,
 # so one config change failed nine identical calls in the first stage.
 
@@ -522,8 +523,8 @@ def _bad_request(message):
     return BadRequestError(message, response=response, body={"message": message})
 
 
-_OPUS5_REFUSAL = (
-    "BAD_REQUEST: Model eu.anthropic.claude-opus-5 does not support the "
+_SAMPLING_REFUSAL = (
+    "BAD_REQUEST: Model eu.example.reasoning-1 does not support the "
     "temperature parameter."
 )
 
@@ -535,7 +536,7 @@ async def test_a_refused_sampling_param_is_dropped_and_the_call_succeeds():
     async def fake_create(**kwargs):
         seen.append(dict(kwargs))
         if "temperature" in kwargs:
-            raise _bad_request(_OPUS5_REFUSAL)
+            raise _bad_request(_SAMPLING_REFUSAL)
         return _FakeResponse('{"value": "ok"}')
 
     client.client.chat.completions.create = fake_create
@@ -555,7 +556,7 @@ async def test_the_refusal_is_learned_once_not_per_request():
         calls["n"] += 1
         if "temperature" in kwargs:
             calls["with_temp"] += 1
-            raise _bad_request(_OPUS5_REFUSAL)
+            raise _bad_request(_SAMPLING_REFUSAL)
         return _FakeResponse('{"value": "ok"}')
 
     client.client.chat.completions.create = fake_create

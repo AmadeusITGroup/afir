@@ -165,7 +165,19 @@ log_sources:
         warehouse_id: "<sql-warehouse-id>"
         # This workspace's PAT env var. Each workspace needs its OWN token — a token
         # from another workspace 403s here.
-        api_key_env: "DATABRICKS_TOKEN"
+        #
+        # NAME IT PER WORKSPACE AND NEVER `DATABRICKS_TOKEN`. Inside a Databricks App the
+        # platform injects OAuth credentials, and a PAT in `DATABRICKS_TOKEN` beside them
+        # makes the SDK's `Config()` raise *more than one authorization method configured*
+        # rather than choose — measured against databricks-sdk 0.125.0. `try_build_auth()`
+        # catches it and returns None, so the failure arrives as NO auth at all: a blank
+        # `llm_config.base_url` means "the workspace the SDK resolves", so there is then no
+        # endpoint and every LLM stage is dead, while each Databricks retriever loses the
+        # host it was going to inherit. The log says "SDK auth unavailable", which reads as
+        # a platform fault rather than a name collision. Locally the same name is correct
+        # and harmless — there are no OAuth vars to collide with — which is exactly how it
+        # survives a laptop and kills a deployment.
+        api_key_env: "<WORKSPACE>_DATABRICKS_TOKEN"
         max_results: 500
         # Poll budget must cover a cold/auto-stopped warehouse start (observed ~7 min
         # from fully-stopped) PLUS the query itself for big tables. Raise BOTH the poll
@@ -256,7 +268,11 @@ log_sources:
       workspace_url: "https://<workspace-host>"
       # 16-hex SQL WAREHOUSE id (NOT the workspace/org id from the URL — that yields 403s).
       warehouse_id: "<sql-warehouse-id>"
-      api_key_env: "DATABRICKS_TOKEN"   # fallback token when SDK auth is unavailable
+      # Fallback token when SDK auth is unavailable, per workspace and never named
+      # `DATABRICKS_TOKEN` in a deployed environment — see the backends block above for the
+      # measured reason (a PAT under that name beside an App's injected OAuth costs the run
+      # ALL auth, reported as a platform fault).
+      api_key_env: "<WORKSPACE>_DATABRICKS_TOKEN"
       catalog: "main"
       # schema: "fraud"                 # omit to scan all schemas + LLM curation
       max_results: 500
@@ -279,6 +295,15 @@ log_sources:
 # local run on `mock_domain` unless AFIR_PACK_DIR says otherwise.
 knowledge:
   pack_dir: "${AFIR_PACK_DIR:-mock_domain}"
+  # The authoring assistant's live-measurement lane. Read-only (a write verb or a
+  # ';'-chain is refused before a connection is opened) and bounded three ways, because
+  # the alternative is an assistant that writes down a plausible number: a threshold
+  # nobody measured is indistinguishable, in an approved diff, from one that was.
+  assistant_probes: 4                     # measurements one authoring session may run; 0 disables
+  assistant_probe_row_cap: 40             # rows one measurement may return (a cut list says so)
+  # Its own wall clock, and not the source's: a `primary` source is deliberately allowed
+  # 2h in a pipeline run, and an authoring turn inheriting that hangs with nothing to show.
+  assistant_probe_timeout_seconds: 30
 
 # Correlation/aggregation stage (between retrieval and anomaly detection).
 # Correlation keys are resolved in precedence order: (1) a playbook's structured
@@ -301,7 +326,22 @@ correlation:
   # Char budget for the deterministic investigation-evidence pack (chronology + actor
   # attribution + trimmed per-source aggregates) fed to anomaly detection & the report.
   # The pack degrades (aggregates harder) to fit this before the LLM stages embed it.
-  evidence_char_budget: 15000
+  #
+  # Measured on a full 41-source investigation: the pack renders at ~37,000 chars with
+  # nothing constraining it, so at 15,000 every heavy run degraded — `evidence_clipped`,
+  # correlation health capped at 0.70, and the adjudicated values dropped from the render
+  # in `kept=` order. 80,000 clears that render with margin and changed the report's prose
+  # not at all. It is a CEILING, not a target: a small investigation costs what it costs.
+  evidence_char_budget: 80000
+  # WHICH procedure adjudicates is a keyword score over the incident summary, and the losing
+  # procedure's conditions still resolve against real rows — so a misselection is a confident
+  # wrong verdict, not a missing one. Two facts about the choice are therefore scored as stage
+  # health: no procedure matched at all (`procedure_not_selected`, gates on its own), and the
+  # winner barely beat a rival (`procedure_selection_thin`, informational). This is the floor
+  # for the second: the fraction of the winning score the runner-up did NOT hold, below which
+  # the win is reported as thin. 0 disables it. It belongs in config because how much
+  # vocabulary two procedures share is a property of the domain, not of the engine.
+  selection_margin_floor: 0.15
 
   # Cross-procedure links — the ADVISORY lane, and nested here because it is a deterministic
   # step at the end of this stage rather than a stage of its own. Nothing under this key can
@@ -421,6 +461,40 @@ correlation:
     max_concurrent_children: 1
     max_total_children: 8
 
+  # The other advisory lane, and the axis is what differs: `links:` above asks whether ANOTHER
+  # procedure applies to this evidence; this one asks what THIS procedure could not settle about
+  # its own. Same posture in every other respect — nothing here is read by a condition, and none
+  # of it moves the verdict, its severity or this run's stage health.
+  #
+  # A ruleset declares its own questions under `open_questions:`, so a pack that declares none
+  # produces no output and spends nothing whatever is set here. `enabled: false` turns the lane
+  # off for a pack that does declare them.
+  inquiries:
+    enabled: true
+    # Questions one run may spend a QUERY on. Most cost nothing and this number does not bound
+    # them: where the run already retrieved the source a question names, it is answered by
+    # reading those rows again, reported as such, and never counted here. This bounds only the
+    # questions whose source was not retrieved.
+    #
+    # It ships at 1 — narrow but ARMED. At 0 every refusal path below becomes unreachable
+    # outside a test, which is how a bound comes to be shipped untested; at 1 the lane is
+    # exercised on any run that raises a question the run's own sources cannot answer.
+    #
+    # THE MARGIN IS THE BUDGET, NOT THE NUMBER, and the ceiling is SHARED with the link lane
+    # above: this count times the timeout below is capped by what `links.max_probes_per_run *
+    # links.probe_timeout_seconds` leaves of the engine's own advisory ceiling. So the two
+    # advisory lanes together can never spend more seconds than one of them could alone, and
+    # raising a link budget narrows this one rather than widening the run. The subtraction uses
+    # the link lane's BUDGETED worst case and not what it actually spent — a bound whose value
+    # depends on how slow the other lane happened to be is not a bound anybody can state in
+    # advance.
+    max_inquiry_probes_per_run: 1
+    probe_timeout_seconds: 120
+    # Rows one question may read, bounded separately from every timeout for the reason the link
+    # probe's cap is separate: a row cap and a time cap are different limits. A count at exactly
+    # this number is reported as a FLOOR and never as a total.
+    probe_row_cap: 200
+
 anomaly_detection:
   use_llm: true
   threshold: 0.8
@@ -528,6 +602,73 @@ stage_gates:
   timeout_seconds: 0
   on_timeout: hold
 
+# WHO is asking. Off everywhere the platform forwards no caller, which is a laptop, a VM,
+# an App Service and — until an operator says otherwise — a Databricks App: there every
+# request is the single local administrator, every write lands on the shared tree, and the
+# per-caller machinery below is unreachable rather than merely unused. `auto` turns it on
+# behind a Databricks cluster driver proxy, the one ingress whose forwarded header set has
+# been measured.
+#
+# Two roles, and the split is what each may WRITE: an administrator edits the shared config
+# and knowledge pack, everyone else edits their own layer of them and reads the rest. A
+# layer is a durable, merged-forward DRAFT — the running pipeline loads the administrator's
+# base, because the pack and the retriever connections are built once at boot.
+#
+# There is deliberately no state meaning "read an identity but accept its absence": that
+# makes an unauthenticated request indistinguishable from the single-operator case, at
+# administrator.
+identity:
+  mode: auto
+  # Comma-separated, because the Configuration tab writes a scalar. A hand-edited YAML list
+  # works too and is read the same way; it just cannot be patched from the UI, which
+  # refuses a key holding a block rather than orphaning its children.
+  admin_groups: ""
+  # The list that works on the BROWSER path with no extra step. That path forwards a
+  # validated user name and no credential, and a non-administrator cannot read another
+  # account's group membership from the workspace at all — so groups alone would leave
+  # every browser caller a plain user.
+  admin_users: ""
+  # Where a forwarded token is validated (the SCIM /Me endpoint). Blank takes the
+  # `databricks.host` below; blank in both disables validation and degrades to the
+  # platform-asserted name plus admin_users, which is a working state and the one to expect
+  # where the app has no outbound route to its own workspace.
+  workspace_host: ""
+  validation_ttl_seconds: 900
+  allow_self_elevation: true
+
+# Who called, and what they changed. Every other durable record AFIR keeps is about a RUN,
+# which leaves the other half of "usage" invisible: a caller who only browses, reads someone
+# else's report, is refused at the door, or edits this file leaves no trace anywhere.
+#
+# Appended to the STORAGE BACKEND (`audit/access-YYYY-MM-DD.jsonl`, one day per object) and
+# not to stdout, because on a cluster driver stdout is a file on ephemeral local disk — an
+# audit trail a restart erases is not one. `backend: local` therefore journals to local disk
+# and inherits that caveat.
+#
+# `enabled: auto` follows the identity layer: on for a driver proxy or a Databricks App,
+# where there are several callers to tell apart; off on a laptop or a VM, where every caller
+# is the same local operator and the journal would record one person visiting their own
+# machine. Read it back at GET /api/v1/audit (administrators only).
+#
+# NOT a security control and never in the request path: entries are buffered and appended in
+# batches, because a Volume append is a read-modify-write serialised on one thread and an
+# append per request would put an investigation's writes behind a queue of page loads. The
+# cost is stated rather than hidden — up to `flush_seconds` of entries are lost by a hard
+# kill, and a shutdown drains them.
+audit:
+  enabled: auto
+  flush_seconds: 30
+  # Flush early once this many entries are buffered, whichever comes first.
+  max_buffer: 200
+  # Ceiling while the sink is REFUSING writes. Past it the OLDEST entries are dropped and the
+  # count is journalled, because a buffer that grows until the process dies takes the
+  # in-flight investigation with it.
+  max_pending: 5000
+  retention_days: 90
+  # Paths that carry no information about usage and would drown everything that does. The
+  # platform's own liveness probe hits /health every few seconds forever.
+  exclude_paths: "/health"
+
 # Outbound webhooks. Optional, disabled by default, and never able to fail or slow a
 # run — delivery is a background POST and every failure degrades to a log line.
 #
@@ -600,6 +741,14 @@ storage:
   #              Reached over HTTP rather than by pointing `root` at /Volumes, which in an
   #              App container is not mounted at all: that write lands in /tmp and reports
   #              success while losing every pending approval on the next restart.
+  # dbfs       — workspace storage over /api/2.0/dbfs, configured under `dbfs:` below. The
+  #              SAME machinery as the Volume backend (one writer thread, .prev, verified
+  #              read-back, a bounded flush a gate waits on) pointed at the one durable
+  #              namespace that needs NO Unity Catalog grant. For a workspace where the
+  #              app's service principal cannot be given USE CATALOG on the catalog holding
+  #              the Volume: prefer `databricks` wherever it can, since a UC Volume is
+  #              governed and audited and DBFS is not, and this is the fallback that keeps
+  #              pending approvals across a restart until that grant exists.
   # sql        — a transactional database (sqlite or postgresql), configured under `sql:`
   #              below. The ONLY option safe with more than one replica: its upsert and its
   #              append are each one atomic statement, where the Volume backend emulates
@@ -651,6 +800,18 @@ storage:
     token_env: DATABRICKS_TOKEN
     verify_ssl: true            # true here unlike log_sources; a store holding pending
                                 # approvals must not inherit a dev-only insecure posture
+
+  # Read only when `backend: dbfs`. One key, because `host` / `token_env` / `verify_ssl`
+  # are read from the `databricks:` block above: reaching the workspace is the same problem
+  # for both destinations, so switching between them is this one `backend:` value and not a
+  # second set of credentials to keep in step. Anything set here still wins, for the rare
+  # run whose DBFS namespace is in another workspace.
+  dbfs:
+    # A DBFS path, NOT a filesystem path — written over the API, so no /dbfs mount is
+    # involved and `root:` above is not read. Under /FileStore because that is the one DBFS
+    # area a workspace user can browse by hand, which is what an operator needs when a
+    # restart lost something. Env-driven for the same bootstrap reason as `backend`.
+    root: "${AFIR_DBFS_ROOT:-/FileStore/afir/state}"
 
   # Read only when `backend: sql`. Present with defaults for the same reason as the block
   # above: the Configuration tab can fill in a key that exists, and cannot offer one the
@@ -708,9 +869,19 @@ jobs:
   # omission is recorded in the job doc, so a reloaded job reports that its evidence
   # is missing instead of looking complete with empty logs.
   max_evidence_mb: 64
-  # How long job FILES are kept. Deliberately longer than the in-memory TTL (1h): the
-  # point of persisting is to outlive the process, and an audit may come days later.
+  # How long job FILES are kept. Deliberately longer than `completed_ttl_seconds` below:
+  # the point of persisting is to outlive the process, and an audit may come days later.
   retention_days: 14
+  # How long a FINISHED run stays fully in memory. Past this the next submission evicts it,
+  # keeping a compact row in the list and answering any read of it from the store — so this
+  # bounds how much a long-lived process holds, not how far back an operator can see. It
+  # used to bound both, and a finished investigation would vanish from the Jobs list the
+  # moment someone else submitted a run, which reads as a run that was deleted.
+  completed_ttl_seconds: 3600
+  # How many of those evicted rows the list keeps. Purely a memory bound on the list; the
+  # documents themselves are kept for `retention_days` regardless, so lowering this hides
+  # old runs from the list without deleting anything.
+  history_max_items: 2000
   # How many entries each per-stage summary list keeps — extracted entities, generated
   # queries, findings, anomalies, verdict subjects. These summaries are what the
   # Investigate cards and the APPROVAL GATES show, so a list cut here is a list the

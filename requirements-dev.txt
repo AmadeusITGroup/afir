@@ -13,11 +13,17 @@ pytest-asyncio
 pytest-cov
 
 # Formatting and linting. Never run repo-wide: there is no setup.cfg/pyproject, so flake8
-# defaults to 79 columns against black's 88 and reports ~13.6k pre-existing findings. See
-# the top of CLAUDE.md.
+# defaults to 79 columns against black's 88 and reports ~13.6k pre-existing findings.
+# See "Formatting posture" in CONTRIBUTING.md.
 black
 flake8
 isort
+
+# The Snowflake driver, for the same reason: `SnowflakeRetriever` is covered by the suite,
+# but the driver's botocore dependency exceeds the per-file cap on the App's install route.
+# No test imports `snowflake.connector` — they mock the cursor — so a machine without this
+# still runs green; it is here so a laptop can actually reach a Snowflake source.
+snowflake-connector-python>=3.7
 
 # The local embedding provider. Not a runtime dependency (the default provider is a
 # serving endpoint), but the suite covers that provider and an air-gapped deployment

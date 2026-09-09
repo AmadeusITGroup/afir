@@ -696,6 +696,37 @@ def test_the_discount_is_visible_in_the_reason_not_just_the_number():
     assert "b" in reason.detail
 
 
+def test_a_source_that_answers_by_being_empty_is_not_listed_as_a_gap():
+    """The arithmetic excluded it; the sentence must too.
+
+    Reported from a live run: the reason read "3 of 8 source(s) returned zero rows:
+    <eight names>" with a pack-discounted registry lookup first in that list and the
+    discount note cut off by the 5-name cap, so a check that succeeded by coming back
+    empty read as the penalty.
+    """
+    ctx = _pack_with_zero_rows(
+        {
+            "automation_registry": {
+                "health_weight": 0.0,
+                "meaning": "no row means the actor is not a registered robot",
+            }
+        }
+    )
+    logs = {"a": [{"x": 1}], "real_gap": [], "automation_registry": []}
+    reason = [
+        r
+        for r in score_stage("log_retrieval", logs, ctx).reasons
+        if r.code == "empty_sources"
+    ][0]
+    counted, answered = reason.detail.split("ANSWERED by being empty")
+    assert "real_gap" in counted
+    assert "automation_registry" not in counted
+    assert "automation_registry" in answered
+    assert "not a registered robot" in answered
+    # One counted source of three, not three of three.
+    assert reason.detail.startswith("1 of 3 source(s)")
+
+
 def test_an_undeclared_pack_scores_exactly_as_before():
     ctx = _pack_with_zero_rows({})
     logs = {"a": [{"x": 1}], "b": [], "c": [], "d": []}
@@ -747,6 +778,27 @@ def test_a_source_at_exactly_its_cap_is_reported_as_truncated():
     assert "source_truncated" in codes(h)
     detail = [r for r in h.reasons if r.code == "source_truncated"][0].detail
     assert "capped" in detail and "fine" not in detail
+
+
+def test_one_capped_source_cannot_gate_the_stage_on_its_own():
+    """The row cap is the operator's own `max_results`, and a capped source ANSWERED.
+
+    It stays a deduction — "N rows" and "N rows, and there were more" are different findings,
+    and truncation is reported everywhere the count is read — but in the same tier as the
+    other configured-limit signals, so it pauses a run only when it is pervasive.
+    """
+    at_cap = [{}, {}]
+    engine = MagicMock()
+    engine.row_caps.return_value = {f"s{i}": 2 for i in range(5)}
+    ctx = _Ctx(modules={"log_retrieval": engine})
+    one = score_stage("log_retrieval", {"s0": at_cap, "ok": [{}]}, ctx)
+    assert one.score == pytest.approx(0.9)
+    assert one.gate_recommended is False
+    many = score_stage(
+        "log_retrieval", {f"s{i}": at_cap for i in range(5)} | {"ok": [{}]}, ctx
+    )
+    assert many.score == pytest.approx(0.5)
+    assert many.gate_recommended is True
 
 
 def test_row_caps_raising_does_not_break_scoring():
@@ -873,17 +925,65 @@ def test_the_clip_note_the_scorer_looks_for_is_the_one_the_ladder_writes():
     assert degraded.notes[-1] == CLIP_NOTE
 
 
-def test_degraded_verdict_and_brief_are_separate_signals():
+def test_one_degradation_is_charged_once_not_twice():
+    """`brief.degraded` is a SUPERSET of `verdict.degraded`, so both codes double-charged.
+
+    `usecases/base.py` seeds the brief's flag with `bool(verdict.degraded)` and only ever
+    OR-s its own two causes onto it. Firing both deducted 0.6 for one missing-data fact and,
+    stacked with an evidence rung and a skipped narration, hit exactly 1.0 — a stage scored
+    0.00 while the verdict, the conditions and every source were intact.
+    """
     h = score_stage(
         "correlation",
         _correlation(verdict=MagicMock(degraded=True), brief=MagicMock(degraded=True)),
         _Ctx(),
     )
-    assert {"verdict_degraded", "brief_degraded"} <= codes(h)
+    assert "verdict_degraded" in codes(h)
+    assert "brief_degraded" not in codes(h)
+    assert h.score == pytest.approx(0.7)
 
 
-def test_no_narrated_findings_is_only_a_light_penalty():
-    """The volume gate skipping the LLM is normal on a big incident, not a fault."""
+def test_a_brief_degraded_on_its_own_still_scores():
+    """Its own two causes (a dropped projection leaf, an unwidenable sweep) are real."""
+    h = score_stage(
+        "correlation",
+        _correlation(verdict=MagicMock(degraded=False), brief=MagicMock(degraded=True)),
+        _Ctx(),
+    )
+    assert "brief_degraded" in codes(h)
+    assert "verdict_degraded" not in codes(h)
+    assert h.score == pytest.approx(0.7)
+
+
+def test_the_deterministic_narration_path_is_not_a_defect():
+    """The volume gate is a CONFIGURED choice; `summary_text` still flows downstream."""
+    ctx = _Ctx(stage_facts={"correlation": {"narration": "deterministic"}})
+    h = score_stage("correlation", _correlation(findings=[]), ctx)
+    assert h.reasons == []
+    assert h.score == 1.0
+
+
+def test_narration_that_ran_and_produced_nothing_is_a_defect():
+    ctx = _Ctx(stage_facts={"correlation": {"narration": "llm"}})
+    h = score_stage("correlation", _correlation(findings=[]), ctx)
+    assert codes(h) == {"narration_skipped"}
+    detail = [r for r in h.reasons if r.code == "narration_skipped"][0].detail
+    assert "ran and produced none" in detail
+    assert h.score == pytest.approx(0.9)
+
+
+def test_the_narration_path_falls_back_to_the_shared_module_attribute():
+    """Callers that drive the stage directly record no fact; the module still knows."""
+    module = MagicMock()
+    module.last_narration = "deterministic"
+    h = score_stage(
+        "correlation", _correlation(findings=[]), _Ctx(modules={"correlation": module})
+    )
+    assert h.reasons == []
+
+
+def test_an_unrecorded_narration_path_is_still_scored():
+    """Unknown is not "designed": a defect the run cannot attribute is still a defect."""
     h = score_stage("correlation", _correlation(findings=[]), _Ctx())
     assert codes(h) == {"narration_skipped"}
     assert h.score == pytest.approx(0.9)
