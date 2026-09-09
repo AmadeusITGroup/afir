@@ -9,9 +9,11 @@ from anomaly_detection import AnomalyDetectionModule
 from api_call_generator import ApiCallGenerator
 from correlation import CorrelationModule
 from export_results import ResultExporter
+from identity import owner_scoped
 from feedback_loop import FeedbackLoop
 from incident_input import IncidentInputInterface
 from incident_understanding import IncidentUnderstandingModule
+from inquiry_probe import build_inquiry_probe
 from job_store import build_job_store
 from knowledge.pack import load_knowledge_pack
 from link_probe import build_link_probe
@@ -33,7 +35,14 @@ from report_generation import ReportGenerationModule
 # Package-qualified: a flat import creates a second module object that `incident_input`
 # (which uses `from src import report_delivery`) never reads. Same for `src.storage`.
 from src import report_delivery
+# Package-qualified for the same reason, and because `incident_input` reaches it that way:
+# two module objects would give the HTTP layer a different journal than main() started.
+from src.audit_journal import build_audit_journal
 from src.storage import PrefixedStorage, build_storage
+# Package-qualified for the same reason: the HTTP layer reads `src.user_secrets`, and a flat
+# import here would install the store on a second module object nothing else can see.
+from src.user_secrets import (UserSecretStore, offered_names,
+                              set_secret_store)
 from src.storage.mirror import (build_mirrors, seed_working_copies,
                                 working_copies_are_writable)
 from utils.databricks_auth import try_build_auth
@@ -174,7 +183,7 @@ async def process_incident(incident, modules):
                 },
                 "anomalies": [a.model_dump() for a in anomalies],
             },
-            storage=modules.get("artifact_storage"),
+            storage=owner_scoped(modules.get("artifact_storage"), incident),
         )
         exports = exports_dir()
         exporter.export_json(str(exports / f"incident_{incident['id']}.json"))
@@ -326,6 +335,18 @@ async def main():
         llm_config = load_config(config_path("llm_config.yaml"))
         configure_logging(main_config)
 
+    # Per-caller credential overrides. Installed here, after the config re-read, because the
+    # set of names a caller may replace is read from the live config: a name no reader resolves
+    # would be a secret somebody could save to no effect. Nothing is stored for anybody until a
+    # caller asks, and with no offerable name the whole feature reports itself unavailable.
+    offered = offered_names(main_config, llm_config)
+    set_secret_store(UserSecretStore(storage, offered=offered))
+    logger.info(
+        "Personal credential overrides: %d name(s) a caller may replace for their own runs%s",
+        len(offered),
+        f" ({', '.join(sorted(offered))})" if offered else "",
+    )
+
     # Works for a local PAT and an App's OAuth service principal. None when the SDK or its
     # credentials are absent, in which case the LLM client and retrievers fall back to the
     # static api_key_env token.
@@ -459,6 +480,10 @@ async def main():
             # because correlation is deliberately IO-free. What it may spend is the config's
             # to bound; `max_probes_per_run: 0` withdraws the capability entirely.
             link_probe=build_link_probe(api_call_generator, log_retrieval_engine),
+            # The same for the other advisory lane, through the same two seams: what an open
+            # question may spend is bounded by `inquiries.max_inquiry_probes_per_run` and by the
+            # ceiling it shares with the link lane, and `0` withdraws the capability entirely.
+            inquiry_probe=build_inquiry_probe(api_call_generator, log_retrieval_engine),
         ),
         "anomaly_detection": AnomalyDetectionModule(
             main_config["anomaly_detection"], llm_client, rag, feedback=feedback_loop
@@ -486,6 +511,24 @@ async def main():
     # Backs both controllable jobs and classic endpoints. The store is durable because
     # approval gates hold indefinitely; a pending decision must outlive a restart.
     job_store = build_job_store(main_config, storage=storage)
+    # The other half of "usage": every durable record above is about a RUN, so a caller who
+    # only browses, reads someone else's report, is refused at the door or edits the shared
+    # configuration leaves no trace anywhere. Pruned before the server accepts requests
+    # because that listing is the one blocking read it does.
+    audit_journal = build_audit_journal(main_config, storage)
+    if audit_journal.enabled:
+        audit_journal.prune()
+        logger.info(
+            "Access journal enabled: %s storage, flushed every %.0fs, %s.",
+            getattr(storage, "kind", "unknown"),
+            audit_journal.flush_seconds,
+            # `0` means keep everything, so printing the number would read as the opposite of
+            # what it does — "kept 0 day(s)" is how a journal that discards its own output
+            # would announce itself.
+            f"kept {audit_journal.retention_days} day(s)"
+            if audit_journal.retention_days
+            else "kept indefinitely",
+        )
     # Sets how many entries each per-stage summary list keeps. A module global, since the
     # summarizers are module-level functions; also re-set by the config-apply path, as
     # `jobs.summary_max_items` is `live`.
@@ -591,10 +634,19 @@ async def main():
         # Read-only: which declared sources built no retriever. Without this the run
         # reports success while every decisive condition is `unknown`.
         retrieval_engine=log_retrieval_engine,
+        # Read-only, and the loaded object rather than the name above: an absent pack
+        # directory loads as an empty pack, which is the one degradation that leaves every
+        # stage running and answers nothing.
+        knowledge_pack=knowledge_pack,
+        # Write-only from the interface's side: the HTTP layer is the only place that sees a
+        # caller at all, so it is the only place that can record one.
+        audit_journal=audit_journal,
     )
 
     try:
         await input_server.start_server(port=port)
+        # After the server, because the periodic flush needs the running loop.
+        audit_journal.start()
         logger.info(
             "Fraud Investigation System ready on port %s. Submit incidents to / or the API.",
             port,
@@ -606,6 +658,9 @@ async def main():
         # A bounded moment for in-flight webhook POSTs to land, bounded because a shutdown
         # must not hang on an unresponsive receiver.
         await webhooks.close()
+        # Before the storage drain, since draining the journal is what puts its last entries
+        # INTO the storage queue.
+        await audit_journal.stop()
         # Drain the storage queue last: a queueing backend holds writes in memory and a
         # shutdown that skips this discards the state the restart needs. Bounded, off-thread.
         await asyncio.to_thread(storage.close, 10.0)

@@ -108,9 +108,9 @@ from a candidate nobody considered, so it renders as a line in the report and a 
 
 ## Measured: the per-pair table
 
-`scripts/measure_link_signals.py` replays the local job corpus and reports **per (source → target)
-pair, never in aggregate**. It is domain-neutral (the pack is read at runtime) and deterministic
-(two `--json` runs diff identically).
+The measurement replays the local job corpus and reports **per (source → target) pair, never in
+aggregate**. It is domain-neutral (the pack is read at runtime) and deterministic (two runs diff
+identically).
 
 **Its output gates nothing.** It is an authoring instrument: it tells an author which declarations
 discriminate and which have become labels, and its numbers reach a run only as the additive
@@ -200,7 +200,7 @@ score. What the script still owns is the **reverse** direction — a declaration
 a population — because a rate is transcribed by hand once and then nothing re-reads the corpus:
 
 ```
-scripts/measure_link_signals.py  →  entry_signals[].base_rate in the pack  →  base_rate_measured()
+a replay of the job corpus  →  entry_signals[].base_rate in the pack  →  base_rate_measured()
    →  link_score()'s signal_discriminates term  (run time)
    →  entry-signal-unmeasured / -broad-selector  (authoring time)
 ```
@@ -411,6 +411,57 @@ asserted independently in `tests/test_link_probe.py` / `tests/test_link_children
   stopped it.
 - Children start **after** the parent's retrieval, against the shared
   `Semaphore(max_concurrency=4)`.
+
+## The sibling lane: this procedure's own open questions
+
+Everything above answers *does **another** procedure apply to these rows*. The other question a
+reader of a finished report actually asks is *what could **this** procedure not settle* — and the two
+are the same shape on different axes, so the open-question lane (`src/inquiry.py`, the pure planner;
+`src/inquiry_probe.py`, the one rung that spends a query) is built out of this one's parts rather than
+beside them. A ruleset declares `open_questions:` (`knowledge-pack-authoring.md` §2.5.3); a pack
+declaring none produces no finding, no probe and no field content, byte-identically.
+
+What it inherits verbatim: the purity discipline (no IO, no clock, no `async` in the planner,
+AST-asserted), rows arriving as an **argument** to the settlement and never merged into `logs`, the
+query built through `build_manual_query` so every `_attach_query_guards` guarantee applies for free,
+coded refusals instead of silences, and the invariance gate —
+`tests/test_inquiries_never_change_the_verdict.py`, the same `_sacred()` comparison with `inquiries`
+added to the exclusion set. `InquiryFinding` sits on `CorrelationResult.inquiries` /
+`InvestigationBrief.inquiries`, exactly where `links` sits.
+
+What is genuinely its own, and each of the four is a place the naive version collapses two facts:
+
+- **Five states, not four, and the order is the sort key**: `answered`, `not_asked`, `empty`,
+  `unanswered`, `unreachable` — actionable first, so a reader who stops halfway has seen every
+  question with something to say. `empty` and `unanswered` are the pair the whole lane exists for: a
+  source that answered with no rows is a finding whose meaning the **pack** wrote, a source that never
+  answered is a credential or catalog gap, and the remedies are opposite.
+- **The free rung is most of the value.** Where the run already retrieved the source a question names,
+  the question is settled by reading those rows again — no probe, `probe_spent` stays `False`, and it
+  is a separate named entry point (`settle_from_rows_in_hand`) rather than a flag, so a call site
+  cannot mistake one for the other. The budget bounds only the questions whose source was *not*
+  retrieved.
+- **One shared clamped ceiling with this lane, subtracted rather than added.** `inquiry_budget` gives
+  the count its own key (`max_inquiry_probes_per_run`, shipping at **1** — narrow but armed, for the
+  reason the rungs above ship armed) and then caps `count × timeout` at what
+  `links.max_probes_per_run × links.probe_timeout_seconds` leaves of `PROBE_BUDGET_CEILING_SECONDS`.
+  So raising a link budget **narrows** this lane instead of widening the run, and the subtraction uses
+  the link lane's *budgeted* worst case: a bound whose value depends on how slow the other lane
+  happened to be is not a bound anybody can state in advance. With both lanes at their defaults the
+  link lane budgets 240s and this one gets 120s of the remaining 660s.
+- **A non-answer does not consume the probe COUNT; the wall clock is the hard bound.** Exact parity
+  with `run_link_probes` — `spent += 1` sits only under `answer is not None` — because a timeout that
+  burned the budget would let one unreachable source silence every question behind it, while a
+  `deadline_seconds` check before each probe stops a slow lane regardless. A slice is reported through
+  the shared `slice_text`, which both lanes now use: `int(seconds)` printed a nearly-exhausted deadline
+  as an `0s` slice, i.e. in the words a lane configured to spend nothing produces, and those two facts
+  have opposite remedies.
+
+Two smaller ones worth knowing before editing the settlement: `row_cap_hit` is measured on the rows
+that came **back**, before the declaration's own `where` selector runs (the cap bounds the retrieval,
+so a selector keeping two of a capped hundred still owes the reader *and there were more*), and a
+selector that raises yields `unanswered` with nothing claimed rather than a reading of every row
+against a question nobody asked.
 
 ## The honest limitation
 

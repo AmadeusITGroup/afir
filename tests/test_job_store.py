@@ -565,6 +565,117 @@ async def test_in_memory_pruning_keeps_the_persisted_file(tmp_path):
     assert (tmp_path / "jobs" / f"{job.job_id}.json").exists(), "file survives"
 
 
+# --- a finished run stays visible after the TTL evicts it -------------------
+#
+# The defect these assert against: `_prune` runs as the first statement of `create_job`, so
+# submitting one run erased every finished run from `GET /api/v1/jobs` while the documents sat
+# untouched in the store. An investigation vanishing from the list on somebody else's
+# submission reads as a run that was deleted, and the operator has no way to tell otherwise.
+
+
+async def test_a_pruned_run_is_still_listed_and_marked_not_live(tmp_path):
+    import asyncio
+
+    store = _store(tmp_path)
+    jm = _manager(
+        [StageDescriptor("understanding", _noop, "understanding")],
+        store=store,
+        ttl_seconds=-1,
+    )
+    job = jm.create_job(_incident())
+    await asyncio.wait_for(jm.run_job(job), timeout=2)
+
+    jm.create_job(_incident("INC-Q"))  # triggers _prune
+    rows = {row["job_id"]: row for row in jm.list_jobs()}
+    assert job.job_id in rows, "a finished run must not vanish from the list"
+    assert rows[job.job_id]["live"] is False
+    assert rows[job.job_id]["status"] == "completed"
+    # Not left at whatever the backlog said when it was evicted: a terminal run is waiting
+    # for nothing, and a stale `#3` is an instruction to wait.
+    assert rows[job.job_id]["queue_position"] == 0
+    # And the run whose submission triggered the prune is there too, live.
+    assert sum(1 for row in rows.values() if row["live"]) == 1
+
+
+async def test_a_pruned_run_is_rehydrated_from_the_store_on_demand(tmp_path):
+    """The other half: the row is a summary, and attaching to it needs the whole document."""
+    import asyncio
+
+    store = _store(tmp_path)
+    jm = _manager(
+        [StageDescriptor("understanding", _noop, "understanding")],
+        store=store,
+        ttl_seconds=-1,
+    )
+    job = jm.create_job(_incident())
+    await asyncio.wait_for(jm.run_job(job), timeout=2)
+    jm.create_job(_incident("INC-Q"))
+    assert jm.get_job(job.job_id) is None, "gone from memory"
+
+    revived = jm.hydrate(job.job_id)
+    assert revived is not None and revived.job_id == job.job_id
+    assert revived.status.value == "completed"
+    # And it is back in memory, so the row it now contributes is a live one rather than a
+    # duplicate of the history entry.
+    ids = [row["job_id"] for row in jm.list_jobs()]
+    assert ids.count(job.job_id) == 1
+    assert jm.get_job(job.job_id) is not None
+
+
+def test_hydrate_answers_none_for_an_id_that_was_never_stored(tmp_path):
+    jm = _manager([StageDescriptor("understanding", _noop, "understanding")],
+                  store=_store(tmp_path))
+    assert jm.hydrate("no-such-job") is None
+    assert jm.hydrate("") is None
+
+
+async def test_the_history_list_is_bounded(tmp_path):
+    """The TTL bounds MEMORY; this bounds the list. The documents outlive both at
+    `jobs.retention_days`, so a run past the bound is rehydratable by id and simply not
+    enumerated."""
+    import asyncio
+
+    store = _store(tmp_path)
+    jm = _manager(
+        [StageDescriptor("understanding", _noop, "understanding")],
+        store=store,
+        ttl_seconds=-1,
+        config={"jobs": {"history_max_items": 2}},
+    )
+    finished = []
+    for i in range(4):
+        job = jm.create_job(_incident(f"INC-{i}"))
+        await asyncio.wait_for(jm.run_job(job), timeout=2)
+        finished.append(job.job_id)
+    jm.create_job(_incident("INC-LAST"))
+    listed = {row["job_id"] for row in jm.list_jobs()}
+    kept = [jid for jid in finished if jid in listed]
+    assert len(kept) <= 2
+    # Dropped from the LIST, not from the store.
+    for jid in finished:
+        assert jm.store.load_one(jid) is not None
+
+
+def test_the_ttl_and_the_history_bound_are_read_from_the_config(tmp_path):
+    jm = _manager(
+        [StageDescriptor("understanding", _noop, "understanding")],
+        store=_store(tmp_path),
+        config={"jobs": {"completed_ttl_seconds": 120, "history_max_items": 7}},
+    )
+    assert jm.ttl_seconds == 120 and jm.history_max_items == 7
+
+
+def test_a_typo_in_either_falls_back_to_the_default_rather_than_zero(tmp_path):
+    """`completed_ttl_seconds: ""` from a half-finished edit meaning "evict immediately" is
+    the defect this whole section is about, reintroduced by a blank line in a YAML file."""
+    jm = _manager(
+        [StageDescriptor("understanding", _noop, "understanding")],
+        store=_store(tmp_path),
+        config={"jobs": {"completed_ttl_seconds": "", "history_max_items": "lots"}},
+    )
+    assert jm.ttl_seconds == 3600 and jm.history_max_items == 2000
+
+
 # --- config ----------------------------------------------------------------
 
 
@@ -717,3 +828,92 @@ async def _noop(ctx):
 # intent is readable at the call site even though the body matches _noop.
 async def _noop_none(ctx):
     return None
+
+
+# -- per-caller segregation ------------------------------------------------
+#
+# A run belongs to whoever asked for it. The prefix is the whole mechanism: an admin lists
+# across every caller with one prefix, a caller sees their own with another. What must not
+# regress is the unowned case — every job written before ownership existed keeps its key.
+
+
+def _owned(iid, owner, name="someone@example.com"):
+    doc = _incident(iid)
+    doc.update({"owner": owner, "owner_name": name})
+    return doc
+
+
+def test_an_owned_job_lands_under_its_owners_segment(tmp_path):
+    store = _store(tmp_path)
+    store.save({"job_id": "j1", "incident": _owned("INC-1", "4242")})
+    keys = {o.key for o in store.storage.list_keys("")}
+    assert "users/4242/j1.json" in keys
+
+
+def test_an_unowned_job_keeps_the_flat_key_it_always_had(tmp_path):
+    store = _store(tmp_path)
+    store.save({"job_id": "j1", "incident": _incident("INC-1")})
+    assert {o.key for o in store.storage.list_keys("")} == {"j1.json"}
+
+
+def test_load_all_finds_both_shapes(tmp_path):
+    """A store holding pre-ownership jobs and owned ones must return every one of them."""
+    store = _store(tmp_path)
+    store.save({"job_id": "old", "incident": _incident("INC-OLD")})
+    store.save({"job_id": "mine", "incident": _owned("INC-MINE", "4242")})
+    store.save({"job_id": "yours", "incident": _owned("INC-YOURS", "9999")})
+    assert {d["job_id"] for d in store.load_all()} == {"old", "mine", "yours"}
+
+
+def test_two_callers_do_not_collide_on_the_same_job_id(tmp_path):
+    store = _store(tmp_path)
+    store.save({"job_id": "same", "incident": _owned("INC-A", "4242")})
+    store.save({"job_id": "same", "incident": _owned("INC-B", "9999")})
+    loaded = {d["incident"]["owner"]: d["incident"]["id"] for d in store.load_all()}
+    assert loaded == {"4242": "INC-A", "9999": "INC-B"}
+
+
+def test_evidence_follows_its_doc_into_the_owners_segment(tmp_path):
+    store = _store(tmp_path)
+    doc = {
+        "job_id": "j1",
+        "incident": _owned("INC-1", "4242"),
+        "outputs": {"logs": {"src": [{"row": 1}]}},
+    }
+    store.save(doc, evidence_changed=True)
+    keys = {o.key for o in store.storage.list_keys("")}
+    assert "users/4242/j1.evidence.json" in keys
+    [back] = store.load_all()
+    assert back["outputs"]["logs"] == {"src": [{"row": 1}]}
+
+
+def test_delete_locates_an_owned_job_without_being_told_the_owner(tmp_path):
+    """prune and the job manager both delete by id alone; neither holds the incident."""
+    store = _store(tmp_path)
+    store.save(
+        {
+            "job_id": "j1",
+            "incident": _owned("INC-1", "4242"),
+            "outputs": {"logs": {"a": [1]}},
+        },
+        evidence_changed=True,
+    )
+    assert store.delete("j1") is True
+    assert store.storage.list_keys("") == []
+
+
+def test_delete_reports_a_job_that_is_not_there(tmp_path):
+    assert _store(tmp_path).delete("absent") is False
+
+
+def test_prune_removes_an_owned_job(tmp_path):
+    import os
+    import time
+
+    store = _store(tmp_path, retention_days=1)
+    store.save({"job_id": "j1", "incident": _owned("INC-1", "4242")})
+    stale = tmp_path / "jobs" / "users" / "4242" / "j1.json"
+    old = time.time() - (5 * 86400)
+    os.utime(stale, (old, old))
+    assert store.prune() == 1
+    assert store.load_all() == []

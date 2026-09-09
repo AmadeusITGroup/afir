@@ -372,7 +372,7 @@ def test_a_pair_whose_declarations_never_ASKED_is_not_probed_off_its_gate_source
     a gate, so its gate source stands as a candidate on its own merits — and refusing it is then
     attributable to the declaration and to nothing else.
 
-    This is the two-edit shape `tests/CLAUDE.md` records: a mutation caught by a second guard
+    This is the two-edit shape: a mutation caught by a second guard
     downstream reads exactly like an assertion that holds, and only the case where the second
     guard is silent discriminates the two.
     """

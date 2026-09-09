@@ -17,11 +17,13 @@ Layout::
     configure.py    the configuration form, raw editor, import/export
     knowledge.py    the knowledge-pack editor: tree, editor, checker, history, assist
     script_core.py  shared JS runtime: state, SSE, tab routing, stage cards, gates
+    script_identity.py   who is asking, what their role hides, where their edits land
     script_knowledge.py  the pack editor's JS: declarations and state, no side effects
     script_tabs.py  per-tab JS: log modes, report, evidence, config, and the init block
-    script.py       concatenates the three into the one <script> body
+    script.py       concatenates them into the one <script> body
 
-The gate panel, the two topbar popovers (``#jobsPop`` / ``#ctlPop``) and the toast stack live
+The gate panel, the three topbar popovers (``#jobsPop`` / ``#ctlPop`` / ``#idPop``) and the
+toast stack live
 in ``shell.GLOBAL_HTML``, above the tab bodies rather than inside Investigate: a gate opens
 while the operator may be on any tab and holds the run until answered.
 

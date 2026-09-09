@@ -417,6 +417,11 @@ async function saveConfig(){
       parts.push("needs a restart: <code>"+rl.restart_required.map(esc).join("</code>, <code>")+"</code>");
     if((d.skipped||[]).length)
       parts.push("skipped: "+d.skipped.map(s => esc(s.path)+" ("+esc(s.reason)+")").join("; "));
+    /* Before the "nothing to change" fallback, because a layered write reports no `reloaded` at
+       all — nothing it wrote is live by definition — so the banner would otherwise say only
+       "N value(s) written", which is exactly the reading the draft model has to prevent. */
+    const scope = writeScopeNote(d);
+    if(scope) parts.push(scope);
     if(!parts.length) parts.push("nothing to change");
     /* `durable:false` means the values are patched and in effect but were not stored
        durably, so a container restart discards them. That is the one outcome an operator
@@ -559,6 +564,10 @@ function setConfigView(which){
   show("cfgFormView", which === "form");
   show("cfgRawView", which === "raw");
   show("cfgIoView", which === "io");
+  show("cfgCredsView", which === "creds");
+  /* Loaded on entry rather than at boot: it is the one view whose contents are per-caller, and
+     a fingerprint read at page load goes stale the moment another tab saves one. */
+  if(which === "creds") loadSecrets();
 }
 
 /* ================= ANALYST REVIEW ================= */
@@ -759,7 +768,7 @@ el("gateStripGo").addEventListener("click", () => {
   if(panel && !panel.hidden) scrollToEl(panel, "start");
 });
 
-/* -- the two topbar popovers -- */
+/* -- the three topbar popovers -- */
 /* Escape and outside-click are wired ONCE at the document, not per open. A listener added
    on each open is a listener removed on the wrong close, and the leak is invisible until a
    stale handler closes a pop the operator just opened. */
@@ -767,7 +776,7 @@ document.addEventListener("keydown", (ev) => {
   if(ev.key === "Escape") closeAllPops();
 });
 document.addEventListener("pointerdown", (ev) => {
-  ["jobsPop","ctlPop"].forEach(id => {
+  POPS.forEach(id => {
     if(!popOpen(id)) return;
     const pop = el(id), trigger = popTrigger(id);
     if(pop.contains(ev.target)) return;
@@ -799,7 +808,7 @@ el("ctlPopExpand").addEventListener("click", () =>
    problem when it is wide, and one behaviour on both is one thing to learn. Double-click
    the head to put it back: `dragged` suppresses the re-anchor, so without this a panel
    dropped somewhere awkward stays there until a reload. */
-["jobsPop","ctlPop"].forEach(id => {
+POPS.forEach(id => {
   const pop = el(id);
   if(!pop) return;
   const head = pop.querySelector(".pophead");
@@ -814,9 +823,36 @@ el("ctlPopExpand").addEventListener("click", () =>
    pop that cannot be reached cannot be closed except by Escape. Re-anchors the ones still
    attached to their trigger and clamps the ones that were moved. */
 window.addEventListener("resize", () => {
-  ["jobsPop","ctlPop"].forEach(id => {
+  POPS.forEach(id => {
     if(popOpen(id)) anchorPop(id, popTrigger(id));
   });
+});
+/* The identity chip. Wired unconditionally and hidden by `applyIdentity` where no identity is
+   read, because a listener on a hidden button costs nothing while a conditional wiring would be
+   a second place that decides whether this deployment segregates callers at all. */
+el("idBtn").addEventListener("click", openIdentity);
+el("idPopClose").addEventListener("click", () => closePop("idPop"));
+el("idElevate").addEventListener("click", elevateIdentity);
+el("idOverlayRefresh").addEventListener("click", loadOverlay);
+/* Delegated, because the rows are re-rendered on every refresh and on every discard. */
+el("idOverlayRows").addEventListener("click", (ev) => {
+  const b = ev.target.closest("[data-drop-layer]");
+  if(!b) return;
+  discardOverlay(b.getAttribute("data-drop-layer"), b.getAttribute("data-drop-path"));
+});
+el("credReload").addEventListener("click", loadSecrets);
+/* Delegated for the same reason, and Enter in the field saves that field's own row: the rows
+   carry one input each, so a form-wide submit would have no one row to mean. */
+el("credRows").addEventListener("click", (ev) => {
+  const set = ev.target.closest("[data-cred-set]");
+  if(set){ saveSecret(set.getAttribute("data-cred-set")); return; }
+  const clear = ev.target.closest("[data-cred-clear]");
+  if(clear) clearSecret(clear.getAttribute("data-cred-clear"));
+});
+el("credRows").addEventListener("keydown", (ev) => {
+  if(ev.key !== "Enter") return;
+  const box = ev.target.closest("[data-cred-input]");
+  if(box) saveSecret(box.getAttribute("data-cred-input"));
 });
 el("jobsRefresh").addEventListener("click", pollJobs);
 el("jobsOnlyOpen").addEventListener("change", pollJobs);
@@ -971,13 +1007,17 @@ pollInbox();
 setInterval(() => { pollInbox(); pollJobs(); }, INBOX_POLL_MS);
 pollHealth();
 setInterval(pollHealth, HEALTH_POLL_MS);
+/* Once, not polled: who is asking cannot change without a reload, and the one thing that does
+   change it — proving groups with a token — re-reads it itself. */
+loadWhoami();
 
 /* -- come back to where the operator was -- */
 /* A reload used to be a reset: the tab went back to Investigate and the attached job was
    simply gone, because jobId lived in a `let` while the run carried on server-side. Both
    are restored from localStorage, and both are HINTS — the tab is validated against the
-   five names, and attachTo() forgets a job id the server no longer has (terminal jobs are
-   pruned after an hour). Fire-and-forget: this is a classic script, so there is no
+   five names, and attachTo() forgets a job id the server no longer has — a pruned run is
+   rehydrated from the store, one past its retention is not. Fire-and-forget: this is a
+   classic script, so there is no
    top-level await, and attachTo swallows its own errors into #status. */
 const savedTab = rememberedTab();
 if(savedTab && savedTab !== "investigate") showTab(savedTab);

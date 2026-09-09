@@ -278,7 +278,8 @@ REPORTED, never injected"). **What that means for you as an author:** the `sourc
 what the procedure needs and makes a shortfall visible, but the thing that actually gets the source
 picked is still `selection_guidance` + `not_answered_by` on the source itself. If a run reports
 `not_queried`, the fix is in those two keys — verify with
-`scripts/validate_source_selection.py`, whose `MISSING` column is exactly this gap.
+a replay of each persisted understanding through query generation alone, whose missing-source
+column is exactly this gap.
 
 **`encoded_fields:`** — a column whose value is a *payload* rather than a datum (a base64 blob
 holding a delimited table). This is the one shape where a source returns the richest evidence it
@@ -391,7 +392,7 @@ you discover what the ruleset needs.
 The procedure. Twenty condition kinds are available (`element_absence`, `element_presence`,
 `field_equality`, `time_gap`, `record_absence`, `cohort_membership`, `field_flag`,
 `distinct_count`, `route_membership`, `value_mismatch`, `value_matches_pattern`,
-`delimited_field_mismatch`, `velocity_count`, `stub`, plus the six compositional ones in §2.5.3 —
+`delimited_field_mismatch`, `velocity_count`, `stub`, plus the six compositional ones in §2.5.4 —
 `all_of`, `any_of`, `none_of`, `numeric_compare`, `event_order`, `value_equivalence`), all dispatched
 on `kind` in `src/correlation.py`. Their parameters are specified in
 [`verdict-engine.md`](verdict-engine.md); the template documents the first fourteen inline.
@@ -554,7 +555,59 @@ mode is DROPPED by the resolver (`link-escalation-bad-mode`, closed vocabulary),
 naming no ruleset in the pack can never match, so the pair silently takes the general mode
 (`link-escalation-unknown-source`) — it is another procedure's name, so a rename elsewhere breaks it.
 
-### 2.5.3 The compositional kinds
+### 2.5.3 `open_questions:` — what could this procedure not settle?
+
+Optional, and the other advisory lane. §2.5.1 asks *does a **different** procedure apply to these
+rows*; this asks *what did **this** procedure leave unanswered*. Same discipline, same shared budget
+ceiling, and the same hard rule: **an inquiry may not move a label, a condition result, a severity or
+a health score.** Declare none and the lane produces no probe, no report section and no field content.
+
+```yaml
+open_questions:
+  - id: was_the_handover_recorded_elsewhere
+    when:                              # BOTH halves must hold on the SAME subject
+      condition: chain_of_custody      # a condition id in this ruleset
+      result: unknown                  # unknown (default) | fail | pass
+      verdict_class: insufficient      # optional; a class from this ruleset's labels
+    ask:
+      source: handover_register        # logical (this ruleset's `sources:`) or physical
+      question: "Was a handover recorded for {entity} {value} outside this procedure's own sources?"
+      scope_entity: shipment           # defaults to the ruleset's `subject_entity`
+      where:                           # optional; the scope of the question, applied to the rows
+        - {field: shipment_code, any_of: ["{value}"]}
+    meaning:                           # ALL THREE required — the entry is DROPPED without them
+      rows: "the handover was recorded elsewhere, so the gap in this procedure's own evidence has
+        an explanation a human should read before treating it as an omission"
+      empty: "nothing recorded a handover for this subject anywhere, which is what this
+        procedure's own silence would mean if it were the only source asked"
+      unanswered: "whether a handover was recorded elsewhere is still unknown: the source was
+        asked and said nothing, so this is a credential or catalog gap and not a finding"
+```
+
+**`meaning` is three sentences and not one because the lane's whole value is that its five states do
+not collapse.** A question is `answered` (rows the `where` kept), `empty` (asked, nothing matched),
+`unanswered` (the source never answered), `not_asked` (no budget spent yet) or `unreachable` (this run
+holds no value of `scope_entity`, so an unscoped probe would scan the source over the whole window).
+The engine has no sentence of its own for any of the first three and must not acquire one — a plausible
+default printed as the procedure's own words is the failure this repo is organised against — so
+`pack.open_questions` **DROPS** an entry missing any of them, with one warning naming what was missing.
+A dropped entry is indistinguishable from a pack that declared nothing, which is why the warning
+exists and why `pack_validate` carries thirteen `open-question-*` diagnostics for the rest of it: an
+unknown condition id, an unknown `result`, an unknown `verdict_class`, an unknown `scope_entity`, a
+duplicate `id`, a `source` no catalog and no `sources:` map resolves.
+
+Three things the source is not. It is **not** a `sources:` entry — naming it there makes it a hard
+dependency retrieved on every run, which is the opposite of a question asked only when a trigger fires
+(hence `open-question-unknown-source` rather than the dependency check). It is **not** required to be
+absent either: where the run already retrieved it, the question is settled from **rows in hand** at no
+retrieval cost, and the note says so. And where it is absent, one probe may be spent — the default is
+**one**, sharing `PROBE_BUDGET_CEILING_SECONDS` with the link lane so the two cannot jointly exceed
+what one could. Every refusal is a coded sentence, never a silence.
+
+`question` is substituted with `str.replace` and never `.format`, so procedure prose may contain
+braces; `{value}` becomes the comma-joined scope values and `{entity}` the scope entity's name.
+
+### 2.5.4 The compositional kinds
 
 Six kinds exist so that a pattern the first fourteen cannot express becomes new YAML rather than a
 Python commit. Full semantics in [`verdict-engine.md`](verdict-engine.md) §"The compositional
@@ -613,13 +666,13 @@ magnitudes and accepts either order, so a check labelled *"the reversal followed
 on a reversal timestamped minutes before it.
 
 **`value_equivalence`** — `source`, `field`, `form`, plus `operator` and `bound`, where `form` names a
-pipeline from §2.5.4. Without an `anchor:` it counts the largest equivalence class (a *collision*);
+pipeline from §2.5.5. Without an `anchor:` it counts the largest equivalence class (a *collision*);
 with `anchor: {source, field}` it counts the values equivalent to that anchor (a *targeting*
 question). The class key and its members are printed, and so is the number of values the form could
 not read — a class of 4 drawn from 60 values of which 55 were unresolvable is not the finding it
 reads as. A class can only grow, so the reading survives truncation upward only.
 
-### 2.5.4 Equivalence forms — `shared/equivalence_forms.yaml`
+### 2.5.5 Equivalence forms — `shared/equivalence_forms.yaml`
 
 The third pack-root sharing mechanism, beside `shared/concepts/` and `shared/checks/`. A form is a
 named answer to "when are two textual values *the same thing* for the purpose being adjudicated" —
@@ -768,7 +821,7 @@ Concepts split the same way. `shared/concepts/x.md` says what the elements *are*
 `use_cases/<name>/concepts/y.md` says what they *mean for this procedure*. Link across with
 `[[concept_id]]`.
 
-Equivalence forms (§2.5.4) are the third mechanism and the only one with **no scoped half**: a form
+Equivalence forms (§2.5.5) are the third mechanism and the only one with **no scoped half**: a form
 answers when two values are the same thing, which is a fact about the data rather than a judgement
 about a procedure, so `shared/equivalence_forms.yaml` is flat and pack-wide with no per-use-case
 override. Two procedures that need different relations need two named forms, not one form resolved
@@ -877,6 +930,45 @@ records, they travel with the pack's branch and the pack's gitignore rules.
 Never call a real LLM or backend; mock `llm_client.structured_output` and the backend clients.
 Duck-type rather than `isinstance` across the flat / `src.` import boundary — the same Pydantic
 class reached both ways has two module identities, so `isinstance` can be `False`.
+
+### What the editing surface measures for you, and what it cannot
+
+Every edit made through the pack editor (`/api/v1/knowledge/...`, the Knowledge tab, or the
+assistant's preview) arrives with **four measurements over the candidate tree** — the pack as it
+would be *after* the edit, not before it. They exist because each is blind to the next, and reading
+them in order is the cheapest review a pack change gets:
+
+| Reading | Asks | Severity |
+|---|---|---|
+| `pack_validate` | will the engine read this declaration at all | **error** — an introduced one refuses the write |
+| `pack_dry_run` | does the ruleset decide anything over rows that really came back | warning |
+| `pack_selection_delta` | which **procedure** would adjudicate each stored incident | warning |
+| `pack_verdict_delta` | what the edit does to the **findings** of the runs already on record | warning |
+
+Only the first gates, and deliberately: a moved selection or a moved finding is usually the *point*
+of the edit, and "is this move correct" is a judgement no arithmetic settles. What the last two buy
+you is that the move cannot be silent. A reworded playbook title re-scores every incident the pack
+has ever seen (the losing procedure's conditions still resolve against real rows — every stage
+green, one confident verdict from the wrong procedure), and a threshold moved by one changes what a
+report concludes about a named person's conduct while all three checks above it stay clean.
+
+**Three things they cannot tell you**, each of which is still yours:
+
+- **`compared: false` is a silence, not a pass.** No stored corpus, no replayable ruleset, an
+  unchanged surface, or a failed determinism control — all four report zero changes, and only the
+  field says which. An empty result with `compared: true` is the only clean bill either delta gives.
+- **A replay is not the run.** A stored run's evidence sidecar is flattened and carries neither
+  `row_caps` nor `keyed_sources`, so a condition may read `unknown` in the replay for reasons that
+  have nothing to do with your edit. Both sides suffer that identically, which is why the comparison
+  is base-replay against candidate-replay — but it also means **an edit meant to FIX such a check
+  shows no change**, and the `limits` line says so.
+- **Neither can see a source that was never chosen.** Selection of *sources* is the planner's, and
+  no offline replay exercises it — replaying query generation against the real model, REPEATEDLY,
+  is that check, because selection is not deterministic and once is not a pass.
+
+`python -m src.knowledge.pack_validate <dir>`, `-m src.knowledge.pack_dry_run <dir>` and
+`-m src.knowledge.pack_verdict_delta <base> <candidate>` are the same code from a shell, so nothing
+in the preview is a number you cannot reproduce offline.
 
 ---
 

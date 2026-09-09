@@ -1,8 +1,10 @@
 import asyncio
 import json
 import logging
+import time
 import uuid
 from datetime import datetime, timezone
+from typing import Dict, List, Optional
 
 import aiohttp
 from aiohttp import web
@@ -15,6 +17,9 @@ from src import (
     report_delivery,
     retrieval_cache,
 )
+from src.audit_journal import AuditJournal
+from src.identity import (LOCAL_IDENTITY, IdentityRefused,
+                          build_identity_resolver, owner_of, stamp_owner)
 from src.knowledge import pack_assistant, pack_attachments, pack_store, pack_validate
 from src.links import compose_referral
 from src.utils.deployment import (
@@ -22,7 +27,12 @@ from src.utils.deployment import (
     resolve_mode,
     running_as_databricks_app,
 )
+from src.user_overlay import (CLEAN, CONFIG_LAYER, KNOWLEDGE_LAYER, OverlaySet,
+                              UserLayer, rebase_all, splice_lines)
+from src.user_secrets import (SecretsUnavailable, reset_current_segment,
+                              secret_store, set_current_segment, withheld_names)
 from src.utils.error_handling import async_retry_with_backoff
+from src.utils.paths import config_dir
 from src.utils.rate_limiter import AsyncRateLimiter
 from src.webui import INDEX_HTML
 
@@ -66,12 +76,157 @@ def _pass_number(payload):
     return number if number >= 1 else None
 
 
+#: What a pack must carry for the pipeline to ask anything at all: entities to extract and
+#: sources to ask. A ruleset is not on the list — a pack may legitimately ship none and still
+#: retrieve and correlate — so it is counted and reported rather than required.
+_PACK_ESSENTIALS = ("entities", "sources")
+
+
+def _pack_health(pack):
+    """``(loaded, detail)`` from a loaded pack's own contents, never from its configured name.
+
+    ``load_knowledge_pack`` answers a missing directory with an *empty* pack and a log line,
+    so a name is not evidence: the counts are. ``detail`` is filled either way, because a
+    reader who has been told the pack loaded still has to see whether it holds the ruleset
+    their verdict needs.
+    """
+    counts = {}
+    for attr in _PACK_ESSENTIALS + ("playbook_documents",):
+        try:
+            counts[attr] = len(getattr(pack, attr, None) or ())
+        except TypeError:  # a collaborator that is not sized must not fail the answer
+            counts[attr] = 0
+    # Through `ruleset_keys()` and never `len(pack.rulesets)`: that attribute is the whole rules
+    # FILE, whose top-level keys are `verdicts` and `default_ruleset`, so sizing it reported "2
+    # rulesets" for a pack shipping ten and would report the same 2 for a pack shipping one.
+    try:
+        counts["rulesets"] = len(pack.ruleset_keys())
+    except (AttributeError, TypeError):
+        counts["rulesets"] = 0
+    loaded = all(counts[attr] for attr in _PACK_ESSENTIALS)
+    detail = "%s: %d entities, %d sources, %d rulesets, %d playbooks" % (
+        str(getattr(pack, "name", "") or "unnamed"),
+        counts["entities"],
+        counts["sources"],
+        counts["rulesets"],
+        counts["playbook_documents"],
+    )
+    if not loaded:
+        detail += (
+            " — nothing was loaded from knowledge.pack_dir, so no source can be "
+            "retrieved and every condition reads `unknown`"
+        )
+    return loaded, detail
+
+
+#: Cap on one recorded config value. The journal says WHAT changed, and a pasted certificate
+#: would push a day's other entries out of a bounded buffer.
+_AUDIT_VALUE_CHARS = 200
+
+
+def _audit_changes(changed) -> list:
+    """The patcher's own change records, made safe to keep.
+
+    Kept as ``path`` + ``from`` + ``to`` because the before value is what makes the entry
+    actionable — "somebody lowered the threshold" and "somebody set it to 0.05" are different
+    findings. Two edits to that:
+
+    - **A secret-shaped key records the placeholder both ways.** The patcher does not redact,
+      and it must not start: the same records drive the response the operator reads back. But
+      the journal is append-only, kept for months, and readable by every administrator — a
+      wider set than whoever may set a credential.
+    - **Each value is capped.** A pasted certificate would push a day's other entries out of a
+      bounded buffer, so a long value is truncated and says how long it was.
+    """
+    out = []
+    for record in changed or []:
+        if not isinstance(record, dict):
+            out.append({"path": str(record)})
+            continue
+        secret = config_store.is_secret_key(str(record.get("path") or ""))
+        entry = {"path": str(record.get("path") or "")}
+        for side in ("from", "to"):
+            if record.get(side) is None:
+                continue
+            entry[side] = config_store.REDACTED if secret else _audit_value(record[side])
+        if record.get("applies"):
+            entry["applies"] = record["applies"]
+        out.append(entry)
+    return out
+
+
+def _audit_value(value):
+    """One value, bounded. Numbers and booleans pass through; text is cut and says so."""
+    if isinstance(value, (int, float, bool)):
+        return value
+    text = str(value)
+    if len(text) <= _AUDIT_VALUE_CHARS:
+        return text
+    return text[:_AUDIT_VALUE_CHARS] + f"… ({len(text)} chars)"
+
+
+def _config_base_reader(name: str) -> Optional[str]:
+    """The shared text of one config file, or None where it does not exist.
+
+    The base a caller's own layer of that file forks from and is re-merged against. ``None``
+    rather than ``""`` because a rebase treats an absent base as a deleted file and keeps the
+    caller's text, while an empty one is a file that was emptied.
+    """
+    if name not in config_store.CONFIG_FILES:
+        return None
+    if not (config_dir() / name).exists():
+        return None
+    return config_store.read_raw(name)
+
+
+def _knowledge_base_reader(rel: str) -> Optional[str]:
+    """The shared text of one packed file, addressed as ``<pack>/<path>``.
+
+    A layer is keyed across packs, so the pack name is the first segment of the layer path
+    rather than a second argument — which is what lets one `rebase_all` walk a caller's whole
+    knowledge layer without knowing which packs they have touched. ``None`` for anything the
+    store will not hand back, so a rebase keeps the caller's text instead of merging against
+    a guess.
+    """
+    pack, _, path = str(rel).partition("/")
+    if not pack or not path:
+        return None
+    try:
+        return pack_store.read_file(pack, path)["text"]
+    except (pack_store.PackStoreError, OSError, KeyError):
+        return None
+
+
 class _PlanUnavailable(Exception):
     """A refusal the query-plan read and write share, carrying the response to send."""
 
     def __init__(self, response):
         super().__init__("query plan unavailable")
         self.response = response
+
+
+class _LayerUnavailable(Exception):
+    """A refusal every layered pack handler shares, carrying the response to send."""
+
+    def __init__(self, response):
+        super().__init__("no per-caller layer is available")
+        self.response = response
+
+
+def _add_missing_dirs(nodes: List[dict], known: Dict[str, dict], rel: str) -> None:
+    """Add the directory nodes a draft-only file needs to be reachable in the browser.
+
+    The tree is flat and indented by ``depth``, so a file two levels down with no parent node
+    renders at the wrong indent under whatever precedes it.
+    """
+    parts = rel.split("/")
+    for index in range(len(parts) - 1):
+        path = "/".join(parts[: index + 1])
+        if path in known:
+            continue
+        node = {"path": path, "dir": True, "depth": index, "name": parts[index]}
+        known[path] = node
+        nodes.append(node)
 
 
 class IncidentInputInterface:
@@ -88,11 +243,26 @@ class IncidentInputInterface:
         llm_client=None,
         storage=None,
         retrieval_engine=None,
+        knowledge_pack=None,
+        identity_resolver=None,
+        audit_journal=None,
     ):
         self.config = config
+        # Who is asking. None builds a resolver from the config, which on a laptop resolves
+        # every request to the single local admin — so an unwired caller behaves as before.
+        self.identity_resolver = identity_resolver or build_identity_resolver(
+            live_config if isinstance(live_config, dict) else None
+        )
+        # Where an attributable event goes. None is a working state that records nothing:
+        # every call on it is best-effort by contract, so no handler tests for it.
+        self.audit = audit_journal or AuditJournal(storage=None, enabled=False)
         # Read side only, for `?deep=1`. None reports `null` rather than a failure.
         self.storage = storage
         self.retrieval_engine = retrieval_engine
+        # Read-only, and the LOADED object rather than the configured name: a pack directory
+        # that is not in the deployed tree degrades to an empty pack with one log line, and
+        # every stage then runs with no glossary, no catalog and no ruleset.
+        self.knowledge_pack = knowledge_pack
         # Shared with the pipeline so the pack assistant does not compete with a run for the
         # same rate limit. None makes the assist endpoints answer 503.
         self.llm_client = llm_client
@@ -116,8 +286,26 @@ class IncidentInputInterface:
         # A ceiling, not a policy: aiohttp defaults to 1 MB, which a generated schema file
         # exceeds, and each handler enforces its own smaller cap with a 413.
         self.app = web.Application(client_max_size=32 * 1024 * 1024)
+        # Identity is resolved once per request, before any handler runs: a handler that
+        # forgot to ask would otherwise be an unguarded one.
+        self.app.middlewares.append(self._identity_middleware)
         self.app.router.add_get("/", self.index)
+        # Aliases, not a base path: behind a driver proxy the URL is
+        # `/driver-proxy/o/<org>/<cluster>/<port>/`, whose prefix is the platform's and
+        # names no service, so the operator's bookmark ends in a segment that does. The
+        # page needs no change — `afirBasePath()` reads segments 1-5 and ignores the tail.
+        # Both spellings, because no normalize_path_middleware is installed.
+        self.app.router.add_get("/afir", self.index)
+        self.app.router.add_get("/afir/", self.index)
         self.app.router.add_get("/health", self.health)
+        self.app.router.add_get("/api/v1/whoami", self.whoami)
+        self.app.router.add_post("/api/v1/whoami/elevate", self.elevate_identity)
+        self.app.router.add_get("/api/v1/audit", self.get_audit)
+        self.app.router.add_get("/api/v1/overlay", self.get_overlay)
+        self.app.router.add_delete("/api/v1/overlay/{label}", self.drop_overlay)
+        self.app.router.add_get("/api/v1/secrets", self.get_secrets)
+        self.app.router.add_put("/api/v1/secrets/{name}", self.put_secret)
+        self.app.router.add_delete("/api/v1/secrets/{name}", self.delete_secret)
         # Fixed paths, not config-driven: a generator cannot discover a renamed one.
         self.app.router.add_get("/openapi.json", self.openapi_json)
         self.app.router.add_get("/docs", self.api_docs)
@@ -335,10 +523,10 @@ class IncidentInputInterface:
                 run_queue = self.job_manager.queue.stats()
             except Exception:  # a broken reporter must not fail the health answer
                 run_queue = None
-        pack = None
-        holder = getattr(self, "live_config", None)
-        if isinstance(holder, dict):
-            pack = bool((holder.get("knowledge") or {}).get("pack_dir"))
+        # Whether the pack LOADED, which the configured `pack_dir` does not answer.
+        pack, pack_detail = None, None
+        if self.knowledge_pack is not None:
+            pack, pack_detail = _pack_health(self.knowledge_pack)
         # A remote store refusing every write reads as a working one until the restart that
         # finds nothing, so `storage_ok: False` carries the reason.
         storage_kind, storage_ok, storage_detail = None, None, None
@@ -375,6 +563,7 @@ class IncidentInputInterface:
                 "status": "ok",
                 "llm_credential": credential,
                 "pack": pack,
+                "pack_detail": pack_detail,
                 "jobs": jobs,
                 "run_queue": run_queue,
                 "pipeline": self.process_fn is not None,
@@ -394,7 +583,445 @@ class IncidentInputInterface:
         except (TypeError, ValueError):
             limit = 200
         return web.json_response(
-            {"incidents": report_delivery.list_incidents(limit=limit)}
+            {
+                "incidents": report_delivery.list_incidents(
+                    limit=limit, owners=self._artifact_owners(request)
+                )
+            }
+        )
+
+    # -- identity ----------------------------------------------------------
+
+    #: Reachable with no identity, because a platform probe carries none and the page has to
+    #: load before it can tell the caller who they are.
+    _UNAUTHENTICATED_PATHS = frozenset(
+        {"/", "/afir", "/afir/", "/health", "/openapi.json", "/docs"}
+    )
+
+    @web.middleware
+    async def _identity_middleware(self, request, handler):
+        """Resolve the caller once, refuse a request whose identity cannot be trusted, and
+        record that the request happened.
+
+        The journal entry is written HERE and not per handler for the same reason the
+        identity is resolved here: a handler that forgot to record would be an unrecorded
+        one. It is also the only place that sees the two events no handler ever runs for —
+        a refusal at the door, and a page load by someone who then does nothing.
+        """
+        started = time.monotonic()
+        if request.path in self._UNAUTHENTICATED_PATHS:
+            request["identity"] = LOCAL_IDENTITY
+            # The handler runs as the local operator — the page has to load before it can tell
+            # the caller who they are — but the JOURNAL may not say so where an identity is
+            # enforced: nobody is local there, and an anonymous browser hit recorded as `local`
+            # is a census naming a caller who does not exist.
+            enforced = getattr(self.identity_resolver, "enforced", False)
+            who = None if enforced else LOCAL_IDENTITY
+            return await self._recorded(request, handler, who, started)
+        try:
+            identity = self.identity_resolver.resolve(request.headers)
+        except IdentityRefused as exc:
+            # 403 and not 401: there is no credential for the caller to supply here. The
+            # ingress supplies it, so the remedy is which URL they used.
+            #
+            # Recorded with the reason: a caller reaching AFIR by a URL that strips the
+            # identity headers sees only a 403, and this is the one record of why.
+            self.audit.record(
+                "refused",
+                None,
+                method=request.method,
+                path=request.path,
+                status=403,
+                detail=str(exc),
+            )
+            logger.warning(
+                "Refused a request to %s %s: %s", request.method, request.path, exc
+            )
+            return web.json_response({"error": str(exc)}, status=403)
+        request["identity"] = identity
+        return await self._recorded(request, handler, identity, started)
+
+    async def _recorded(self, request, handler, identity, started):
+        """Run the handler, then journal the outcome. A raised handler is still an event."""
+        status = 500
+        # Whose personal credentials apply to anything this request starts. Bound here rather
+        # than threaded through: the readers are a retriever, an embedding provider and the LLM
+        # client, none of which has any notion of a caller. `request["identity"]` and not
+        # `identity`, which is deliberately None for an unauthenticated page load.
+        token = set_current_segment(self._identity(request).segment)
+        try:
+            response = await handler(request)
+            status = getattr(response, "status", 200)
+            return response
+        except web.HTTPException as exc:
+            status = exc.status
+            raise
+        finally:
+            reset_current_segment(token)
+            self.audit.record_request(
+                identity,
+                request.method,
+                request.path,
+                status,
+                (time.monotonic() - started) * 1000.0,
+            )
+
+    @staticmethod
+    def _identity(request):
+        """The resolved caller. Falls back to the local admin for a directly-invoked handler."""
+        got = request.get("identity") if hasattr(request, "get") else None
+        return got if got is not None else LOCAL_IDENTITY
+
+    def _forbid_non_admin(self, request, what: str):
+        """A 403 naming what was refused, or None when the caller may proceed.
+
+        Returned rather than raised so each handler keeps its own ordering: a 503 for an
+        unwired collaborator is a truer answer than a 403 about a surface that is absent.
+        """
+        identity = self._identity(request)
+        if identity.is_admin:
+            return None
+        return web.json_response(
+            {
+                "error": f"{what} is restricted to an administrator.",
+                "role": identity.role,
+                "role_reason": identity.role_reason,
+                "you": identity.user_name,
+                # Named because the browser path cannot read the caller's groups, so an
+                # owner looks like a user until they prove it.
+                "remedy": (
+                    "if you are an owner, POST your own workspace token to "
+                    "/api/v1/whoami/elevate, or add yourself to identity.admin_users"
+                ),
+            },
+            status=403,
+        )
+
+    def _owns(self, request, job) -> bool:
+        """Whether this caller may see `job`. An admin sees every run."""
+        identity = self._identity(request)
+        if identity.is_admin:
+            return True
+        return owner_of(getattr(job, "incident", None)) == identity.segment
+
+    def _own(self, request, incident):
+        """Record the caller on a run they are creating."""
+        return stamp_owner(incident, self._identity(request))
+
+    def _actor(self, request, claimed=None) -> str:
+        """Who to record on a durable decision: the RESOLVED caller, not the claimed one.
+
+        Every audit-bearing write (a gate decision, a stage override, a plan edit, a pack
+        write) used to record whatever string the client sent — collected by the UI from a
+        typed box, and so attributable to anyone, including to nobody when left blank. Where
+        the ingress establishes an identity, that identity is the answer and an unverified
+        claim never overrides it; the claim survives only where there is no identity to
+        contradict it, which is the single-operator deployment where the box is all there is.
+        """
+        identity = self._identity(request)
+        if getattr(identity, "source", "local") != "local":
+            return identity.user_name
+        return str(claimed or "").strip()
+
+    # -- per-caller overlays -----------------------------------------------
+    #
+    # Both editable trees work the same way and the asymmetry is in WHERE a write lands, never
+    # in whether one is allowed: an administrator edits the base — the working copy the running
+    # process loaded — and everyone else edits their own layer over it. A layer is a DRAFT: it
+    # is durable, it is merged forward when the base moves, and it is what its author reads
+    # back, but the pack and the config this process runs on are built once at boot from the
+    # base. So every layered write says so in its own response rather than reporting an apply
+    # that did not happen.
+
+    #: What a layered write actually did, stated on the response so a caller is never left to
+    #: infer it from a 200.
+    _DRAFT_EFFECT = "draft"
+    _DRAFT_NOTE = (
+        "saved to your own layer. The running configuration and knowledge pack are the "
+        "administrator's base; an administrator promotes a layer by saving the same text."
+    )
+
+    #: A layer has nowhere to live without a durable store, and a non-administrator has no
+    #: other destination — so the refusal names the one thing that still works.
+    _NO_STORE = (
+        "no durable store is configured, so your own version of this file cannot be kept. "
+        "Ask an administrator to apply this change to the shared configuration."
+    )
+
+    def _overlay(self, request) -> OverlaySet:
+        """The caller's own layer of both editable trees."""
+        return OverlaySet(self.storage, self._identity(request).segment)
+
+    def _layer(self, request, label: str) -> UserLayer:
+        return self._overlay(request).layer(label)
+
+    def _edits_the_base(self, request) -> bool:
+        """Whether this caller's writes go to the shared tree rather than to their own layer."""
+        return bool(self._identity(request).is_admin)
+
+    def _draft_result(self, result: dict, layer: UserLayer, rel: str) -> dict:
+        """Stamp a layered write with what it did and where it went."""
+        result["layer"] = True
+        result["effect"] = self._DRAFT_EFFECT
+        result["note"] = self._DRAFT_NOTE
+        result["state"] = layer.meta_of(rel).get("state", CLEAN)
+        return result
+
+    def _rebase_layers(self, label: str, base_reader) -> dict:
+        """Re-merge every caller's layer after the administrator moved the base.
+
+        Reported on the admin's own response: a release that silently conflicted with somebody
+        else's draft is a release nobody knows to look at.
+        """
+        try:
+            report = rebase_all(self.storage, label, base_reader)
+        except Exception as exc:  # noqa: BLE001 — a rebase must never fail the write
+            logger.warning("Could not rebase %s layers: %s", label, exc)
+            return {"error": str(exc)}
+        if report:
+            logger.info(
+                "%s base moved: %d caller layer(s) re-merged (%s)",
+                label,
+                len(report),
+                ", ".join(sorted(report)),
+            )
+        return report
+
+    async def get_overlay(self, request):
+        """``GET /api/v1/overlay``: this caller's own drafts of both editable trees."""
+        overlay = self._overlay(request)
+        identity = self._identity(request)
+        return web.json_response(
+            {
+                "you": identity.user_name,
+                "role": identity.role,
+                "edits_the_base": identity.is_admin,
+                "effect": None if identity.is_admin else self._DRAFT_EFFECT,
+                "config": overlay.config.describe(),
+                "knowledge": overlay.knowledge.describe(),
+            }
+        )
+
+    async def drop_overlay(self, request):
+        """``DELETE /api/v1/overlay/{label}?path=``: discard one of my own overrides.
+
+        The way back to the base view, and the only way out of a conflict a rebase left in
+        place — a conflicted draft is kept deliberately, so discarding it has to be a choice.
+        """
+        label = request.match_info["label"]
+        if label not in (CONFIG_LAYER, KNOWLEDGE_LAYER):
+            return web.json_response(
+                {"error": f"unknown layer '{label}'"}, status=404
+            )
+        rel = (request.query.get("path") or "").strip()
+        if not rel:
+            return web.json_response({"error": "a 'path' is required"}, status=400)
+        layer = self._layer(request, label)
+        if layer.read(rel) is None:
+            return web.json_response(
+                {"error": f"you have no override of {rel!r}"}, status=404
+            )
+        dropped = layer.drop(rel)
+        logger.info(
+            "Identity %s discarded their %s override of %s",
+            self._identity(request).user_name,
+            label,
+            rel,
+        )
+        return web.json_response({"dropped": bool(dropped), "path": rel, "layer": label})
+
+    # -- personal credentials ----------------------------------------------
+    #
+    # Caller-scoped on all three routes, with no administrator override in either direction:
+    # an owner may replace their OWN token and read their OWN fingerprints, and has no route
+    # to anybody else's. The value never comes back out — what a caller reads is which names
+    # exist, whether theirs or the deployment's is in force, and a fingerprint.
+
+    async def get_secrets(self, request):
+        """``GET /api/v1/secrets``: which credentials I may replace, and what is in force."""
+        store = secret_store()
+        identity = self._identity(request)
+        body = {
+            "you": identity.user_name,
+            "available": bool(store is not None and store.available),
+            "secrets": store.describe(identity.segment) if store is not None else [],
+            # Named rather than omitted: a surface listing four names and silently dropping
+            # three others reads as a surface that covers everything. The offered set goes in
+            # so that a replaceable name is never also listed as unreplaceable.
+            "withheld": withheld_names(
+                self.live_config, store.offered if store is not None else None
+            ),
+            "note": (
+                "A value you save here is used by your own runs only and is never displayed "
+                "again — the fingerprint is how you confirm which one is in force. It applies "
+                "from your next run."
+            ),
+        }
+        if not body["available"]:
+            # Both ways of being off, or the amber state names no consequence: a caller told
+            # only "unavailable" cannot tell a deployment that never wired a store from one
+            # whose config reads no credential by name, and those are different fixes.
+            body["reason"] = (
+                store.unavailable_reason
+                if store is not None
+                else "personal credentials are not available on this deployment"
+            )
+        return web.json_response(body)
+
+    async def put_secret(self, request):
+        """``PUT /api/v1/secrets/{name}``: replace one credential for my own runs."""
+        store = secret_store()
+        if store is None:
+            return web.json_response(
+                {"error": "personal credentials are not available on this deployment"},
+                status=503,
+            )
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError:
+            return web.Response(status=400, text="Invalid JSON")
+        name = request.match_info["name"]
+        identity = self._identity(request)
+        try:
+            row = store.set(identity.segment, name, str(payload.get("value") or ""))
+        except SecretsUnavailable as exc:
+            return web.json_response({"error": str(exc)}, status=503)
+        except KeyError:
+            return web.json_response(
+                {
+                    "error": (
+                        f"nothing on this deployment reads {name!r}, so replacing it would "
+                        "change none of your runs"
+                    ),
+                    "offerable": sorted(store.offered),
+                },
+                status=400,
+            )
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        except OSError as exc:
+            return web.json_response({"error": str(exc)}, status=503)
+        # The NAME and the fingerprint, never the value: this journal is readable by an
+        # administrator, and the whole point of the surface is that the value is not.
+        self.audit.record(
+            "secret_change",
+            identity,
+            name=name,
+            action="set",
+            fingerprint=row.get("fingerprint", ""),
+        )
+        return web.json_response({"saved": True, **row})
+
+    async def delete_secret(self, request):
+        """``DELETE /api/v1/secrets/{name}``: go back to the deployment's own credential."""
+        store = secret_store()
+        if store is None:
+            return web.json_response(
+                {"error": "personal credentials are not available on this deployment"},
+                status=503,
+            )
+        name = request.match_info["name"]
+        identity = self._identity(request)
+        # Checked before the call, because `clear` cannot tell the two KeyErrors apart and they
+        # are different answers: an unreadable name is a mistake about the deployment, a name
+        # with no value of the caller's own is a mistake about their own state.
+        if name in store.offered:
+            try:
+                row = store.clear(identity.segment, name)
+            except SecretsUnavailable as exc:
+                return web.json_response({"error": str(exc)}, status=503)
+            except KeyError:
+                return web.json_response(
+                    {"error": f"you have no personal credential for {name!r}"}, status=404
+                )
+            except ValueError as exc:
+                return web.json_response({"error": str(exc)}, status=400)
+            except OSError as exc:
+                return web.json_response({"error": str(exc)}, status=503)
+        else:
+            return web.json_response(
+                {
+                    "error": f"nothing on this deployment reads {name!r}",
+                    "offerable": sorted(store.offered),
+                },
+                status=400,
+            )
+        self.audit.record("secret_change", identity, name=name, action="clear")
+        return web.json_response({"cleared": True, **row})
+
+    async def whoami(self, request):
+        """Who the server thinks the caller is, and why they have the role they have."""
+        identity = self._identity(request)
+        body = identity.as_dict()
+        body["mode"] = self.identity_resolver.mode
+        body["enforced"] = self.identity_resolver.enforced
+        body["can_elevate"] = bool(
+            self.identity_resolver.allow_elevation and not identity.is_admin
+        )
+        # The one fact the page needs to describe its own save button: whether this caller is
+        # editing the shared tree or their own copy of it.
+        body["edits_the_base"] = self._edits_the_base(request)
+        return web.json_response(body)
+
+    async def elevate_identity(self, request):
+        """Prove group membership with the caller's own workspace token.
+
+        The browser path forwards no credential, so an owner arrives indistinguishable from
+        a reader. This is how they show otherwise; the token is validated against the
+        identity the platform already asserted and is never stored.
+        """
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError:
+            return web.Response(status=400, text="Invalid JSON")
+        token = str(payload.get("token") or "").strip()
+        if not token:
+            return web.Response(status=400, text="A non-empty 'token' is required")
+        identity = self._identity(request)
+        accepted, detail = await asyncio.to_thread(
+            self.identity_resolver.elevate, identity, token
+        )
+        if not accepted:
+            return web.json_response({"error": detail}, status=403)
+        logger.info("Identity %s elevated: %s", identity.user_name, detail)
+        return web.json_response(
+            {"accepted": True, "detail": detail, **self.identity_resolver.resolve(request.headers).as_dict()}
+        )
+
+    async def get_audit(self, request):
+        """``GET /api/v1/audit`` — the access journal, newest entry first.
+
+        Administrators only: it names every other caller, which is exactly the question a
+        plain user has no business asking. ``?limit=`` bounds the answer, ``?since=`` an ISO
+        timestamp and ``?user=`` one account.
+
+        Answers 200 with an empty list and the journal's own state when it is off, rather than
+        404: "nobody has done anything" and "nothing is being recorded" are different
+        answers, and an operator checking on their deployment needs to tell them apart.
+        """
+        refused = self._forbid_non_admin(request, "reading the access journal")
+        if refused is not None:
+            return refused
+        try:
+            limit = int(request.query.get("limit") or 200)
+        except (TypeError, ValueError):
+            limit = 200
+        limit = min(2000, max(1, limit))
+        entries = await asyncio.to_thread(
+            self.audit.tail,
+            limit,
+            str(request.query.get("since") or ""),
+            str(request.query.get("user") or ""),
+        )
+        return web.json_response(
+            {
+                "entries": entries,
+                "count": len(entries),
+                # Not a footnote: a short list under a small limit reads like a quiet
+                # deployment, and this is what says which it was.
+                "limit": limit,
+                "journal": self.audit.stats(),
+            }
         )
 
     # -- helpers -----------------------------------------------------------
@@ -494,7 +1121,9 @@ class IncidentInputInterface:
             if not validate_incident(incident):
                 return web.Response(status=400, text="Invalid incident data")
 
-            incident = self._normalize_incident(incident, source="api")
+            incident = self._own(
+                request, self._normalize_incident(incident, source="api")
+            )
             logger.info(f"Received incident: {incident['id']}")
             return await self._run_pipeline(
                 incident, verbose=self._wants_verbose(request)
@@ -520,7 +1149,9 @@ class IncidentInputInterface:
             base = {"description": description}
             if _truthy(payload.get("extended_retrieval")):
                 base["extended_retrieval"] = True
-            incident = self._normalize_incident(base, source="freetext")
+            incident = self._own(
+                request, self._normalize_incident(base, source="freetext")
+            )
             logger.info(f"Received free-text incident: {incident['id']}")
             return await self._run_pipeline(
                 incident, verbose=self._wants_verbose(request)
@@ -758,7 +1389,7 @@ class IncidentInputInterface:
         pin = str(payload.get("link_pin", "") or "").strip()
         if pin:
             base["link_pin"] = pin
-        incident = self._normalize_incident(base, source="freetext")
+        incident = self._own(request, self._normalize_incident(base, source="freetext"))
         try:
             job = self.launch_fn(incident, mode)
         except RuntimeError as exc:
@@ -799,17 +1430,30 @@ class IncidentInputInterface:
         )
 
     async def list_jobs(self, request):
-        """List all live jobs (newest first) so an API client can discover them."""
+        """List the caller's live jobs (newest first); an administrator sees every run."""
         if self.job_manager is None:
             return web.json_response({"error": "Jobs not available."}, status=503)
         return web.json_response(
             {
-                "jobs": self.job_manager.list_jobs(),
+                "jobs": self._visible(request, self.job_manager.list_jobs()),
                 # Beside the rows, not on a route of its own: a caller reading `queued`
                 # on a job needs the width and the depth in the same request.
                 "queue": self.job_manager.queue.stats(),
             }
         )
+
+    def _visible(self, request, rows):
+        """Rows this caller may see. Filters on the row's own `owner`, never on a lookup.
+
+        An unowned row — every run from before ownership existed, and every run of a
+        deployment that resolves no identity — is visible to an administrator only: it
+        cannot be attributed, and attributing it to whoever asks would be inventing a claim.
+        """
+        identity = self._identity(request)
+        if identity.is_admin:
+            return rows
+        mine = identity.segment
+        return [row for row in rows if (row.get("owner") or "") == mine]
 
     async def get_job(self, request):
         job = self._lookup_job(request)
@@ -867,7 +1511,9 @@ class IncidentInputInterface:
             pin = str(item.get("link_pin", "") or "").strip()
             if pin:
                 base["link_pin"] = pin
-            incidents.append(self._normalize_incident(base, source="batch"))
+            incidents.append(
+                self._own(request, self._normalize_incident(base, source="batch"))
+            )
         if not incidents:
             return web.json_response(
                 {"error": "No usable incident in the batch", "rejected": rejected},
@@ -889,7 +1535,7 @@ class IncidentInputInterface:
             return web.json_response({"error": "Jobs not available."}, status=503)
         return web.json_response(
             {
-                "batches": self.job_manager.list_batches(),
+                "batches": self._visible(request, self.job_manager.list_batches()),
                 "queue": self.job_manager.queue.stats(),
             }
         )
@@ -899,9 +1545,10 @@ class IncidentInputInterface:
         if self.job_manager is None:
             return web.json_response({"error": "Jobs not available."}, status=503)
         try:
-            return web.json_response(
-                self.job_manager.batch_status(request.match_info["batch_id"])
-            )
+            status = self.job_manager.batch_status(request.match_info["batch_id"])
+            if not self._visible(request, [status]):
+                raise KeyError(request.match_info["batch_id"])
+            return web.json_response(status)
         except KeyError:
             # A batch whose jobs have aged out of memory reads like one that never existed;
             # saying so beats an empty batch that looks like nothing ran.
@@ -913,10 +1560,11 @@ class IncidentInputInterface:
         """Cancel every job in a batch that has not already ended."""
         if self.job_manager is None:
             return web.json_response({"error": "Jobs not available."}, status=503)
+        batch_id = request.match_info["batch_id"]
         try:
-            return web.json_response(
-                self.job_manager.cancel_batch(request.match_info["batch_id"])
-            )
+            if not self._visible(request, [self.job_manager.batch_status(batch_id)]):
+                raise KeyError(batch_id)
+            return web.json_response(self.job_manager.cancel_batch(batch_id))
         except KeyError:
             return web.json_response(
                 {"error": "No live job carries that batch id"}, status=404
@@ -927,7 +1575,9 @@ class IncidentInputInterface:
         if self.job_manager is None:
             return web.json_response({"error": "Jobs not available."}, status=503)
         job_id = request.match_info["job_id"]
-        if self.job_manager.get_job(job_id) is None:
+        # Through the ownership funnel like every other job route: this stream replays the
+        # whole event history, so it carries the report and the retrieved evidence.
+        if self._lookup_job(request) is None:
             return web.json_response({"error": "Job not found"}, status=404)
         response = web.StreamResponse(
             status=200,
@@ -961,6 +1611,10 @@ class IncidentInputInterface:
         if self.job_manager is None:
             return web.json_response({"error": "Jobs not available."}, status=503)
         job_id = request.match_info["job_id"]
+        # Checked before the body is read, and by absence rather than refusal: cancelling
+        # another caller's run is the one job action that cannot be undone.
+        if self._lookup_job(request) is None:
+            return web.json_response({"error": "Job not found"}, status=404)
         try:
             payload = await request.json()
         except json.JSONDecodeError:
@@ -1001,7 +1655,9 @@ class IncidentInputInterface:
         """Every gate currently awaiting a human, across all live jobs (the inbox)."""
         if self.job_manager is None:
             return web.json_response({"error": "Jobs not available."}, status=503)
-        return web.json_response({"gates": self.job_manager.list_open_gates()})
+        return web.json_response(
+            {"gates": self._visible(request, self.job_manager.list_open_gates())}
+        )
 
     async def resolve_job_gate(self, request):
         """Resolve an open approval gate.
@@ -1021,6 +1677,8 @@ class IncidentInputInterface:
         if self.job_manager is None:
             return web.json_response({"error": "Jobs not available."}, status=503)
         job_id = request.match_info["job_id"]
+        if self._lookup_job(request) is None:
+            return web.json_response({"error": "Job not found"}, status=404)
         try:
             payload = await request.json()
         except json.JSONDecodeError:
@@ -1048,7 +1706,7 @@ class IncidentInputInterface:
                 reason_code=payload.get("reason_code"),
                 restart_from=payload.get("restart_from"),
                 value=payload.get("value"),
-                actor=payload.get("actor"),
+                actor=self._actor(request, payload.get("actor")),
                 note=payload.get("note"),
                 restart_pass=_pass_number(payload),
             )
@@ -1066,7 +1724,7 @@ class IncidentInputInterface:
             action,
             job_id,
             action,
-            payload.get("actor"),
+            self._actor(request, payload.get("actor")),
         )
         return web.json_response(job.snapshot())
 
@@ -1082,6 +1740,10 @@ class IncidentInputInterface:
             return web.json_response({"error": "Jobs not available."}, status=503)
         job_id = request.match_info["job_id"]
         stage = request.match_info["stage"]
+        # An override is recorded in `Job.interventions` as the caller's own decision, so a
+        # caller with no claim on the run must not be able to leave one on it.
+        if self._lookup_job(request) is None:
+            return web.json_response({"error": "Job not found"}, status=404)
         try:
             payload = await request.json()
         except json.JSONDecodeError:
@@ -1095,7 +1757,7 @@ class IncidentInputInterface:
                 job_id,
                 stage,
                 payload["value"],
-                actor=payload.get("actor"),
+                actor=self._actor(request, payload.get("actor")),
                 pass_number=_pass_number(payload),
             )
         except KeyError:
@@ -1108,7 +1770,7 @@ class IncidentInputInterface:
             "Analyst overrode stage %s output for job %s (actor=%s)",
             stage,
             job_id,
-            payload.get("actor"),
+            self._actor(request, payload.get("actor")),
         )
         return web.json_response(job.snapshot())
 
@@ -1284,7 +1946,7 @@ class IncidentInputInterface:
                 job.job_id,
                 "query_generation",
                 value,
-                actor=payload.get("actor"),
+                actor=self._actor(request, payload.get("actor")),
                 pass_number=_pass_number(payload),
                 detail=f"retrieval plan edited by analyst: {detail}",
             )
@@ -1299,7 +1961,7 @@ class IncidentInputInterface:
             "Analyst edited the retrieval plan for job %s: %s (actor=%s)",
             job.job_id,
             detail,
-            payload.get("actor"),
+            self._actor(request, payload.get("actor")),
         )
         return web.json_response(
             {
@@ -1497,7 +2159,7 @@ class IncidentInputInterface:
                     f"referral to {target} launched by hand as job {launched_id} — the child "
                     "has its own verdict, and this run's was settled before it started"
                 ),
-                actor=payload.get("actor"),
+                actor=self._actor(request, payload.get("actor")),
             )
         else:
             # "composed" and never "referred": a word implying a child run exists sends the
@@ -1512,7 +2174,7 @@ class IncidentInputInterface:
                     f"{', '.join(composed['scope']['pivot_values'])}, window {resolved} "
                     f"{date_from or 'unbounded'}..{date_to or 'unbounded'} — not launched"
                 ),
-                actor=payload.get("actor"),
+                actor=self._actor(request, payload.get("actor")),
             )
         await self.job_manager.flush_persistence(job.job_id)
         logger.info(
@@ -1521,7 +2183,7 @@ class IncidentInputInterface:
             target,
             job.job_id,
             index,
-            payload.get("actor"),
+            self._actor(request, payload.get("actor")),
             f" as job {launched_id}" if launched_id else "; not launched",
         )
         composed.update(
@@ -1683,7 +2345,7 @@ class IncidentInputInterface:
                     else ""
                 )
             ),
-            actor=payload.get("actor"),
+            actor=self._actor(request, payload.get("actor")),
         )
         await self.job_manager.flush_persistence(job.job_id)
         logger.info(
@@ -1691,7 +2353,7 @@ class IncidentInputInterface:
             mode,
             job.job_id,
             ", ".join(targets),
-            payload.get("actor"),
+            self._actor(request, payload.get("actor")),
             (
                 f"held at '{link_escalation.MANUAL_LINK_MODE}' for {', '.join(held)}"
                 if held
@@ -1714,6 +2376,10 @@ class IncidentInputInterface:
         if self.job_manager is None:
             return web.json_response({"error": "Jobs not available."}, status=503)
         job_id = request.match_info["job_id"]
+        # The export doc is the whole run — the incident, every stage output and the report —
+        # so it is the widest read on this router and takes the same funnel as the narrowest.
+        if self._lookup_job(request) is None:
+            return web.json_response({"error": "Job not found"}, status=404)
         try:
             doc = self.job_manager.export_job(job_id)
         except KeyError:
@@ -1727,6 +2393,10 @@ class IncidentInputInterface:
             doc = await request.json()
         except json.JSONDecodeError:
             return web.Response(status=400, text="Invalid JSON")
+        if isinstance(doc.get("incident"), dict) and not owner_of(doc["incident"]):
+            # An export from before ownership existed, or from another deployment: it
+            # becomes the importer's rather than staying unattributable.
+            self._own(request, doc["incident"])
         try:
             job = self.job_manager.import_job(doc)
         except Exception as e:  # noqa: BLE001 — malformed export doc
@@ -1735,9 +2405,26 @@ class IncidentInputInterface:
         return web.json_response({"job_id": job.job_id}, status=201)
 
     def _lookup_job(self, request):
+        """The requested job, or None. The one funnel every job route passes through.
+
+        Someone else's job reads as absent rather than forbidden: a 403 would confirm that
+        the id exists, which is the one thing a caller with no claim on it should not learn.
+
+        A run the in-memory TTL has evicted is rehydrated from the store here, so a finished
+        investigation stays readable for as long as its document is kept — the ownership
+        check below then applies to it exactly as it did while it was live.
+        """
         if self.job_manager is None:
             return None
-        return self.job_manager.get_job(request.match_info["job_id"])
+        job = self.job_manager.hydrate(request.match_info["job_id"])
+        if job is not None and not self._owns(request, job):
+            logger.info(
+                "Job %s hidden from %s: owned by another caller.",
+                job.job_id,
+                self._identity(request).user_name,
+            )
+            return None
+        return job
 
     def _link_config(self):
         """The ``correlation.links`` block, read from the whole config and not from this slice.
@@ -1757,16 +2444,41 @@ class IncidentInputInterface:
 
     # -- artifacts: report + evidence --------------------------------------
 
-    def _incident_id_for_job(self, request):
-        """The incident id behind a job id, or None (a 404) when the job is unknown.
+    def _artifact_owners(self, request, job=None):
+        """The storage segments this caller may be shown artifacts from.
+
+        Two sources, because the two route families know different things. A job-scoped
+        route has the run in hand and `_lookup_job` has already refused another caller's,
+        so the run's OWN owner is authoritative and exact — an admin reading somebody
+        else's finished run gets that run's segment and no other. An incident-keyed route
+        has only an id, so it offers the caller their own segment; an admin gets every
+        segment, which is the visibility `_visible` already grants them over the rows.
+
+        The shared root is always searched and is not listed here: it is where a
+        deployment that resolves no identity writes, and where every run from before
+        ownership existed still lives.
+        """
+        if job is not None:
+            segment = owner_of(getattr(job, "incident", None) or {})
+            return [segment] if segment else []
+        who = self._identity(request)
+        if who.is_admin:
+            return report_delivery.owner_segments()
+        return [who.segment] if who.segment else []
+
+    def _job_artifacts_for(self, request):
+        """``(job, incident_id)`` behind a job-scoped artifact URL; ``(None, None)`` for a 404.
 
         Artifacts are named after the incident, so a job-scoped URL has to translate; a
-        fallback to the job id would serve a mistyped one something.
+        fallback to the job id would serve a mistyped one something. The JOB comes back
+        beside the id because the run's own owner decides which view holds its artifacts,
+        and looking it up twice would ask the store the same question the caller's
+        visibility check has already answered.
         """
         job = self._lookup_job(request)
         if job is None:
-            return None
-        return (job.incident or {}).get("id")
+            return None, None
+        return job, (job.incident or {}).get("id")
 
     @staticmethod
     def _artifact_response(body, content_type, filename, download):
@@ -1778,11 +2490,11 @@ class IncidentInputInterface:
             headers["Content-Disposition"] = f'inline; filename="{filename}"'
         return web.Response(body=body, content_type=content_type, headers=headers)
 
-    async def _serve_report(self, incident_id, request, report=None):
+    async def _serve_report(self, incident_id, request, report=None, owners=()):
         fmt = (request.query.get("format") or "html").strip().lower()
         try:
             body, content_type, filename = report_delivery.resolve_report(
-                incident_id, fmt, report=report
+                incident_id, fmt, report=report, owners=owners
             )
         except ValueError as e:
             return web.json_response({"error": str(e)}, status=400)
@@ -1801,7 +2513,7 @@ class IncidentInputInterface:
             body, content_type, filename, _truthy(request.query.get("download"))
         )
 
-    async def _serve_evidence(self, incident_id, request):
+    async def _serve_evidence(self, incident_id, request, owners=()):
         kind = (request.query.get("kind") or "raw").strip().lower()
         if kind not in report_delivery.EVIDENCE_KINDS:
             return web.json_response(
@@ -1819,7 +2531,7 @@ class IncidentInputInterface:
         try:
             if full:
                 body, content_type, filename = report_delivery.resolve_evidence(
-                    incident_id, kind
+                    incident_id, kind, owners=owners
                 )
                 return self._artifact_response(
                     body,
@@ -1827,7 +2539,7 @@ class IncidentInputInterface:
                     filename,
                     _truthy(request.query.get("download")),
                 )
-            outline = report_delivery.evidence_outline(incident_id, kind)
+            outline = report_delivery.evidence_outline(incident_id, kind, owners=owners)
         except ValueError as e:
             return web.json_response({"error": str(e)}, status=400)
         except FileNotFoundError as e:
@@ -1843,45 +2555,64 @@ class IncidentInputInterface:
 
     async def get_job_report(self, request):
         """``GET /api/v1/jobs/{job_id}/report?format=html|md|pdf|json[&download=1]``."""
-        incident_id = self._incident_id_for_job(request)
+        job, incident_id = self._job_artifacts_for(request)
         if incident_id is None:
             return web.json_response({"error": "Job not found"}, status=404)
-        job = self._lookup_job(request)
         # The in-memory report where there is one, so a finished-but-not-yet-exported job can
         # answer; otherwise this falls through to the files on disk.
         ctx = getattr(job, "context", None)
         outputs = getattr(ctx, "outputs", None) or {}
         return await self._serve_report(
-            incident_id, request, report=outputs.get("report")
+            incident_id,
+            request,
+            report=outputs.get("report"),
+            owners=self._artifact_owners(request, job),
         )
 
     async def get_job_evidence(self, request):
         """``GET /api/v1/jobs/{job_id}/evidence?kind=raw|transformed[&full=1]``."""
-        incident_id = self._incident_id_for_job(request)
+        job, incident_id = self._job_artifacts_for(request)
         if incident_id is None:
             return web.json_response({"error": "Job not found"}, status=404)
-        return await self._serve_evidence(incident_id, request)
+        return await self._serve_evidence(
+            incident_id, request, owners=self._artifact_owners(request, job)
+        )
 
     async def get_job_artifacts(self, request):
-        incident_id = self._incident_id_for_job(request)
+        job, incident_id = self._job_artifacts_for(request)
         if incident_id is None:
             return web.json_response({"error": "Job not found"}, status=404)
         try:
-            return web.json_response(report_delivery.artifact_inventory(incident_id))
+            return web.json_response(
+                report_delivery.artifact_inventory(
+                    incident_id, owners=self._artifact_owners(request, job)
+                )
+            )
         except ValueError as e:
             return web.json_response({"error": str(e)}, status=400)
 
     async def get_incident_report(self, request):
         """Same as the job-scoped report, keyed by incident id (survives a restart)."""
-        return await self._serve_report(request.match_info["incident_id"], request)
+        return await self._serve_report(
+            request.match_info["incident_id"],
+            request,
+            owners=self._artifact_owners(request),
+        )
 
     async def get_incident_evidence(self, request):
-        return await self._serve_evidence(request.match_info["incident_id"], request)
+        return await self._serve_evidence(
+            request.match_info["incident_id"],
+            request,
+            owners=self._artifact_owners(request),
+        )
 
     async def get_incident_artifacts(self, request):
         try:
             return web.json_response(
-                report_delivery.artifact_inventory(request.match_info["incident_id"])
+                report_delivery.artifact_inventory(
+                    request.match_info["incident_id"],
+                    owners=self._artifact_owners(request),
+                )
             )
         except ValueError as e:
             return web.json_response({"error": str(e)}, status=400)
@@ -1892,17 +2623,27 @@ class IncidentInputInterface:
         """The whole editable configuration, with literal secrets redacted.
 
         A literal value under a secret-shaped key comes back as the placeholder; an
-        ``${ENV_VAR}`` reference comes back verbatim, being a name the operator needs. This
-        API is unauthenticated, so ``config_store``'s redaction — which covers the raw text
-        as well as this structured view — is all that stands between it and the credentials.
+        ``${ENV_VAR}`` reference comes back verbatim, being a name the operator needs.
+        Readable and writable by every caller — a non-administrator's write lands in their own
+        layer rather than being refused — so ``config_store``'s redaction, which covers the raw
+        text as well as this structured view, has to hold for all of them.
+
+        The values are the BASE's, because the base is what the process runs on; a caller's own
+        drafts ride beside them under ``overlay`` rather than being merged into the view, or a
+        reader cannot tell the running value from their own unpromoted edit.
         """
         try:
-            return web.json_response(config_store.describe())
+            payload = config_store.describe()
         except Exception as e:  # noqa: BLE001 — an unreadable config must not 500 blind
             logger.error("Config read failed: %s", e)
             return web.json_response(
                 {"error": f"Could not read the configuration: {e}"}, status=500
             )
+        identity = self._identity(request)
+        payload["role"] = identity.role
+        payload["edits_the_base"] = identity.is_admin
+        payload["overlay"] = self._overlay(request).config.describe()
+        return web.json_response(payload)
 
     async def patch_config(self, request):
         """``PUT /api/v1/config`` with ``{"updates": {"<dotted.path>": value, ...}}``.
@@ -1910,6 +2651,10 @@ class IncidentInputInterface:
         All-or-nothing against the field descriptors: a half-landed write leaves the app in a
         state nobody chose. A value matching the redaction placeholder is dropped as
         "unchanged", so a UI that PUTs back what it read cannot overwrite a password with it.
+
+        An administrator's write lands on the base and then re-merges every caller's layer onto
+        it; anyone else's lands in their own layer. Both go through the same validation and the
+        same line-anchored patcher, so a draft cannot hold text the base would have refused.
         """
         try:
             payload = await request.json()
@@ -1930,6 +2675,8 @@ class IncidentInputInterface:
             return web.json_response(
                 {"changed": [], "skipped": [], "note": "nothing to change"}
             )
+        if not self._edits_the_base(request):
+            return self._patch_config_layer(request, accepted)
         try:
             result = config_store.apply_updates(accepted)
         except ValueError as e:
@@ -1942,6 +2689,84 @@ class IncidentInputInterface:
         # Modules hold their slice by reference, so re-reading the file into the live dict
         # is what makes a `live` field take effect.
         result["reloaded"] = self._reload_live_config(result.get("changed") or [])
+        result["rebased"] = self._rebase_layers(CONFIG_LAYER, _config_base_reader)
+        # The one write on this surface that changes what every other caller runs on, and until
+        # now the only record of it was a filename and a key count with no who.
+        identity = self._identity(request)
+        self.audit.record(
+            "config_change",
+            identity,
+            target="base",
+            changed=_audit_changes(result.get("changed")),
+        )
+        logger.info(
+            "Identity %s changed the base configuration: %s",
+            identity.user_name,
+            ", ".join(c.get("path", "?") for c in (result.get("changed") or []))
+            or "nothing",
+        )
+        return web.json_response(result)
+
+    def _patch_config_layer(self, request, accepted):
+        """The same dotted-path patch, applied to this caller's own layer of each file.
+
+        The fork point is the BASE text and not the caller's previous draft, so a later release
+        merges against what they actually forked from. Reported per file, since one path landing
+        while another's file is absent is two different answers.
+        """
+        layer = self._layer(request, CONFIG_LAYER)
+        if not layer.available:
+            return web.json_response({"error": self._NO_STORE}, status=503)
+        changed, skipped = [], []
+        durable = True
+        for name, items in config_store.group_by_file(accepted).items():
+            base = _config_base_reader(name)
+            if base is None:
+                for path in items:
+                    skipped.append({"path": path, "reason": f"{name} does not exist"})
+                continue
+            current = layer.read(name)
+            try:
+                new_text, file_changed, file_skipped = config_store.patch_text(
+                    current if current is not None else base, name, items
+                )
+            except ValueError as e:
+                return web.json_response({"error": str(e)}, status=400)
+            changed.extend(file_changed)
+            skipped.extend(file_skipped)
+            if file_changed:
+                durable = layer.write(name, new_text, base) and durable
+        # No single `state`: a patch spans files, and one merged file beside one conflicted one
+        # has no one answer. `files` is where the caller reads the per-file states from.
+        result = {
+            "changed": changed,
+            "skipped": skipped,
+            "durable": durable,
+            "layer": True,
+            "effect": self._DRAFT_EFFECT,
+            "note": self._DRAFT_NOTE,
+            # No restart applies a draft, so a `live` descriptor on a drafted key is a claim
+            # about the FIELD and not about this write — same answer its whole-file sibling
+            # and a layered pack save give, since a caller comparing two of them must not read
+            # the silence as "then a restart might".
+            "restart_required": False,
+            "files": layer.describe(),
+        }
+        identity = self._identity(request)
+        # Journalled like the base write and distinguished from it: a draft changes nothing any
+        # other caller runs on, so a reader must be able to tell the two apart.
+        self.audit.record(
+            "config_change",
+            identity,
+            target="layer",
+            changed=_audit_changes(changed),
+            durable=durable,
+        )
+        logger.info(
+            "Identity %s patched their own config layer (%d key(s))",
+            identity.user_name,
+            len(changed),
+        )
         return web.json_response(result)
 
     def _reload_live_config(self, changed):
@@ -2067,6 +2892,10 @@ class IncidentInputInterface:
 
         The redaction makes an export safe to share as a template, and the importer refuses
         text still carrying the placeholder rather than writing it over a real credential.
+
+        A caller with a draft of this file gets THEIR text, because this is the raw editor's
+        read half and it must round-trip: served the base, their next save would silently
+        discard the draft it was editing. ``?base=1`` asks for the shared version.
         """
         name = request.match_info["name"]
         if name not in config_store.CONFIG_FILES:
@@ -2075,6 +2904,10 @@ class IncidentInputInterface:
             )
         try:
             text = config_store.redact_raw(config_store.read_raw(name))
+            if not _truthy(request.query.get("base")):
+                mine = self._layer(request, CONFIG_LAYER).read(name)
+                if mine is not None:
+                    text = config_store.redact_raw(mine)
         except OSError as e:
             return web.json_response({"error": str(e)}, status=500)
         if not text:
@@ -2092,7 +2925,9 @@ class IncidentInputInterface:
         """``PUT /api/v1/config/{name}`` with ``{"text": "<yaml>"}``: whole-file save.
 
         Parses the candidate text before replacing anything, and keeps the previous version
-        as ``<name>.yaml.bak``.
+        as ``<name>.yaml.bak``. A non-administrator's whole-file save lands in their own layer,
+        validated by the same rules first — the validation is about the text, not about who
+        wrote it, so a draft cannot hold YAML the base would have refused.
         """
         name = request.match_info["name"]
         try:
@@ -2101,6 +2936,8 @@ class IncidentInputInterface:
             return web.Response(status=400, text="Invalid JSON")
         if not isinstance(payload, dict) or not isinstance(payload.get("text"), str):
             return web.Response(status=400, text='Body must be {"text": "<yaml>"}')
+        if not self._edits_the_base(request):
+            return self._replace_config_layer(request, name, payload["text"])
         try:
             result = config_store.replace_file(name, payload["text"])
         except ValueError as e:
@@ -2109,7 +2946,36 @@ class IncidentInputInterface:
             logger.error("Config replace failed for %s: %s", name, e)
             return web.json_response({"error": str(e)}, status=500)
         result["restart_required"] = True
+        result["rebased"] = self._rebase_layers(CONFIG_LAYER, _config_base_reader)
         return web.json_response(result)
+
+    def _replace_config_layer(self, request, name: str, text: str):
+        """A whole-file save into this caller's own layer."""
+        try:
+            config_store.validate_replacement(name, text)
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        layer = self._layer(request, CONFIG_LAYER)
+        if not layer.available:
+            return web.json_response({"error": self._NO_STORE}, status=503)
+        base = _config_base_reader(name)
+        if base is None:
+            return web.json_response(
+                {"error": f"{name} does not exist in the config directory"}, status=404
+            )
+        durable = layer.write(name, text, base)
+        logger.info(
+            "Identity %s saved their own layer of %s",
+            self._identity(request).user_name,
+            name,
+        )
+        return web.json_response(
+            self._draft_result(
+                {"name": name, "durable": bool(durable), "restart_required": False},
+                layer,
+                name,
+            )
+        )
 
     async def import_config(self, request):
         """``POST /api/v1/config/import`` with ``{"files": {"<name>": "<yaml>"}}``.
@@ -2129,33 +2995,24 @@ class IncidentInputInterface:
             )
         errors = []
         for name, text in files.items():
-            if name not in config_store.CONFIG_FILES:
-                errors.append(f"{name}: not a recognised config file")
-            elif not isinstance(text, str):
+            if not isinstance(text, str):
                 errors.append(f"{name}: contents must be a string")
-            elif config_store.REDACTED in text:
-                errors.append(
-                    f"{name}: still contains {config_store.REDACTED} — replace those "
-                    "placeholders with real values or ${ENV_VAR} references"
-                )
-            else:
-                try:
-                    parsed = config_store.yaml.safe_load(text)
-                except Exception as e:  # noqa: BLE001 — YAMLError and friends
-                    errors.append(f"{name}: invalid YAML — {e}")
-                else:
-                    # `replace_file`'s own rule, checked here too so a non-mapping file
-                    # cannot fail mid-write and break the validate-all-first promise.
-                    if parsed is not None and not isinstance(parsed, dict):
-                        errors.append(
-                            f"{name}: a config file must be a YAML mapping at the "
-                            "top level"
-                        )
+                continue
+            try:
+                # `replace_file`'s own rules, checked here first so a file that would fail
+                # mid-write cannot break the validate-all-first promise. Every file is
+                # reported, not just the first: a caller fixing an import one message at a
+                # time re-uploads as many times as it has faults.
+                config_store.validate_replacement(name, text)
+            except ValueError as e:
+                errors.append(f"{name}: {e}")
         if errors:
             return web.json_response(
                 {"error": "Import rejected; nothing was written", "errors": errors},
                 status=400,
             )
+        if not self._edits_the_base(request):
+            return self._import_config_layer(request, files)
         written = []
         for name, text in files.items():
             try:
@@ -2167,7 +3024,53 @@ class IncidentInputInterface:
                     {"error": f"{name}: {e}", "written": written}, status=500
                 )
         logger.info("Configuration imported: %s", ", ".join(files))
-        return web.json_response({"written": written, "restart_required": True})
+        return web.json_response(
+            {
+                "written": written,
+                "restart_required": True,
+                "rebased": self._rebase_layers(CONFIG_LAYER, _config_base_reader),
+            }
+        )
+
+    def _import_config_layer(self, request, files: dict):
+        """An import into this caller's own layer, pre-validated by the caller above."""
+        layer = self._layer(request, CONFIG_LAYER)
+        if not layer.available:
+            return web.json_response({"error": self._NO_STORE}, status=503)
+        missing = [name for name in files if _config_base_reader(name) is None]
+        if missing:
+            # Refused whole, like the base path: a partial import leaves the caller running
+            # half of somebody else's environment, which is what all-or-nothing is for.
+            return web.json_response(
+                {
+                    "error": "Import rejected; nothing was written",
+                    "errors": [
+                        f"{name}: does not exist in the config directory" for name in missing
+                    ],
+                },
+                status=400,
+            )
+        written = []
+        durable = True
+        for name, text in files.items():
+            durable = bool(layer.write(name, text, _config_base_reader(name))) and durable
+            written.append({"file": name, "bytes": len(text)})
+        logger.info(
+            "Identity %s imported into their own config layer: %s",
+            self._identity(request).user_name,
+            ", ".join(files),
+        )
+        return web.json_response(
+            {
+                "written": written,
+                "durable": durable,
+                "restart_required": False,
+                "layer": True,
+                "effect": self._DRAFT_EFFECT,
+                "note": self._DRAFT_NOTE,
+                "files": layer.describe(),
+            }
+        )
 
     # -- knowledge packs ---------------------------------------------------
     #
@@ -2198,6 +3101,307 @@ class IncidentInputInterface:
                 {"error": str(exc), "path": exc.path, "line": exc.line}, status=400
             )
         return web.json_response({"error": str(exc)}, status=400)
+
+    # -- knowledge packs: the per-caller layer -----------------------------
+    #
+    # The same split the config surface has, over the same primitives: an administrator's write
+    # goes through `pack_store`, everyone else's through their own `UserLayer` after clearing
+    # `pack_store`'s own verification. A layer is keyed `<pack>/<path>` because a caller may
+    # hold drafts across several packs and one rebase has to walk all of them.
+
+    def _pack_layer_rel(self, pack: str, rel: str) -> str:
+        """One layer address for a packed file, both halves validated.
+
+        Validated here rather than left to the store: a traversal that can only ever land in
+        the caller's own namespace is still a traversal, and the layer has no atomic-write
+        verification behind it to catch one.
+        """
+        return f"{pack_store.safe_pack_name(pack)}/{pack_store.safe_rel_path(rel)}"
+
+    def _pack_layer_paths(self, layer: UserLayer, pack: str) -> Dict[str, str]:
+        """`{path within the pack: state}` for the caller's drafts in `pack`."""
+        prefix = f"{pack}/"
+        out = {}
+        for rel in layer.paths():
+            if rel.startswith(prefix):
+                out[rel[len(prefix):]] = layer.meta_of(rel).get("state", CLEAN)
+        return out
+
+    def _layered_tree(self, request, tree: dict) -> dict:
+        """`tree` with this caller's drafts marked, and their draft-only files added.
+
+        A draft that does not appear in the browser cannot be opened again, so a file the
+        caller created in their own layer is listed like any other with `in_base: False` —
+        the tree is what they can edit, not what the running process loaded.
+        """
+        pack = tree.get("pack") or ""
+        layer = self._layer(request, KNOWLEDGE_LAYER)
+        mine = self._pack_layer_paths(layer, pack)
+        if not mine:
+            return tree
+        nodes = list(tree.get("nodes") or [])
+        known = {str(node.get("path")): node for node in nodes}
+        for rel, state in mine.items():
+            text = layer.read(self._pack_layer_rel(pack, rel)) or ""
+            node = known.get(rel)
+            if node is None:
+                node = {
+                    "path": rel,
+                    "dir": False,
+                    "depth": rel.count("/"),
+                    "name": rel.rsplit("/", 1)[-1],
+                    "kind": pack_store.classify(rel),
+                    "text": True,
+                    "in_base": False,
+                }
+                nodes.append(node)
+                _add_missing_dirs(nodes, known, rel)
+            node["layer"] = True
+            node["state"] = state
+            node["bytes"] = len(text.encode("utf-8"))
+            node["lines"] = len(text.splitlines())
+            node["editable"] = node["bytes"] <= pack_store.INLINE_EDIT_MAX_BYTES
+        nodes.sort(key=lambda n: tuple(str(n["path"]).split("/")))
+        out = dict(tree)
+        out["nodes"] = nodes
+        out["counts"] = {
+            "files": sum(1 for n in nodes if not n["dir"]),
+            "dirs": sum(1 for n in nodes if n["dir"]),
+            "bytes": sum(int(n.get("bytes") or 0) for n in nodes if not n["dir"]),
+        }
+        out["layered"] = sorted(mine)
+        return out
+
+    def _draft_read(self, pack: str, rel: str, text: str, layer: UserLayer, in_base: bool):
+        """One layered file in the shape `pack_store.read_file` returns.
+
+        Built rather than patched over the base read, so every field derived from the text —
+        `sha256` above all — describes what was actually served. A concurrency token computed
+        from somebody else's copy silently disables the 409 the editor relies on.
+        """
+        layer_rel = self._pack_layer_rel(pack, rel)
+        size = len(text.encode("utf-8"))
+        return {
+            "pack": pack_store.safe_pack_name(pack),
+            "path": str(pack_store.safe_rel_path(rel)),
+            "kind": pack_store.classify(rel),
+            "text": text,
+            "bytes": size,
+            "lines": len(text.splitlines()),
+            "sha256": pack_store.sha256_text(text),
+            "editable": size <= pack_store.INLINE_EDIT_MAX_BYTES,
+            "in_base": in_base,
+            "layer": True,
+            "state": layer.meta_of(layer_rel).get("state", CLEAN),
+        }
+
+    def _pack_draft_result(self, pack: str, layer_rel: str, layer: UserLayer, result: dict):
+        """A layered pack write's response. Deliberately not `_pack_write_result`.
+
+        That one attaches the pack's diagnostics, which describe the files on disk — beside a
+        draft they would read as a verdict on what was just saved. So the scope is named, and
+        `restart_required` is false because no restart applies a draft either.
+        """
+        result["restart_required"] = False
+        result["validate"] = self._validate_payload(pack)
+        result["validate_scope"] = "base"
+        return web.json_response(self._draft_result(result, layer, layer_rel))
+
+    def _pack_layer_for(self, request, pack: str, rel: str):
+        """`(layer, layer_rel, base_text, my_text)` or raises `_LayerUnavailable`.
+
+        The four things every layered pack handler needs, resolved once so a refusal is worded
+        the same way whichever of them asked.
+        """
+        layer = self._layer(request, KNOWLEDGE_LAYER)
+        if not layer.available:
+            raise _LayerUnavailable(
+                web.json_response({"error": self._NO_STORE}, status=503)
+            )
+        layer_rel = self._pack_layer_rel(pack, rel)
+        return layer, layer_rel, _knowledge_base_reader(layer_rel), layer.read(layer_rel)
+
+    async def _save_knowledge_layer(self, request, pack: str, rel: str, payload: dict):
+        """A save into this caller's own draft of a packed file.
+
+        A range is spliced against their EFFECTIVE text — their draft where they have one, the
+        base otherwise — so a line number means what the editor showed them, and `expect_sha`
+        is checked against that same text for the same reason.
+        """
+        try:
+            layer, layer_rel, base, mine = self._pack_layer_for(request, pack, rel)
+        except _LayerUnavailable as refused:
+            return refused.response
+        except pack_store.PackStoreError as e:
+            # A bad pack name or path, refused before it becomes a storage key.
+            return self._pack_error_response(e)
+        try:
+            pack_store.require_editable_suffix(pack_store.safe_rel_path(rel))
+            if mine is None and base is None:
+                return web.json_response(
+                    {"error": f"{rel}: no such file in pack {pack!r}"}, status=404
+                )
+            effective = mine if mine is not None else base
+            expect_sha = str(payload.get("expect_sha") or "")
+            if expect_sha and expect_sha != pack_store.sha256_text(effective):
+                raise pack_store.PackConflict(
+                    f"{rel} changed since it was read — reload it and re-apply your edit"
+                )
+            text = payload["text"]
+            start, end = payload.get("start_line"), payload.get("end_line")
+            if start is not None or end is not None:
+                candidate = splice_lines(effective, int(start or 0), int(end or 0), text)
+            else:
+                candidate = text
+            size = len(candidate.encode("utf-8"))
+            if size > pack_store.WRITE_MAX_BYTES:
+                raise pack_store.PackTooLarge(
+                    f"{rel}: {size} bytes is over the "
+                    f"{pack_store.WRITE_MAX_BYTES}-byte write limit"
+                )
+            pack_store.verify_candidate(str(rel), candidate, pre_image=effective)
+        except pack_store.PackStoreError as e:
+            return self._pack_error_response(e)
+        except (TypeError, ValueError) as e:
+            return web.json_response({"error": str(e)}, status=400)
+        durable = layer.write(layer_rel, candidate, base)
+        logger.info(
+            "Identity %s saved their own layer of %s/%s",
+            self._identity(request).user_name,
+            pack,
+            rel,
+        )
+        return self._pack_draft_result(
+            pack,
+            layer_rel,
+            layer,
+            {
+                "pack": pack_store.safe_pack_name(pack),
+                "path": str(pack_store.safe_rel_path(rel)),
+                "durable": bool(durable),
+                "changed": candidate != effective,
+                "bytes": len(candidate.encode("utf-8")),
+                "lines": len(candidate.splitlines()),
+                "sha256": pack_store.sha256_text(candidate),
+                "in_base": base is not None,
+            },
+        )
+
+    async def _create_knowledge_layer(self, request, pack: str, rel: str, text: str):
+        """A file that exists only in this caller's draft of the pack."""
+        try:
+            layer, layer_rel, base, mine = self._pack_layer_for(request, pack, rel)
+        except _LayerUnavailable as refused:
+            return refused.response
+        except pack_store.PackStoreError as e:
+            # A bad pack name or path, refused before it becomes a storage key.
+            return self._pack_error_response(e)
+        try:
+            pack_store.require_editable_suffix(pack_store.safe_rel_path(rel))
+            if base is not None or mine is not None:
+                # Same refusal the base path gives, for the same reason: a create that
+                # silently became a save is how the previous content disappears.
+                raise pack_store.PackFileExists(
+                    f"{rel} already exists — save it instead of creating it"
+                )
+            pack_store.verify_candidate(str(rel), text, pre_image=None)
+        except pack_store.PackStoreError as e:
+            return self._pack_error_response(e)
+        durable = layer.write(layer_rel, text, None)
+        logger.info(
+            "Identity %s created %s/%s in their own layer",
+            self._identity(request).user_name,
+            pack,
+            rel,
+        )
+        return self._pack_draft_result(
+            pack,
+            layer_rel,
+            layer,
+            {
+                "pack": pack_store.safe_pack_name(pack),
+                "path": str(pack_store.safe_rel_path(rel)),
+                "durable": bool(durable),
+                "created": True,
+                "bytes": len(text.encode("utf-8")),
+                "lines": len(text.splitlines()),
+                "sha256": pack_store.sha256_text(text),
+                "in_base": False,
+            },
+        )
+
+    async def _delete_knowledge_layer(self, request, pack: str, rel: str):
+        """Discard this caller's draft of a file — which is the only delete they have.
+
+        A file in the base tree is not theirs to remove: the running process loads it, so a
+        per-caller delete would either do nothing or delete it for everybody. Dropping the
+        draft restores their view of the base, and a draft-only file goes away entirely.
+        """
+        try:
+            layer, layer_rel, base, mine = self._pack_layer_for(request, pack, rel)
+        except _LayerUnavailable as refused:
+            return refused.response
+        except pack_store.PackStoreError as e:
+            return self._pack_error_response(e)
+        if mine is None:
+            return web.json_response(
+                {
+                    "error": (
+                        f"you have no version of {rel!r} to discard. It belongs to the "
+                        "shared pack, which only an administrator can change."
+                    ),
+                    "path": rel,
+                },
+                status=403 if base is not None else 404,
+            )
+        dropped = layer.drop(layer_rel)
+        logger.info(
+            "Identity %s discarded their own layer of %s/%s",
+            self._identity(request).user_name,
+            pack,
+            rel,
+        )
+        return web.json_response(
+            {
+                "pack": pack_store.safe_pack_name(pack),
+                "path": str(pack_store.safe_rel_path(rel)),
+                "dropped": bool(dropped),
+                "restored_to_base": base is not None,
+                "layer": True,
+                "effect": self._DRAFT_EFFECT,
+                "note": (
+                    "your version was discarded; you now see the shared one again"
+                    if base is not None
+                    else "your version was discarded and the file exists nowhere else"
+                ),
+                "restart_required": False,
+            }
+        )
+
+    async def _restore_knowledge_layer(self, request, pack: str, snapshot_id: str, rel: str):
+        """Put a shared snapshot's text into this caller's draft.
+
+        History belongs to the base tree, so a restore cannot write there for a
+        non-administrator — but reading an older shared version into their own draft is the
+        undo they actually want, and it is the same write every other draft takes.
+        """
+        try:
+            text = pack_store.snapshot_text(pack, snapshot_id)
+        except pack_store.PackStoreError as e:
+            return self._pack_error_response(e)
+        except OSError as e:
+            return web.json_response({"error": str(e)}, status=500)
+        if not rel:
+            return web.json_response(
+                {
+                    "error": (
+                        'restoring into your own version needs "path": which file this '
+                        "snapshot should become"
+                    )
+                },
+                status=400,
+            )
+        return await self._save_knowledge_layer(request, pack, rel, {"text": text})
 
     async def list_knowledge_packs(self, request):
         """``GET /api/v1/knowledge``: every installed pack, and which one is loaded.
@@ -2239,10 +3443,12 @@ class IncidentInputInterface:
         except OSError as e:
             logger.error("Pack read failed for %s: %s", pack, e)
             return web.json_response({"error": str(e)}, status=500)
+        tree = self._layered_tree(request, tree)
         payload = {
             "pack": tree["pack"],
             "nodes": tree["nodes"],
             "counts": tree["counts"],
+            "layered": tree.get("layered") or [],
             "limits": {
                 "inline_edit_max_bytes": pack_store.INLINE_EDIT_MAX_BYTES,
                 "read_max_bytes": pack_store.READ_MAX_BYTES,
@@ -2290,7 +3496,8 @@ class IncidentInputInterface:
         write response and only the sizes and line counts have moved.
         """
         try:
-            return web.json_response(pack_store.pack_tree(request.match_info["pack"]))
+            tree = pack_store.pack_tree(request.match_info["pack"])
+            return web.json_response(self._layered_tree(request, tree))
         except pack_store.PackStoreError as e:
             return self._pack_error_response(e)
         except OSError as e:
@@ -2302,15 +3509,30 @@ class IncidentInputInterface:
         ``?download=1`` serves it as an attachment, the answer for a file over the inline-edit
         limit — a generated schema runs to hundreds of kilobytes, and a textarea round trip is
         how one gets lost. ``sha256`` is the token the write half's 409 path checks.
+
+        A caller with their own version of the file gets that one, and ``?base=1`` is how they
+        read the shared text they would be editing against.
         """
         pack = request.match_info["pack"]
         rel = request.query.get("path") or ""
+        mine = None
         try:
+            if not _truthy(request.query.get("base")):
+                layer = self._layer(request, KNOWLEDGE_LAYER)
+                mine = layer.read(self._pack_layer_rel(pack, rel))
             info = pack_store.read_file(pack, rel)
+        except pack_store.PackFileNotFound as e:
+            # A file only this caller has is still a file they must be able to open.
+            if mine is None:
+                return self._pack_error_response(e)
+            info = self._draft_read(pack, rel, mine, layer, in_base=False)
         except pack_store.PackStoreError as e:
             return self._pack_error_response(e)
         except OSError as e:
             return web.json_response({"error": str(e)}, status=500)
+        else:
+            if mine is not None:
+                info = self._draft_read(pack, rel, mine, layer, in_base=True)
         if _truthy(request.query.get("download")):
             return self._artifact_response(
                 info["text"].encode("utf-8"),
@@ -2395,9 +3617,13 @@ class IncidentInputInterface:
         own, while the ruleset now imports a check that no longer exists — and a caller who
         needs a second request to learn that usually will not make it. `restart_required` is
         always true: editing a pack does not reload the one this process holds.
+
+        This is also the one seam every base write to a pack passes, so it is where everybody
+        else's drafts are re-merged onto what just changed.
         """
         result["validate"] = self._validate_payload(pack)
         result["restart_required"] = True
+        result["rebased"] = self._rebase_layers(KNOWLEDGE_LAYER, _knowledge_base_reader)
         return web.json_response(result)
 
     async def save_knowledge_file(self, request):
@@ -2410,6 +3636,10 @@ class IncidentInputInterface:
         means the file moved under the editor, where a 200 would discard whoever saved first.
         `expect_first_line`/`expect_last_line` do the same for a range, where a stale line
         number still points at a line, just the wrong one.
+
+        A non-administrator's save lands in their own version of the file, through the same
+        verification and the same line arithmetic — the checks are about the text, not about
+        who wrote it, so a draft cannot hold YAML the shared pack would have refused.
         """
         pack = request.match_info["pack"]
         rel = request.query.get("path") or ""
@@ -2421,6 +3651,8 @@ class IncidentInputInterface:
             return web.json_response(
                 {"error": 'Body must be {"text": "<file contents>"}'}, status=400
             )
+        if not self._edits_the_base(request):
+            return await self._save_knowledge_layer(request, pack, rel, payload)
         start, end = payload.get("start_line"), payload.get("end_line")
         ranged = start is not None or end is not None
         try:
@@ -2434,7 +3666,7 @@ class IncidentInputInterface:
                     expect_first_line=str(payload.get("expect_first_line") or ""),
                     expect_last_line=str(payload.get("expect_last_line") or ""),
                     expect_sha=str(payload.get("expect_sha") or ""),
-                    actor=str(payload.get("actor") or ""),
+                    actor=self._actor(request, payload.get("actor")),
                 )
             else:
                 result = pack_store.write_file(
@@ -2442,7 +3674,7 @@ class IncidentInputInterface:
                     rel,
                     text,
                     expect_sha=str(payload.get("expect_sha") or ""),
-                    actor=str(payload.get("actor") or ""),
+                    actor=self._actor(request, payload.get("actor")),
                 )
         except pack_store.PackStoreError as e:
             return self._pack_error_response(e)
@@ -2469,9 +3701,11 @@ class IncidentInputInterface:
         text = payload.get("text", "")
         if not isinstance(text, str):
             return web.json_response({"error": '"text" must be a string'}, status=400)
+        if not self._edits_the_base(request):
+            return await self._create_knowledge_layer(request, pack, rel, text)
         try:
             result = pack_store.create_file(
-                pack, rel, text, actor=str(payload.get("actor") or "")
+                pack, rel, text, actor=self._actor(request, payload.get("actor"))
             )
         except pack_store.PackStoreError as e:
             return self._pack_error_response(e)
@@ -2487,6 +3721,10 @@ class IncidentInputInterface:
         `confirm=1` rides in the request rather than in a dialog the UI happens to show, which
         would leave a script or a stray retry uncovered. The content survives in history:
         `delete_file` snapshots first and refuses the unlink if that could not be stored.
+
+        For a non-administrator this discards their own version instead: the shared file is
+        loaded by the running process, so a per-caller delete of it would either do nothing or
+        delete it for everybody.
         """
         pack = request.match_info["pack"]
         rel = request.query.get("path") or ""
@@ -2501,9 +3739,11 @@ class IncidentInputInterface:
                 },
                 status=400,
             )
+        if not self._edits_the_base(request):
+            return await self._delete_knowledge_layer(request, pack, rel)
         try:
             result = pack_store.delete_file(
-                pack, rel, actor=str(request.query.get("actor") or "")
+                pack, rel, actor=self._actor(request, request.query.get("actor"))
             )
         except pack_store.PackStoreError as e:
             return self._pack_error_response(e)
@@ -2534,12 +3774,18 @@ class IncidentInputInterface:
             return web.json_response(
                 {"error": 'Body must be {"snapshot": "<snapshot id>"}'}, status=400
             )
+        if not self._edits_the_base(request):
+            # History belongs to the shared tree, so an older version comes back as this
+            # caller's own draft — which is the undo they were reaching for anyway.
+            return await self._restore_knowledge_layer(
+                request, pack, snapshot_id, str(payload.get("path") or "")
+            )
         try:
             result = pack_store.restore(
                 pack,
                 snapshot_id,
                 rel=str(payload.get("path") or ""),
-                actor=str(payload.get("actor") or ""),
+                actor=self._actor(request, payload.get("actor")),
             )
         except pack_store.PackStoreError as e:
             return self._pack_error_response(e)
@@ -2561,7 +3807,15 @@ class IncidentInputInterface:
         import is usually one coherent change, so landing half leaves a pack broken in a way
         neither file's author would recognise. Unlike the create route, an existing file is
         overwritten, its prior bytes snapshotted so the import is reversible file by file.
+
+        Administrator only. This is the release verb — pushing a new version of the pack
+        everybody runs — while the per-file routes beside it layer a non-administrator's edit
+        into their own draft. Refused rather than layered, because a bulk overwrite of the
+        shared tree is the one thing a draft is not.
         """
+        refused = self._forbid_non_admin(request, "importing into a knowledge pack")
+        if refused is not None:
+            return refused
         pack = request.match_info["pack"]
         payload, bad = await self._pack_body(request)
         if bad is not None:
@@ -2611,7 +3865,7 @@ class IncidentInputInterface:
                 if is_new:
                     written.append(
                         pack_store.create_file(
-                            pack, relp, text, actor=str(payload.get("actor") or "")
+                            pack, relp, text, actor=self._actor(request, payload.get("actor"))
                         )
                     )
                 else:
@@ -2620,7 +3874,7 @@ class IncidentInputInterface:
                             pack,
                             relp,
                             text,
-                            actor=str(payload.get("actor") or ""),
+                            actor=self._actor(request, payload.get("actor")),
                             reason="import",
                         )
                     )
@@ -2641,7 +3895,13 @@ class IncidentInputInterface:
         edit against a green baseline rather than an empty directory. `vocabulary` is required
         and written here — the template's own placeholder words collide with its example
         ruleset, so it ships without the file that proves the engine speaks no domain.
+
+        Administrator only, and it is the one pack route where that is not a policy choice: a
+        new pack has no base to layer over, so there is no draft for this to be.
         """
+        refused = self._forbid_non_admin(request, "creating a knowledge pack")
+        if refused is not None:
+            return refused
         payload, bad = await self._pack_body(request)
         if bad is not None:
             return bad
@@ -2655,7 +3915,7 @@ class IncidentInputInterface:
             result = pack_store.scaffold_pack(
                 name,
                 vocabulary=payload.get("vocabulary"),
-                actor=str(payload.get("actor") or ""),
+                actor=self._actor(request, payload.get("actor")),
             )
         except pack_store.PackStoreError as e:
             return self._pack_error_response(e)
@@ -2840,7 +4100,17 @@ class IncidentInputInterface:
         the identical validation, so an operator can correct a proposal rather than choose
         between accepting it verbatim and rejecting it. A failing op is a 400 with nothing
         written and the per-op reasons, so the next attempt can be a correction.
+
+        Administrator only, and the asymmetry with the rest of the assistant is deliberate:
+        anyone may ask for a plan and read its preview, because that is where the help is. The
+        plan's ops resolve their anchors against the base and are all-or-nothing across
+        several files, so applying one into a per-caller layer would be a second
+        implementation of the whole op vocabulary — and a half-applied plan is worse than a
+        refused one.
         """
+        refused = self._forbid_non_admin(request, "applying an assistant plan")
+        if refused is not None:
+            return refused
         session, bad = self._assist_session(request)
         if bad is not None:
             return bad
@@ -2856,20 +4126,23 @@ class IncidentInputInterface:
                 {"error": f"session {session.id} has no plan to apply"}, status=409
             )
         allow_delete = _truthy(payload.get("allow_delete"))
-        actor = str(payload.get("actor") or "")
+        actor = self._actor(request, payload.get("actor"))
         try:
             # On a thread: building and validating a candidate tree is tens of seconds of
             # CPU, and inline it stalls every in-flight job's SSE stream. Computed once and
             # handed to the apply, so one click validates the pack once.
             #
-            # `dry_run` only for a hand-edited plan: a proposal was already dry-run into the
-            # preview being approved, while an edited one has never been measured.
+            # `dry_run` and `deltas` only for a hand-edited plan: a proposal was already
+            # measured both ways into the preview being approved, while an edited one has
+            # never been. Neither gates the write — recorded with the applied plan, so an
+            # apply that moved a past incident's procedure says so where it is auditable.
             checks = await asyncio.to_thread(
                 pack_assistant.plan_checks,
                 session.pack,
                 plan,
                 allow_delete=allow_delete,
                 dry_run=edited,
+                deltas=edited,
             )
             # Before the write, because a preview is computed against the pre-image: taken
             # after, every patch op fails its own anchors and the recorded plan reads as a
@@ -3001,13 +4274,16 @@ class IncidentInputInterface:
                     record = await response.json()
 
             fft = record["records"][0]["ffts"][0]
-            ir = self._normalize_incident(
-                {
-                    "id": fft["rnid"],
-                    "timestamp": fft["update_date"],
-                    "description": fft["fft"],
-                },
-                source="ir_lookup",
+            ir = self._own(
+                request,
+                self._normalize_incident(
+                    {
+                        "id": fft["rnid"],
+                        "timestamp": fft["update_date"],
+                        "description": fft["fft"],
+                    },
+                    source="ir_lookup",
+                ),
             )
             logger.info(f"Received incident: {ir['id']}")
             return await self._run_pipeline(ir, verbose=self._wants_verbose(request))

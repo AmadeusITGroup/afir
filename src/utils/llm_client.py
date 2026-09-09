@@ -32,7 +32,7 @@ def is_truncation_error(exc) -> bool:
     """Whether ``exc`` is a truncation, across both module identities of this file.
 
     Two import paths → two class objects; ``except LLMTruncatedError`` can miss one.
-    Match on the marker attribute instead (see CLAUDE.md dual-import rule).
+    Match on the marker attribute instead.
     """
     return getattr(exc, "is_truncation", False) is True
 
@@ -146,12 +146,35 @@ class LLMClient:
                 rate_limit=self._requests_per_minute, time_period=60
             )
 
+    def _personal_credential(self) -> Optional[str]:
+        """The current caller's own token for ``api_key_env``, if they set one.
+
+        A per-CALL header rather than ``client.api_key``: one ``AsyncOpenAI`` is shared by
+        every concurrent run, so mutating its key would hand one caller's token to whichever
+        request happened to be in flight. Imported here rather than at module scope to keep
+        ``src/utils`` the leaf package it is — nothing else in it reaches up into ``src.``.
+        """
+        if not self._api_key_env:
+            return None
+        try:
+            from src.user_secrets import personal_value
+
+            return personal_value(self._api_key_env)
+        except Exception as exc:  # noqa: BLE001 — never fail a call over an override
+            logger.debug("Personal credential lookup failed: %s", exc)
+            return None
+
     async def _create(self, **kwargs):
         """Single throttled entry for every chat.completions.create call; enforces the concurrency cap and QPS limit."""
         self._ensure_throttles()
         for key in self._unsupported_params:
             kwargs.pop(key, None)
         self._strip_unsupported_body(kwargs)
+        own = self._personal_credential()
+        if own:
+            headers = dict(kwargs.get("extra_headers") or {})
+            headers["Authorization"] = f"Bearer {own}"
+            kwargs["extra_headers"] = headers
         async with self._semaphore:
             if self._rate_limiter is not None:
                 await self._rate_limiter.acquire()

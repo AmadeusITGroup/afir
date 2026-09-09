@@ -12,6 +12,7 @@ from src.brief_prompt import DEFAULT_BRIEF_CHAR_BUDGET
 from src.brief_prompt import phrase as _phrase
 from src.brief_prompt import render_brief_for_prompt
 from src.human_guidance import guidance_message
+from src.identity import owner_scoped
 from src.link_escalation import ESCALATING_MODES
 from src.models.pydantic_models import STUB_OBSERVED, InvestigationReport
 from src.utils.llm_client import is_truncation_error
@@ -278,7 +279,9 @@ class ReportGenerationModule:
     def _write_readable_reports(self, sections, incident, anomalies):
         """Best-effort write Markdown + PDF next to the JSON export. Never raises."""
         incident_id = incident.get("id", "report")
-        backend = self._artifact_storage()
+        # Scoped to the run's owner, so the readable report lands beside the JSON export
+        # rather than in a shared namespace the exports left.
+        backend = owner_scoped(self._artifact_storage(), incident)
         try:
             md = self.render_markdown(sections, incident, anomalies)
             backend.put_text(f"fraud_report_{incident_id}.md", md)
@@ -369,6 +372,7 @@ class ReportGenerationModule:
             # Built here so it runs on both the narrated and fallback paths; adding it
             # to `_fallback_sections` as well would emit it twice on the fallback path.
             self._links_section,
+            self._inquiries_section,
         ):
             try:
                 section = builder(correlation, phrases)
@@ -582,6 +586,8 @@ class ReportGenerationModule:
     _SEC_ACTIONS = "Authorised Actions"
     # Advisory: questions about other procedures addressed to a human, not part of the verdict.
     _SEC_LINKS = "Cross-Procedure Correlation (advisory — not part of the verdict)"
+    # Advisory, and the other axis: what THIS procedure could not settle about its own evidence.
+    _SEC_INQUIRIES = "Open Questions This Procedure Left (advisory — not part of the verdict)"
     _SEC_ARTIFACTS = "Evidence Artifacts"
     # Subsection inside Incident Reconstruction, not a top-level section.
     _SUB_TIMELINE = "Source records in time order (built from the correlated evidence)"
@@ -608,6 +614,7 @@ class ReportGenerationModule:
         # --- What may be done -------------------------------------------------
         _SEC_ACTIONS,
         _SEC_LINKS,
+        _SEC_INQUIRIES,
         "Recommended Next Steps",
         # --- Appendix ---------------------------------------------------------
         _SEC_ARTIFACTS,
@@ -1434,6 +1441,10 @@ class ReportGenerationModule:
                     lines.append(f"Evidence as of the incident: {n.split('=', 1)[1]}")
                 elif n.startswith("source_unanswered="):
                     lines.append(f"SOURCE DID NOT ANSWER — {n.split('=', 1)[1]}")
+                elif n.startswith("procedure_unselected="):
+                    lines.append(
+                        f"PROCEDURE NOT SELECTED — {n.split('=', 1)[1]}"
+                    )
                 elif n.startswith("co_identity="):
                     lines.append(f"Identity resolution: {n.split('=', 1)[1]}")
                 elif n.startswith("categorical_exclusion="):
@@ -2512,6 +2523,199 @@ class ReportGenerationModule:
         ]
         if note:
             out.append(f"      about that setting: {note}")
+        return out
+
+    _INQUIRY_STATE_BLOCKS = (
+        (
+            "answered",
+            "ASKED AND ANSWERED",
+            "one further reading of the named source returned rows, and the procedure "
+            "declared in advance what those rows mean. A reading, not an adjudication: no "
+            "condition above consumed any of it.",
+        ),
+        (
+            "not_asked",
+            "STILL OPEN",
+            "settling one of these needs a query this run did not make. Nothing below was "
+            "ruled out, and nothing below is a finding — each is a question with a named "
+            "source to put it to.",
+        ),
+        (
+            "empty",
+            "ASKED AND THE SOURCE HAD NOTHING",
+            "the source answered with no matching rows, and the procedure declared what that "
+            "means here. Stated rather than omitted, because an empty answer and a question "
+            "nobody asked are otherwise the same silence.",
+        ),
+        (
+            "unanswered",
+            "ASKED AND THE SOURCE DID NOT ANSWER",
+            "the query was made and the source returned nothing at all — a timeout, a "
+            "credential or a catalog gap. That is not an empty answer: the remedy is the "
+            "environment, and re-reading these rows cannot supply one.",
+        ),
+        (
+            "unreachable",
+            "NOT ASKABLE FROM THIS EVIDENCE",
+            "the question is scoped by a value this run does not hold, so any query would "
+            "scan the source over the whole window instead of asking about one identity. A "
+            "gap in the declaration or in the data model, not in this investigation.",
+        ),
+    )
+
+    _INQUIRY_PREAMBLE = (
+        "ADVISORY, and addressed to a human. These are questions the adjudicating procedure "
+        "declared about its OWN evidence — what this run could not settle. Nothing in this "
+        "section was read by any condition, and none of it moved the verdict above, its "
+        "severity, or this run's stage health. An answer here is a reading of rows against a "
+        "meaning the procedure wrote down in advance; it is not a determination, and a "
+        "question that stayed open is not a negative finding."
+    )
+
+    #: Max scope values quoted per question before the count stands in for the rest.
+    _INQUIRY_MAX_SCOPE_VALUES = 6
+
+    @staticmethod
+    def _inquiries_of(correlation):
+        """Assessed open questions, or ``[]``. Falls back to ``brief.inquiries``; MagicMock-safe."""
+        for holder in (
+            correlation,
+            (getattr(correlation, "brief", None) if correlation is not None else None),
+        ):
+            found = getattr(holder, "inquiries", None) if holder is not None else None
+            if isinstance(found, list):
+                real = [f for f in found if isinstance(getattr(f, "state", None), str)]
+                if real:
+                    return real
+        return []
+
+    @classmethod
+    def _inquiries_section(cls, correlation, phrases=None):
+        """Advisory open-question section, or ``None`` when the pack declared none."""
+        findings = cls._inquiries_of(correlation)
+        if not findings:
+            return None
+        by_state = {}
+        for finding in findings:
+            by_state.setdefault(str(getattr(finding, "state", "") or ""), []).append(
+                finding
+            )
+        known = {state for state, _, _ in cls._INQUIRY_STATE_BLOCKS}
+        blocks = [b for b in cls._INQUIRY_STATE_BLOCKS if b[0] in by_state]
+        # An unknown state prints under its own name rather than being silently dropped.
+        blocks += [
+            (state, (state or "unspecified").replace("_", " ").upper(), "")
+            for state in sorted(by_state)
+            if state not in known
+        ]
+        lines = []
+        for state, heading, meaning in blocks:
+            group = by_state.get(state) or []
+            lines.append(
+                f"{heading} ({len(group)}){' — ' + meaning if meaning else ''}"
+            )
+            for finding in group:
+                lines.extend(cls._inquiry_lines(finding))
+        return {
+            "section_title": cls._SEC_INQUIRIES,
+            "content": [cls._INQUIRY_PREAMBLE]
+            + cls._inquiry_cost_lines(findings)
+            + lines,
+        }
+
+    @classmethod
+    def _inquiry_cost_lines(cls, findings):
+        """What this lane spent, stated once even when it spent nothing."""
+        total = len(findings)
+        spent = [f for f in findings if bool(getattr(f, "probe_spent", False))]
+        free = [
+            f
+            for f in findings
+            if not bool(getattr(f, "probe_spent", False))
+            and str(getattr(f, "state", "") or "")
+            in ("answered", "empty", "unanswered")
+        ]
+        if spent:
+            out = [
+                f"COST — {len(spent)} of these {total} question(s) cost one bounded query "
+                "each, made after the verdict was already decided and outside every source "
+                "the conditions read. Each says below what it asked and what came back."
+            ]
+        else:
+            out = [
+                f"COST — none of these {total} question(s) cost a query. Each was either "
+                "settled from rows this run had already retrieved, or is reported unsettled "
+                "with the reason nothing was spent on it."
+            ]
+        if free:
+            out.append(
+                f"{len(free)} of them were settled at no retrieval cost, by re-reading rows "
+                "this run had already retrieved for its own conditions — a bounded re-use of "
+                "evidence in hand, and each says so."
+            )
+        capped = [f for f in findings if bool(getattr(f, "row_cap_hit", False))]
+        if capped:
+            out.append(
+                f"On {len(capped)} of them the rows read were CAPPED, so the count below is a "
+                "floor and not a total — a larger answer would have been truncated the same "
+                "way, and neither reading changes anything above."
+            )
+        return out
+
+    @classmethod
+    def _inquiry_lines(cls, finding):
+        """One open question: headline plus indented provenance. Every field is optional."""
+        question = str(getattr(finding, "question", "") or "").strip()
+        qid = str(getattr(finding, "id", "") or "").strip()
+        head = f"  ?> {question or qid or '(question not stated)'}"
+        if question and qid:
+            head += f" [{qid}]"
+        out = [head]
+        entity = str(getattr(finding, "scope_entity", "") or "").strip()
+        raw_values = getattr(finding, "scope_values", None)
+        values = (
+            [str(v).strip() for v in raw_values if str(v).strip()]
+            if isinstance(raw_values, list)
+            else []
+        )
+        if entity and values:
+            shown = values[: cls._INQUIRY_MAX_SCOPE_VALUES]
+            cut = cls._cut_note(len(values), len(shown), "value", compact=True)
+            out.append(
+                f"      asked about {entity} {', '.join(shown)}"
+                + (f" ({cut})" if cut else "")
+            )
+        elif entity:
+            out.append(
+                f"      would be asked about a {entity} value, and this run holds none"
+            )
+        source = str(getattr(finding, "source", "") or "").strip()
+        if source:
+            out.append(f"      the source that would answer it: {source}")
+        trigger = str(getattr(finding, "trigger", "") or "").strip()
+        if trigger:
+            out.append(f"      why it was raised: {trigger}")
+        rows = getattr(finding, "rows_matched", None)
+        if isinstance(rows, int) and not isinstance(rows, bool):
+            floor = " (a floor — the rows read were capped)" if getattr(
+                finding, "row_cap_hit", False
+            ) else ""
+            out.append(f"      rows matching it: {rows}{floor}")
+        meaning = str(getattr(finding, "meaning", "") or "").strip()
+        if meaning:
+            out.append(f"      what the procedure says that means: {meaning}")
+        gap = str(getattr(finding, "gap_reason", "") or "").strip()
+        if gap:
+            out.append(f"      why it is not settled: {gap}")
+        probe = str(getattr(finding, "probe_note", "") or "").strip()
+        if probe:
+            out.append(f"      what it cost: {probe}")
+        note = str(getattr(finding, "note", "") or "").strip()
+        if note:
+            out.append(f"      the procedure's own note on it: {note}")
+        advisory = str(getattr(finding, "advisory_note", "") or "").strip()
+        if advisory:
+            out.append(f"      provenance: {advisory}")
         return out
 
     @staticmethod

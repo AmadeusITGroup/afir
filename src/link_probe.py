@@ -19,6 +19,7 @@ from link_escalation import (
     normalise_mode,
     probe_budget,
     probe_row_cap,
+    slice_text,
 )
 from links import resettle_with_probe
 
@@ -264,7 +265,7 @@ async def run_link_probes(
         except asyncio.TimeoutError:
             note = (
                 f"a probe of '{source}' was asked and did not answer within its "
-                f"{int(slice_seconds)}s slice, so nothing was settled — the advisory budget is "
+                f"{slice_text(slice_seconds)} slice, so nothing was settled — the advisory budget is "
                 "deliberately far below the one the system of record is granted, and a source "
                 "that needs longer needs a run of that procedure instead"
             )

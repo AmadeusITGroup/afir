@@ -293,13 +293,17 @@ class LogRetrievalEngine:
                 return None
             indices = endpoints.get("indices") or []
             index = ",".join(indices) if indices else endpoints.get("index", "")
-            # `gateway: kibana` routes to KibanaRetriever (DSL) instead of ES|QL; same config shape.
+            # `gateway` routes to KibanaRetriever (Query DSL) instead of ES|QL, and picks how
+            # that retriever addresses the cluster: `kibana` through the Discover proxy,
+            # `node` straight at a data node. Same config shape for all three.
+            gateway = creds.get("gateway")
             retriever_type = (
-                "kibana" if creds.get("gateway") == "kibana" else "elasticsearch"
+                "kibana" if gateway in ("kibana", "node") else "elasticsearch"
             )
             return {
                 "name": src.name,
                 "type": retriever_type,
+                "gateway": gateway,
                 "url": creds["url"],
                 "username": creds.get("username"),
                 "password": creds.get("password"),

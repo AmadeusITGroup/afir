@@ -395,6 +395,155 @@ async def test_a_retired_loop_does_not_publish_over_the_current_one():
     assert job.status == JobStatus.CANCELLED, "a retired loop revived the job"
 
 
+def _peak_counter():
+    """A stage body that records the highest number of its own invocations in flight."""
+    state = {"live": 0, "peak": 0, "starts": 0}
+    return state
+
+
+async def test_retry_stage_stops_a_loop_live_on_ANOTHER_stage_first():
+    """A rewind must stop whatever loop is live, not only one sitting on the target.
+
+    `_run_gen` retires a stale loop at a stage BOUNDARY, so a second loop started beside one
+    that is mid-stage shares `job.context`, `job.current_stage` and `current_pass` until the
+    first returns. The guard tested only whether the live loop was on the target stage, so
+    rewinding to an EARLIER stage fell through and added that second loop.
+    """
+    s1 = _peak_counter()
+    s2 = _peak_counter()
+    hold = asyncio.Event()
+
+    async def stage_one(ctx):
+        s1["starts"] += 1
+        return "r1"
+
+    async def stage_two(ctx):
+        s2["starts"] += 1
+        s2["live"] += 1
+        s2["peak"] = max(s2["peak"], s2["live"])
+        try:
+            await hold.wait()
+            return "r2"
+        finally:
+            s2["live"] -= 1
+
+    stages = [
+        StageDescriptor("s1", stage_one, "o1"),
+        StageDescriptor("s2", stage_two, "o2"),
+    ]
+    jm = _emitter_with_manager(stages)
+    job = jm.create_job(_incident())
+    task = asyncio.ensure_future(jm.run_job(job))
+    for _ in range(50):
+        if job.stage_statuses.get("s2") == StageStatus.RUNNING:
+            break
+        await asyncio.sleep(0.02)
+    assert job.stage_statuses["s2"] == StageStatus.RUNNING
+    assert s1["starts"] == 1
+
+    jm.control(job.job_id, "retry_stage", "s1")
+    await asyncio.wait_for(task, timeout=2)  # the live loop unwinds
+    for _ in range(80):
+        if s1["starts"] == 2:
+            break
+        await asyncio.sleep(0.02)
+    assert s1["starts"] == 2, "the rewind never re-ran the stage"
+    assert s2["peak"] == 1, "two loops ran over one Job at once"
+    # And the operator is told which of the two it was: the live stage was not the target.
+    detail = [i for i in job.interventions if i["action"] == "retry_stage"][-1]["detail"]
+    assert "rewound" in detail, detail
+    hold.set()
+    for _ in range(80):
+        if job.status == JobStatus.COMPLETED:
+            break
+        await asyncio.sleep(0.02)
+    assert job.status == JobStatus.COMPLETED
+
+
+async def test_retry_all_stops_a_live_loop_before_clearing_the_run():
+    """`retry_all` replaces `job.stage_statuses` and empties `job.context`, so a loop still
+    inside a stage writes the OLD run's result into the fresh one — marking a stage of the
+    new run completed off work the operator asked to discard."""
+    s1 = _peak_counter()
+    hold = asyncio.Event()
+
+    async def stage_one(ctx):
+        s1["starts"] += 1
+        s1["live"] += 1
+        s1["peak"] = max(s1["peak"], s1["live"])
+        try:
+            if s1["starts"] == 1:
+                await hold.wait()
+            return f"v{s1['starts']}"
+        finally:
+            s1["live"] -= 1
+
+    stages = [StageDescriptor("s1", stage_one, "o1")]
+    jm = _emitter_with_manager(stages)
+    job = jm.create_job(_incident())
+    task = asyncio.ensure_future(jm.run_job(job))
+    for _ in range(50):
+        if s1["starts"]:
+            break
+        await asyncio.sleep(0.02)
+
+    jm.control(job.job_id, "retry_all")
+    await asyncio.wait_for(task, timeout=2)
+    for _ in range(80):
+        if job.status == JobStatus.COMPLETED:
+            break
+        await asyncio.sleep(0.02)
+    assert job.status == JobStatus.COMPLETED
+    assert s1["peak"] == 1, "the discarded run was still in flight over the fresh one"
+    assert job.context.outputs.get("o1") == "v2", job.context.outputs
+    hold.set()
+
+
+async def test_skip_stage_stops_a_loop_live_on_ANOTHER_stage_first():
+    """The third of the same shape: `skip_stage` restarts from `index + 1`, so skipping a
+    stage the run has already moved PAST adds a loop beside the live one — and the stage it
+    restarts into is the one already in flight."""
+    s2 = _peak_counter()
+    hold = asyncio.Event()
+
+    async def stage_one(ctx):
+        return "r1"
+
+    async def stage_two(ctx):
+        s2["starts"] += 1
+        s2["live"] += 1
+        s2["peak"] = max(s2["peak"], s2["live"])
+        try:
+            if s2["starts"] == 1:
+                await hold.wait()
+            return "r2"
+        finally:
+            s2["live"] -= 1
+
+    stages = [
+        StageDescriptor("s1", stage_one, "o1"),
+        StageDescriptor("s2", stage_two, "o2"),
+    ]
+    jm = _emitter_with_manager(stages)
+    job = jm.create_job(_incident())
+    task = asyncio.ensure_future(jm.run_job(job))
+    for _ in range(50):
+        if job.stage_statuses.get("s2") == StageStatus.RUNNING:
+            break
+        await asyncio.sleep(0.02)
+    assert job.stage_statuses["s1"] == StageStatus.COMPLETED
+
+    jm.control(job.job_id, "skip_stage", "s1")
+    await asyncio.wait_for(task, timeout=2)
+    for _ in range(80):
+        if job.status == JobStatus.COMPLETED:
+            break
+        await asyncio.sleep(0.02)
+    assert job.status == JobStatus.COMPLETED
+    assert s2["peak"] == 1, "two loops ran over one Job at once"
+    hold.set()
+
+
 # --- pause / step ----------------------------------------------------------
 
 
@@ -1640,6 +1789,33 @@ async def test_process_incident_via_job_return_job():
     assert "report_generation" in job.stage_durations
 
 
+def test_the_run_records_which_narration_path_correlation_took():
+    """The health scorer exempts the deterministic path, so the fact has to reach the run.
+
+    Recorded per run rather than read off the module: the correlation module is shared across
+    jobs, so its attribute holds whichever run finished most recently. Both facts ride the
+    same call, and either one missing must not drop the other.
+    """
+    from src.pipeline_runner import _record_procedure_selection
+
+    ctx = SimpleNamespace(stage_facts={})
+    _record_procedure_selection(ctx, SimpleNamespace(last_narration="deterministic"))
+    assert ctx.stage_facts["correlation"]["narration"] == "deterministic"
+    assert "procedure_selection" not in ctx.stage_facts["correlation"]
+
+    basis = MagicMock()
+    basis.to_dict.return_value = {"basis": "scored"}
+    _record_procedure_selection(
+        ctx, SimpleNamespace(last_narration="llm", last_selection=basis)
+    )
+    assert ctx.stage_facts["correlation"]["narration"] == "llm"
+    assert ctx.stage_facts["correlation"]["procedure_selection"] == {"basis": "scored"}
+
+    # An unrecorded path leaves what was there rather than writing an empty claim.
+    _record_procedure_selection(ctx, SimpleNamespace(last_narration=""))
+    assert ctx.stage_facts["correlation"]["narration"] == "llm"
+
+
 # --- stage health riding a real run (Phase A: scoring only, no gating) ------
 
 
@@ -1938,9 +2114,9 @@ async def test_log_retrieval_records_per_source_outcomes_for_the_scorer():
             extended=False,
             keyed_out=None,
             queries_out=None,
-            # The real signature, including the out-parameter this test does not read — see
-            # tests/CLAUDE.md: the stage passes all of them, and an unexpected-kwarg
-            # `TypeError` here surfaces as a retrieval failure with the cause in a log line.
+            # The real signature, including the out-parameter this test does not read: the
+            # stage passes all of them, and an unexpected-kwarg `TypeError` here surfaces
+            # as a retrieval failure with the cause in a log line.
             unanswered_out=None,
         ):
             progress_cb("ok", "completed", "2 rows")

@@ -175,6 +175,7 @@ const SUBVIEWS = {
     { key:"form", kind:"view", group:"cfgview" },
     { key:"raw",  kind:"view", group:"cfgview" },
     { key:"io",   kind:"view", group:"cfgview" },
+    { key:"creds", kind:"view", group:"cfgview" },
   ],
   knowledge: [
     { key:"files",   kind:"view", group:"pkview" },
@@ -293,6 +294,11 @@ function rememberedTab(){
    that was most of the Run-controls button row. Measured from the rail element rather
    than from --rail-w, because at the overlay breakpoint the rail is translated off-screen
    and its own rect is the only thing that knows that. */
+/* ONE list of them, because four places ask "which pops exist" — close-all, outside-click,
+   the drag wiring and the resize re-anchor — and a pop missing from any of them is a panel
+   that cannot be dismissed, cannot be moved, or survives the click that opened the next one.
+   Declared here rather than in script_tabs so it is evaluated before any listener reads it. */
+const POPS = ["jobsPop","ctlPop","idPop"];
 function popLeftBound(){
   const rail = document.querySelector(".rail");
   if(!rail) return 8;
@@ -403,7 +409,10 @@ function openPop(id, trigger){
   if(first) first.focus();
 }
 function popTrigger(id){
-  return id === "ctlPop" ? el("jobtag") : (id === "jobsPop" ? el("jobsToggle") : null);
+  if(id === "ctlPop") return el("jobtag");
+  if(id === "jobsPop") return el("jobsToggle");
+  if(id === "idPop") return el("idBtn");
+  return null;
 }
 function closePop(id){
   const pop = el(id);
@@ -423,7 +432,7 @@ function closePop(id){
   }
 }
 function closeAllPops(except){
-  ["jobsPop","ctlPop"].forEach(id => { if(id !== except) closePop(id); });
+  POPS.forEach(id => { if(id !== except) closePop(id); });
 }
 function togglePop(id, trigger){
   const pop = el(id);
@@ -510,13 +519,15 @@ function toggleRail(){
 function closeRailOverlay(){ if(railState() === "open") setRail("collapsed"); }
 
 /* ---------- service indicator ---------- */
-/* Bare /health only proves the page you are already looking at was served. THREE FAILURES
+/* Bare /health only proves the page you are already looking at was served. FOUR FAILURES
    COST A RUN WITHOUT FAILING IT, and every one of them is announced only in a container log
    the operator cannot read: an empty LLM credential (all six LLM stages 401), a durable
    store that refuses every write (the run completes and its approvals vanish on the next
-   restart), and declared sources that built no retriever (the stage reports success and the
-   verdict comes back INSUFFICIENT DATA — measured once at 18 of 30 sources, every ELK one).
-   ?deep=1 asks all three; the bare probe stays untouched for the platform.
+   restart), declared sources that built no retriever (the stage reports success and the
+   verdict comes back INSUFFICIENT DATA — measured once at 18 of 30 sources, every ELK one),
+   and a knowledge pack that loaded EMPTY, which is the widest of them: a pack_dir absent
+   from the deployed tree costs the glossary, the catalog and every ruleset at once.
+   ?deep=1 asks all four; the bare probe stays untouched for the platform.
 
    They are collected rather than ranked, because a deployment that is missing credentials
    is usually missing more than one and fixing the first would otherwise just reveal the
@@ -535,6 +546,12 @@ async function pollHealth(){
       labels.push("no LLM key");
       why.push("No LLM credential resolved — every LLM stage will fail with 401. Check the "
         + "env var named by llm_config's api_key_env.");
+    }
+    if(d.pack === false){
+      labels.push("no pack");
+      why.push("The knowledge pack loaded empty" + (d.pack_detail ? " (" + d.pack_detail + ")" : "")
+        + ". Nothing names a source to retrieve, so a run reaches a report with every "
+        + "condition `unknown`. Check knowledge.pack_dir against the directories that shipped.");
     }
     if(d.storage_ok === false){
       labels.push("storage");
@@ -1356,6 +1373,19 @@ const LINK_STATE_LABEL = {
    words and not two. Kept in the server's order (`src/link_escalation.py` LINK_MODES) because the
    order is the ladder — least spent first — and a picker that listed `auto` first would make the
    most expensive setting the easiest to hit. */
+/* The five states of the OTHER advisory lane: not "does another procedure apply" but "what could
+   THIS procedure not settle". Five rather than two for the reason the four above are four, and one
+   extra distinction on top: a question that was ASKED and came back empty, and one whose source did
+   not answer at all, are the same silence on this page unless they are labelled apart — and only the
+   second is fixed by a credential. Vocabulary is the server's (`src/inquiry.py` INQUIRY_STATES);
+   an unknown state renders under its own raw name. */
+const INQUIRY_STATE_LABEL = {
+  answered:   "asked and answered",
+  not_asked:  "still open",
+  empty:      "asked, the source had nothing",
+  unanswered: "asked, the source did not answer",
+  unreachable: "not askable from this evidence"
+};
 const LINK_MODES = ["planned", "semi_auto", "auto"];
 const LINK_MODE_LABEL = {
   planned:   "propose only — a human executes",
@@ -1707,6 +1737,78 @@ function linkCards(s){
     + '</div>' + shownOf(ls.length, s.link_count);
 }
 
+/* One open question. Reuses the link card's chrome (`.lnk`) deliberately: both lanes are advisory
+   and a second card style would say they differ in standing, when they differ only in what they ask
+   about. No mode control and no button — there is nothing to escalate here, only something to go and
+   look at. */
+function inquiryCard(f){
+  const st = String(f.state || "unspecified");
+  const lbl = INQUIRY_STATE_LABEL[st] || st.replace(/_/g, " ");
+  let h = '<div class="lnk inq"><div class="hd">'
+    + '<span class="tgt">' + esc(f.question || f.id || "(question not stated)") + '</span>'
+    + '<span class="st s-' + esc(st) + '">' + esc(lbl) + '</span></div>';
+  /* The scope is what the question would be PUT to, so an empty one is the whole reason a question
+     is unreachable — and naming the entity type says which value the run is missing. */
+  const vals = f.scope_values || [];
+  if(f.scope_entity){
+    h += '<div class="ll">about <b>' + esc(f.scope_entity) + '</b> '
+      + (vals.length ? esc(vals.join(", ")) : "&mdash; and this run holds no value of it")
+      + '</div>' + shownOf(vals.length, f.scope_value_count);
+  }
+  if(f.source) h += '<div class="ll">would be answered by <b>' + esc(f.source) + '</b></div>';
+  if(f.trigger) h += '<div class="ll">raised because ' + esc(f.trigger) + '</div>';
+  /* The count and the MEANING together, never the count alone: a number with no declared meaning is
+     the failure this lane exists to avoid, and a capped count is a floor rather than a total. */
+  if(f.state === "answered" || f.state === "empty"){
+    h += '<div class="ll">rows matching it <b>' + (f.rows_matched || 0) + '</b>'
+      + (f.row_cap_hit ? ' &mdash; capped, so a floor and not a total' : "") + '</div>';
+  }
+  if(f.meaning) h += '<div class="ll">the procedure says that means: ' + esc(f.meaning) + '</div>';
+  if(f.gap_reason) h += '<div class="ll">' + esc(f.gap_reason) + '</div>';
+  if(f.note) h += '<div class="ll">' + esc(f.note) + '</div>';
+  return h + inquiryProbeLine(f) + '</div>';
+}
+/* What this question COST, as a fact separate from what it SETTLED — the five states above cannot
+   say either thing. A question answered with `probe_spent` false was settled from rows this run
+   already held, which is the cheap half of the whole lane and reads as a spend unless it is stated;
+   a question left open with no probe spent is one an operator can still authorise. Silent when
+   neither field is set, so a pack declaring nothing renders exactly as before. */
+function inquiryProbeLine(f){
+  const spent = !!f.probe_spent;
+  const note = f.probe_note || "";
+  if(!spent && !note) return "";
+  let h = '<div class="ll lprobe"><span class="hbadge' + (spent ? "" : " low") + '">'
+    + (spent ? "one query spent" : "no query spent") + '</span></div>';
+  /* The server's sentence rides verbatim: it carries which of the three answers came back, and a
+     sentence composed here from a boolean would be a second answer to what the query found. */
+  if(note) h += '<div class="ll lnote">' + esc(note) + '</div>';
+  return h;
+}
+function inquiryCards(s){
+  const qs = (s && Array.isArray(s.inquiries)) ? s.inquiries : [];
+  if(!qs.length) return "";
+  return '<h4>Open questions this procedure left</h4>'
+    + '<div class="advisory"><div class="lane">advisory &mdash; not part of the verdict</div>'
+    + '<div class="why">Questions the adjudicating procedure declared about its OWN evidence. '
+    + 'Nothing below was read by any condition, and none of it moved the verdict, its severity or '
+    + 'the stage health of this run. An answer here is a reading against a meaning the procedure '
+    + 'wrote down in advance; a question that stayed open is not a negative finding.</div>'
+    + qs.map(inquiryCard).join("")
+    + '</div>' + shownOf(qs.length, s.inquiry_count);
+}
+
+/* The one thing a reader cannot see anywhere else on this page: which procedure adjudicated, and
+   whether anything chose it. Renders nothing whenever something did — so on every run of a pack
+   that discriminates, this function is invisible. The server's sentence rides verbatim (it names
+   the zero-scoring rivals and the `pinned_use_case` remedy) rather than being rebuilt here: a
+   second copy of the explanation is a second answer to what went wrong. */
+function unselectedProcedureNotice(s){
+  const why = (s && s.procedure_unselected) || "";
+  if(!why) return "";
+  return '<div class="unsel"><div class="lane">procedure not selected</div>'
+    + '<div class="why">' + esc(why) + '</div></div>';
+}
+
 const DETAIL = {
   understanding(s){
     let h = '<div class="grid">';
@@ -1809,7 +1911,7 @@ const DETAIL = {
 
   correlation(s){
     if(s.skipped) return '<div class="empty">Correlation stage skipped (module not configured).</div>';
-    let h = '<div class="grid">'+
+    let h = unselectedProcedureNotice(s) + '<div class="grid">'+
       stat("Records", s.record_count!=null?s.record_count:"—", true)+
       stat("Resolved keys", s.resolved_key_count!=null?s.resolved_key_count:(s.resolved_correlation_keys||[]).length)+
       stat("Discovered keys", s.discovered_key_count!=null?s.discovered_key_count:(s.discovered_join_keys||[]).length)+
@@ -1851,6 +1953,9 @@ const DETAIL = {
     /* Last, and inside its own frame: everything above is this run's own evidence, and a
        candidate for another procedure is not. A run that found none renders nothing at all. */
     h += linkCards(s);
+    /* And after it, the same posture on the other axis: what THIS procedure could not settle. Last
+       because it is the only part of the card a reader may act on rather than rely on. */
+    h += inquiryCards(s);
     return h;
   },
 
@@ -2371,8 +2476,9 @@ async function attachTo(id){
     subscribe();
     pollInbox();
   } catch(e){
-    /* A terminal job is pruned after an hour, so a remembered id legitimately stops
-       resolving. Forget it here rather than leave a chip pointing at nothing. */
+    /* A remembered id legitimately stops resolving — the server rehydrates a pruned run
+       from the store, but not one past `jobs.retention_days` or from a store that is gone.
+       Forget it here rather than leave a chip pointing at nothing. */
     forgetJob();
     setText("status", "error: " + e.message);
   }
@@ -2410,7 +2516,8 @@ function renderJobs(rows){
     return;
   }
   el("jobsRows").innerHTML = '<table class="tbl"><thead><tr><th>Job</th><th>Incident</th>'
-    + '<th>Status</th><th>Mode</th><th>Stage</th><th>Started</th><th></th></tr></thead><tbody>'
+    + '<th>Status</th><th>Who</th><th>Mode</th><th>Stage</th><th>Started</th><th></th></tr>'
+    + '</thead><tbody>'
     + list.map(r => '<tr'+(r.job_id===jobId?' style="background:var(--row-attached)"':'')+'>'
         + '<td class="mono">'+esc((r.job_id||"").slice(0,8))+'</td>'
         + '<td class="mono">'+esc(r.incident_id||"")+'</td>'
@@ -2418,7 +2525,15 @@ function renderJobs(rows){
         /* The position is the only thing an operator can act on for a run that has not
            started: "queued" alone does not say whether it is next or three hours out. */
         + (r.queue_position ? ' <span class="mono">#'+esc(r.queue_position)+'</span>' : '')
+        /* `live:false` is a run answered from the store, not a missing one. Marked because
+           attaching to it is the same click and an operator comparing two finished rows
+           would otherwise read the difference as an inconsistency. */
+        + (r.live === false ? ' <span class="hbadge low" title="answered from the store,'
+            + ' no longer held in memory">archived</span>' : '')
         + '</td>'
+        /* Who asked for the run. The whole point of the column: on a shared deployment a
+           list of job ids says nothing about who is using it. */
+        + '<td class="mono" title="'+esc(r.owner||"")+'">'+esc(r.owner_name||r.owner||"—")+'</td>'
         + '<td class="mono">'+esc(r.run_mode||"")+'</td>'
         + '<td>'+esc(NAME[r.awaiting_stage||r.current_stage]||r.awaiting_stage||r.current_stage||"—")
         + (r.awaiting_stage ? ' <span class="hbadge low">needs you</span>' : '')+'</td>'

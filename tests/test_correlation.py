@@ -8658,6 +8658,176 @@ def test_an_empty_answer_is_still_an_answer_and_keeps_its_own_wording():
     assert "NOT QUERIED" not in (_comp_check(v).detail or "")
 
 
+# --- a source that answered, about somebody else --------------------------------
+# The fourth state, and the one the three above cannot express. A source answered, with rows,
+# and none of them is THIS subject's: the check reads `unknown` in the wording reserved for a
+# field the projection did not return, so the operator is sent to fix the projection when the
+# remedy is the retrieval scope. Every evaluator reads `src_rows.get(logical, [])`, which is
+# already narrowed per subject, so the distinction exists in the engine and only in the engine.
+
+
+def _absent_subject_spec():
+    return {
+        "key": "roster_case",
+        "title": "Roster check",
+        "subject_entity": "record",
+        "subject_field": "rec",
+        "sources": {"roster": "roster_src"},
+        "conditions": [
+            {
+                "id": "flagged",
+                "label": "The record carries the marker",
+                "kind": "field_flag",
+                "source": "roster",
+                "flag_fields": ["marker"],
+                "expected": True,
+            }
+        ],
+    }
+
+
+class _TwoRecords:
+    def __init__(self, records=("SUBJ03", "SUBJ99")):
+        self.extracted_entities = [
+            ExtractedEntity(type="record", value=r) for r in records
+        ]
+
+
+def _absent_subject_checks(logs):
+    v = evaluate_verdict(
+        _absent_subject_spec(), logs, _TwoRecords(), unanswered_sources={}
+    )
+    return {s.subject_value: s.checks[0] for s in v.subjects}
+
+
+def test_a_subject_absent_from_rows_that_came_back_is_not_a_missing_field():
+    """The fix, with its control in the same run.
+
+    `SUBJ99` is one of the records the incident named and no retrieved row mentions it, so its
+    check is unresolved for a reason the engine knows and was not saying: the rows came back and
+    belong to somebody else. The remedy is the scope, so the note has to name it — a reader sent
+    to the projection re-reads a declaration that is already correct.
+    """
+    checks = _absent_subject_checks({"roster_src": [{"rec": "SUBJ03", "marker": "yes"}]})
+    # The control: the subject the rows DO name resolves, so the note is not boilerplate on
+    # every condition of every multi-subject run.
+    assert checks["SUBJ03"].result == "pass", checks["SUBJ03"].detail
+    assert "NOT ONE of them names" not in (checks["SUBJ03"].detail or "")
+
+    absent = checks["SUBJ99"]
+    assert absent.result == "unknown", (absent.result, absent.detail)
+    assert "NOT ONE of them names SUBJ99" in absent.detail, absent.detail
+    assert "scope gap, not a missing field" in absent.detail, absent.detail
+    # ...and it must not borrow either neighbouring vocabulary: an operator acts differently on
+    # a source that did not answer, one nobody asked, and one that answered about other rows.
+    assert "NOT QUERIED" not in absent.detail, absent.detail
+    assert "was asked and did not answer" not in absent.detail, absent.detail
+
+
+def test_a_source_that_answered_with_nothing_is_not_reported_as_answering_about_others():
+    """The bound that makes the note true rather than merely new.
+
+    With zero rows for everybody there are no other subjects' rows to point at, and claiming
+    otherwise would describe an empty answer as a populated one — the same conflation in the
+    opposite direction. The check stays `unknown` on its own wording, which is where the pack's
+    `zero_rows` meaning speaks.
+    """
+    checks = _absent_subject_checks({"roster_src": []})
+    absent = checks["SUBJ99"]
+    assert absent.result == "unknown", (absent.result, absent.detail)
+    assert "NOT ONE of them names" not in (absent.detail or ""), absent.detail
+    assert "scope gap" not in (absent.detail or ""), absent.detail
+
+
+def test_a_subject_with_rows_of_its_own_still_reads_as_a_missing_field():
+    """The inverse direction, and the one the fix must not take away.
+
+    `SUBJ03` has a row of its own and that row carries no `marker`, so the projection note is the
+    TRUE one — this is the case the third note was written for. Both subjects here read `unknown`
+    off the same source, for opposite reasons, which is the whole distinction: telling the one
+    whose rows are present that none of them names it would be the original conflation running
+    backwards, sending an operator to widen a scope that is already right.
+    """
+    checks = _absent_subject_checks(
+        {"roster_src": [{"rec": "SUBJ03"}, {"rec": "SUBJ99", "marker": "yes"}]}
+    )
+    present = checks["SUBJ03"]
+    assert present.result == "unknown", (present.result, present.detail)
+    assert "not present in the retrieved rows" in present.detail, present.detail
+    assert "NOT ONE of them names" not in present.detail, present.detail
+    assert "scope gap" not in present.detail, present.detail
+    # And the subject whose row DOES carry the field resolves, so neither reading is a blanket
+    # property of this source on this run.
+    assert checks["SUBJ99"].result == "pass", checks["SUBJ99"].detail
+
+
+def test_a_cohort_condition_is_not_told_its_rows_are_somebody_elses():
+    """The other direction the note can be false in, and the one a live pack really declares.
+
+    `subject_scope: false` means the QUERY carried the scope, so the condition reads the source
+    whole and none of its rows naming this subject is the normal state — the rows it read are
+    real and its `unknown` is about something else entirely (here: the marker is on no row). The
+    note is a claim about the subject-narrowed rows, so it may only be stamped where those are
+    what the condition reads.
+    """
+    spec = _absent_subject_spec()
+    spec["conditions"][0]["subject_scope"] = False
+    v = evaluate_verdict(spec, {"roster_src": [{"rec": "SUBJ03"}]}, _TwoRecords())
+    absent = {s.subject_value: s.checks[0] for s in v.subjects}["SUBJ99"]
+    assert absent.result == "unknown", (absent.result, absent.detail)
+    assert "not present in the retrieved rows" in absent.detail, absent.detail
+    assert "NOT ONE of them names" not in absent.detail, absent.detail
+    assert "scope gap" not in absent.detail, absent.detail
+
+
+def test_a_cohort_composites_children_are_scoped_the_way_the_parent_is():
+    """The same rule one level down, which is a separate assertion because the flag is elsewhere.
+
+    Only the ROOT condition's `subject_scope` is read by the evaluation loop, so a child is
+    scoped the way its parent is however the child is declared — and a child's detail rolls up
+    into the parent's report line. Stamping the note per condition dict rather than inheriting it
+    would put the false claim on the one line an operator actually reads.
+    """
+    spec = _absent_subject_spec()
+    leaf = spec["conditions"][0]
+    spec["conditions"] = [
+        {
+            "id": "flagged_all",
+            "label": "Every marker requirement holds",
+            "kind": "all_of",
+            "subject_scope": False,
+            "children": [leaf],
+        }
+    ]
+    v = evaluate_verdict(spec, {"roster_src": [{"rec": "SUBJ03"}]}, _TwoRecords())
+    absent = {s.subject_value: s.checks[0] for s in v.subjects}["SUBJ99"]
+    assert absent.result == "unknown", (absent.result, absent.detail)
+    assert "NOT ONE of them names" not in absent.detail, absent.detail
+
+
+def test_a_source_that_never_answered_keeps_its_own_note_over_the_absent_subject_one():
+    """Precedence, asserted rather than inferred from the branch order.
+
+    A subject absent from rows that arrived and a subject whose source never answered are both
+    `unknown` with no rows for this subject, and only the first is a scope question. The second
+    is the more specific fact and states a different remedy, so it wins.
+    """
+    spec = _absent_subject_spec()
+    # A second source that DID answer, or `logical_to_real` is empty and there is no verdict to
+    # read at all — a run where nothing answered is a different case from the one under test.
+    spec["sources"]["other"] = "other_src"
+    v = evaluate_verdict(
+        spec,
+        {"other_src": [{"rec": "SUBJ03"}]},
+        _TwoRecords(),
+        unanswered_sources={"roster_src": "timed out"},
+    )
+    absent = {s.subject_value: s.checks[0] for s in v.subjects}["SUBJ99"]
+    assert absent.result == "unknown", (absent.result, absent.detail)
+    assert "was asked and did not answer" in absent.detail, absent.detail
+    assert "NOT ONE of them names" not in absent.detail, absent.detail
+
+
 def test_a_non_answer_never_overwrites_the_narrowing_note_that_ran():
     """A note about rows that DID come back is the more specific of the two, so a source
     that answered keeps its own note even while a sibling is reported unanswered."""

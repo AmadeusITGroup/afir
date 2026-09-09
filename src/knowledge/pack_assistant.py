@@ -35,9 +35,12 @@ from pydantic import BaseModel, Field
 from src.knowledge import (
     pack_attachments,
     pack_dry_run,
+    pack_probe,
+    pack_selection_delta,
     pack_skills,
     pack_store,
     pack_validate,
+    pack_verdict_delta,
 )
 
 logger = logging.getLogger(__name__)
@@ -59,6 +62,32 @@ MAX_SEARCH_HITS = 40
 
 #: Files ``list_files`` returns at most.
 MAX_LIST_FILES = 400
+
+#: Live measurements one authoring session may run against a real backend. Armed but narrow
+#: rather than 0: a bound shipped disarmed is a bound nobody has exercised, and every refusal
+#: path in :class:`ProbeLane` would then be unreachable outside a test. Config:
+#: ``knowledge.assistant_probes``, where 0 disables the lane outright.
+MAX_PROBES = 4
+
+#: Rows one probe may bring back. These are context the model pays for, and
+#: :func:`pack_probe.render` states when it cut — a silently truncated bucket list reads as
+#: the whole distribution, which is the measurement error this lane exists to prevent.
+PROBE_ROW_CAP = 40
+
+#: Wall clock one probe may spend, and the reason the lane needs a bound of its own: a
+#: retriever's configured timeout is a PIPELINE budget — a ``primary`` source is deliberately
+#: allowed two hours — and an authoring turn inheriting that hangs with nothing to show.
+PROBE_TIMEOUT_SECONDS = 30.0
+
+#: What a probe that did not happen must say. The one thing it must never do is degrade to a
+#: number: an unmeasured value written into a declaration is indistinguishable from a measured
+#: one, so the fallback is the behaviour that predates this lane — write the measurement down
+#: as a question for a human to run.
+_PROBE_DEGRADE = (
+    "No measurement was taken. Do NOT write a value you have not measured: put the "
+    "measurement you wanted in the plan's `questions` for a human to run, and propose the "
+    "declaration without the number."
+)
 
 #: Live sessions kept. A plan is only meaningful against the snapshot it was computed
 #: from, so there is nothing to gain from keeping more.
@@ -158,6 +187,11 @@ class AssistSession:
     #: plan written with the probe-before-declare rules in front of the model and one written
     #: without them are different artifacts, and the diff does not say which this is.
     skills: List[Dict[str, Any]] = field(default_factory=list)
+    #: Every live measurement this session took, in full. On the snapshot beside `trail`
+    #: rather than inside it, because a trail entry keeps 400 characters and the provenance of
+    #: a number written into a declaration is the whole result: a threshold whose measurement
+    #: is not on the artifact is indistinguishable from one the model liked the look of.
+    probes: List[Dict[str, Any]] = field(default_factory=list)
     #: The rendered skill block. Held so the images probe can rebuild the opening turn without
     #: re-selecting (selection is pure, but its note must be emitted exactly once).
     skill_text: str = field(default="", repr=False)
@@ -179,6 +213,7 @@ class AssistSession:
             "tool_bytes": self.tool_bytes,
             "budget_spent": self.budget_spent,
             "skills": list(self.skills),
+            "probes": list(self.probes),
             "error": self.error,
             "trail": list(self.trail),
             "plan": self.plan.model_dump() if self.plan else None,
@@ -283,9 +318,12 @@ _TERMINAL = ("proposed", "failed", "applied", "rejected")
 def _tool_schemas() -> List[Dict[str, Any]]:
     """The read-only tools, as OpenAI-compatible function definitions.
 
-    Six read the pack and one reads the method library. All seven read: the guarantee that
-    nothing reaches disk until a human approves the plan is a fact about this list, so a tool
-    added here must be incapable of writing.
+    Six read the pack, one reads the method library, and one reads a live source. All eight
+    READ: the guarantee that nothing reaches disk until a human approves the plan is a fact
+    about this list, so a tool added here must be incapable of writing. ``probe`` is the one
+    that leaves the machine, which is why its own read-only guard is structural
+    (:func:`pack_probe._read_only_reason`) rather than a sentence in its description — a
+    prompt instruction cannot be relied on to beat another prompt instruction.
     """
     return [
         {
@@ -392,6 +430,81 @@ def _tool_schemas() -> List[Dict[str, Any]]:
                             ),
                         }
                     },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "probe",
+                "description": (
+                    "MEASURE a live source, read-only. This is how a number gets into a "
+                    "declaration honestly: a threshold, a base rate, which precision a "
+                    "column stores, whether a leaf is in the ROW as well as the schema. "
+                    "Start with op='sources' — it also names the declared sources that "
+                    "built no retriever, which is what a probe 'finding nothing' usually "
+                    "means. The budget is a handful of measurements for the whole session, "
+                    "so spend it on the value you are about to write down. If a probe is "
+                    "refused, fails or times out, that is NOT a zero: put the measurement "
+                    "in the plan's `questions` and propose without the number."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "op": {
+                            "type": "string",
+                            "enum": sorted(_PROBE_OPS),
+                            "description": (
+                                "sources = what is reachable and in which language; "
+                                "leaves = the paths a sampled ROW carries; count = rows; "
+                                "population = total/not-null/not-blank/distinct for one "
+                                "column (a column that is 100% non-null and 100% blank "
+                                "reads as populated to any single question); values = the "
+                                "commonest values, where a notation is read rather than "
+                                "guessed; spread = the value LENGTHS, which is the form "
+                                "question; selectivity = a predicate's base rate against "
+                                "its own control; pair = whether two predicates hold of "
+                                "the SAME rows, all four cells; cost = elapsed against the "
+                                "source's configured budget; sql/dsl = one read you wrote."
+                            ),
+                        },
+                        "source": {
+                            "type": "string",
+                            "description": "a source name from op='sources'",
+                        },
+                        "table": {
+                            "type": "string",
+                            "description": "the target named in op='sources'",
+                        },
+                        "column": {"type": "string"},
+                        "where": {
+                            "type": "string",
+                            "description": (
+                                "an optional predicate in the source's OWN language, "
+                                "narrowing every part of the measurement including the "
+                                "control"
+                            ),
+                        },
+                        "predicate": {
+                            "type": "string",
+                            "description": "selectivity: the predicate being measured",
+                        },
+                        "left": {"type": "string", "description": "pair: one predicate"},
+                        "right": {"type": "string", "description": "pair: the other"},
+                        "top": {"type": "integer"},
+                        "statement": {
+                            "type": "string",
+                            "description": (
+                                "sql: one read statement. A write verb or a ';'-chain is "
+                                "refused outright, never rewritten."
+                            ),
+                        },
+                        "body": {
+                            "type": "string",
+                            "description": "dsl: one query body, as JSON",
+                        },
+                    },
+                    "required": ["op"],
                 },
             },
         },
@@ -604,6 +717,285 @@ def _tool_dry_run(pack: str, args: Dict[str, Any]) -> str:
     return pack_dry_run.render(report)
 
 
+#: The lane's own ops, mapped to what each needs beyond ``source``. A closed set for the same
+#: reason the tool list is: the guarantee is membership, not a screen. ``sources`` is first
+#: because it is the only one that answers "what can be asked at all", including which declared
+#: sources built no retriever — which is what a probe "finding nothing" usually means.
+_PROBE_OPS: Dict[str, Tuple[str, ...]] = {
+    "sources": (),
+    "leaves": ("table",),
+    "count": ("table",),
+    "population": ("table", "column"),
+    "values": ("table", "column"),
+    "spread": ("table", "column"),
+    "cost": ("table",),
+    "selectivity": ("table", "predicate"),
+    "pair": ("table", "left", "right"),
+    "sql": ("statement",),
+    "dsl": ("body",),
+}
+
+
+class ProbeLane:
+    """The budgeted, model-facing lane onto :class:`pack_probe.Probe`.
+
+    The copilot's method skills say *probe before you declare*, and until this existed the
+    model could not: it could only write the measurement down as a `questions` entry for a
+    human to run later, so the loop that turns a guess into a number never closed inside the
+    session. Four bounds, and each one exists because of a failure this repo has already paid
+    for:
+
+    * **Read-only is checked twice, at this seam and again inside ``ask``.** Not because one
+      check is unreliable, but because the first one costs nothing: a refused statement must
+      not open a connection or spend a probe, so a model hunting for a write path is answered
+      instantly and still has its whole budget to do the real work with.
+    * **A wall clock of its own.** A retriever's configured timeout is a PIPELINE budget — a
+      ``primary`` source is deliberately allowed two hours — and a session inheriting that
+      hangs one authoring turn for the whole afternoon with nothing to show.
+    * **A row cap, stated.** Rows here are context the model pays for, and a silently cut list
+      reads as the whole answer; :func:`pack_probe.render` says when it cut.
+    * **Every probe is recorded**, so the preview can show what was measured to justify a
+      line. A number in a proposed declaration whose provenance is not on the snapshot is
+      indistinguishable from a number the model liked the look of.
+
+    The engine is opened LAZILY, on the first probe that gets past its checks. A session that
+    never probes — every session today — builds no retriever, reaches no backend, and is
+    byte-identical to one running without this lane at all.
+    """
+
+    def __init__(
+        self,
+        pack: str,
+        *,
+        config: Optional[Dict[str, Any]] = None,
+        max_probes: Optional[int] = None,
+        row_cap: Optional[int] = None,
+        timeout_s: Optional[float] = None,
+        opener: Optional[Any] = None,
+    ):
+        self.pack = pack
+        self._config = config
+        self._opener = opener or pack_probe.Probe.open
+        self._probe = None
+        self._open_error = ""
+        self.spent = 0
+        self.records: List[Dict[str, Any]] = []
+        settings = self._settings()
+        self.max_probes = _first_int(max_probes, settings.get("probes"), MAX_PROBES)
+        self.row_cap = _first_int(row_cap, settings.get("row_cap"), PROBE_ROW_CAP)
+        self.timeout_s = float(
+            _first_number(
+                timeout_s, settings.get("timeout_seconds"), PROBE_TIMEOUT_SECONDS
+            )
+        )
+
+    def _settings(self) -> Dict[str, Any]:
+        """The three bounds as configured, or nothing at all.
+
+        A config that cannot be read is not a reason to fall back to a bigger bound than the
+        operator chose, so every failure here lands on the module defaults, which are the
+        narrow ones.
+        """
+        cfg = self._config
+        if cfg is None:
+            try:
+                cfg = pack_probe.load_main_config()
+            except Exception as exc:  # noqa: BLE001 — a missing config is a default, not a stop
+                logger.info("probe lane using default bounds (%s)", exc)
+                cfg = {}
+            self._config = cfg
+        knowledge = (cfg or {}).get("knowledge") or {}
+        return {
+            "probes": knowledge.get("assistant_probes"),
+            "row_cap": knowledge.get("assistant_probe_row_cap"),
+            "timeout_seconds": knowledge.get("assistant_probe_timeout_seconds"),
+        }
+
+    @property
+    def enabled(self) -> bool:
+        return self.max_probes > 0
+
+    @property
+    def remaining(self) -> int:
+        return max(0, self.max_probes - self.spent)
+
+    # ------------------------------------------------------------------ the tool call
+
+    async def run(self, args: Dict[str, Any]) -> str:
+        """Answer one ``probe`` call as text. Never raises; every failure is a result.
+
+        The order of the checks is the design: everything that can be decided without a
+        backend is decided first, so the only calls that spend budget are the ones that
+        actually asked a source something.
+        """
+        if not self.enabled:
+            return (
+                "probe is disabled on this deployment (knowledge.assistant_probes is 0). "
+                + _PROBE_DEGRADE
+            )
+        op = str(args.get("op") or "").strip().lower()
+        if op not in _PROBE_OPS:
+            return (
+                f"there is no probe op called {op!r}. The ops are: "
+                + ", ".join(sorted(_PROBE_OPS))
+            )
+        source = str(args.get("source") or "").strip()
+        if op != "sources" and not source:
+            return f"probe {op} needs a 'source' — call probe with op='sources' to see them"
+        missing = [k for k in _PROBE_OPS[op] if not str(args.get(k) or "").strip()]
+        if missing:
+            return f"probe {op} also needs: {', '.join(missing)}"
+        if op == "sql":
+            reason = pack_probe._read_only_reason(str(args.get("statement") or ""))
+            if reason:
+                # Refused before the engine is even opened, and it costs no budget: this is
+                # the one refusal the model is most likely to trip over by accident.
+                return f"probe refused that statement: {reason}. This lane can only read."
+        if op != "sources" and not self.remaining:
+            return (
+                f"the probe budget for this session is spent ({self.max_probes} "
+                f"measurement(s)). " + _PROBE_DEGRADE
+            )
+
+        probe = await self._ensure_open()
+        if probe is None:
+            return f"probe is unavailable: {self._open_error}. " + _PROBE_DEGRADE
+        if op == "sources":
+            return self._render_sources(probe)
+
+        self.spent += 1
+        started = time.monotonic()
+        try:
+            result = await asyncio.wait_for(
+                self._dispatch(probe, op, source, args), timeout=self.timeout_s
+            )
+            text = pack_probe.render(result, max_rows=self.row_cap)
+        except asyncio.TimeoutError:
+            text = (
+                f"probe {op} on '{source}' did not finish inside this lane's "
+                f"{self.timeout_s:.0f}s bound. This is NOT an empty result — nothing is "
+                "known about the data either way, and the source's own pipeline timeout is "
+                "larger, so a real run may well succeed where this did not."
+            )
+        except pack_probe.Unsupported as exc:
+            text = f"probe {op} cannot be expressed faithfully on '{source}': {exc}"
+        except Exception as exc:  # noqa: BLE001 — a probe fault is a measurement result
+            logger.warning("probe %s on %s/%s failed: %s", op, self.pack, source, exc)
+            text = (
+                f"probe {op} on '{source}' FAILED ({type(exc).__name__}: {exc}) — a "
+                "non-answer, not an empty result."
+            )
+        self.records.append(
+            {
+                "op": op,
+                "source": source,
+                "args": {k: v for k, v in (args or {}).items() if k != "op"},
+                "elapsed_s": round(time.monotonic() - started, 2),
+                "result": text[:2000],
+            }
+        )
+        return text + f"\n[probe {self.spent} of {self.max_probes} for this session]"
+
+    async def _dispatch(self, probe, op: str, source: str, args: Dict[str, Any]) -> Any:
+        table = str(args.get("table") or "")
+        column = str(args.get("column") or "")
+        where = args.get("where") or None
+        top = _first_int(args.get("top"), None, pack_probe.TOP_VALUES)
+        if op == "leaves":
+            return await probe.leaves(source, table)
+        if op == "count":
+            return await probe.count(source, table, where)
+        if op == "population":
+            return await probe.population(source, table, column, where)
+        if op == "values":
+            return await probe.values(source, table, column, top, where)
+        if op == "spread":
+            return await probe.spread(source, table, column, top, where)
+        if op == "cost":
+            return await probe.cost(source, table, where)
+        if op == "selectivity":
+            return await probe.selectivity(source, table, args.get("predicate"), where)
+        if op == "pair":
+            return await probe.pair(
+                source, table, args.get("left"), args.get("right"), where
+            )
+        if op == "sql":
+            return await probe.sql(source, str(args.get("statement") or ""))
+        return await probe.dsl(source, _probe_body(args.get("body")))
+
+    @staticmethod
+    def _render_sources(probe) -> str:
+        lines = []
+        for name, language in sorted(probe.sources().items()):
+            targets = probe.tables(name) or "(you must name a table)"
+            lines.append(f"  {name}: {language}  targets={targets}")
+        for name, why in sorted(probe.unavailable().items()):
+            # A declared source that built no retriever cannot answer, and that is a fact
+            # about the deployment rather than about the data. Named here because it is the
+            # first thing to check when a probe comes back with nothing.
+            lines.append(f"  {name}: UNAVAILABLE — {why}")
+        return "\n".join(lines) or "no source built a retriever on this deployment"
+
+    async def _ensure_open(self):
+        if self._probe is not None or self._open_error:
+            return self._probe
+        try:
+            self._probe = await self._opener(pack_name=self.pack, config=self._config)
+        except Exception as exc:  # noqa: BLE001 — no backend is a degrade, never a raise
+            self._open_error = f"{type(exc).__name__}: {exc}"
+            logger.warning("probe lane could not open on %s: %s", self.pack, exc)
+        return self._probe
+
+    async def close(self) -> None:
+        if self._probe is None:
+            return
+        try:
+            await self._probe.close()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("closing the probe lane raised: %s", exc)
+        self._probe = None
+
+
+def _probe_body(raw: Any) -> Dict[str, Any]:
+    if isinstance(raw, dict):
+        return raw
+    return json.loads(str(raw or "{}"))
+
+
+def _first_int(*candidates: Any) -> int:
+    for value in candidates:
+        if value is None or isinstance(value, bool):
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return 0
+
+
+def _first_number(*candidates: Any) -> float:
+    for value in candidates:
+        if value is None or isinstance(value, bool):
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return 0.0
+
+
+def _tool_probe(pack: str, args: Dict[str, Any]) -> str:
+    """``probe`` reached through the synchronous seam, which cannot run it.
+
+    A probe needs a live retriever and an event loop, so it is served by
+    :meth:`ProbeLane.run` from the exploration coroutine. Kept in ``_TOOLS`` anyway, because
+    that mapping is what :func:`dispatch_tool` lists back to a model that invented a name,
+    and a real tool missing from that list sends the model looking for a second spelling.
+    Answering here with the degrade text is the honest form: no measurement was taken.
+    """
+    return "probe is not available in this context. " + _PROBE_DEGRADE
+
+
 _TOOLS = {
     "pack_summary": lambda pack, args: json.dumps(pack_summary(pack), indent=1),
     "list_files": _tool_list_files,
@@ -611,9 +1003,30 @@ _TOOLS = {
     "search": _tool_search,
     "validate": _tool_validate,
     "dry_run": _tool_dry_run,
+    "probe": _tool_probe,
     # Takes no pack: a skill is method, not domain, and is identical for every pack installed.
     "read_skill": lambda pack, args: pack_skills.read(str(args.get("name") or "")),
 }
+
+
+async def dispatch_tool_async(
+    pack: str, name: str, args: Dict[str, Any], *, lane: Optional[ProbeLane] = None
+) -> str:
+    """Run one tool, including the one that needs a loop and a backend.
+
+    Every other tool is pure file reading and stays on the synchronous seam, which is the
+    one the tests and the invented-name path exercise. ``probe`` is routed here only when a
+    lane was supplied: without one the sync stub answers, so no caller can probe by
+    accident, and the model is told a measurement was NOT taken rather than being handed
+    something that reads like one.
+    """
+    if str(name) == "probe" and lane is not None:
+        try:
+            return await lane.run(args or {})
+        except Exception as exc:  # noqa: BLE001 — same contract as dispatch_tool
+            logger.warning("probe lane raised on %s: %s", pack, exc)
+            return f"probe failed: {exc}"
+    return dispatch_tool(pack, name, args)
 
 
 def dispatch_tool(pack: str, name: str, args: Dict[str, Any]) -> str:
@@ -753,8 +1166,10 @@ apart from the diff alone.
 Where a method skill in this request states a rule about what you are changing, the plan
 complies with it or `notes` says why it does not. In particular: anything a skill says must
 be MEASURED against the live source — a binding, a threshold, a filter guarantee, a
-cardinality — is a `questions` entry naming the measurement, never a value you chose. A
-plausible number in an approved diff is the one failure none of these files can catch.
+cardinality — is either a number you measured with `probe`, cited in `notes` as the op and
+the source it came from, or a `questions` entry naming the measurement to run. Never a value
+you chose. A plausible number in an approved diff is the one failure none of these files can
+catch, and a refused, failed or timed-out probe leaves you in the second case, not the first.
 """
 
 
@@ -818,10 +1233,14 @@ class PackAssistant:
         *,
         max_turns: int = MAX_TURNS,
         max_tool_bytes: int = MAX_TOOL_BYTES,
+        probe_lane: Optional[Any] = None,
     ):
         self.llm = llm_client
         self.max_turns = max(1, int(max_turns))
         self.max_tool_bytes = max(1, int(max_tool_bytes))
+        #: A factory, not a lane: the budget is per SESSION, and one lane shared across two
+        #: concurrent authoring sessions would let the second spend the first's measurements.
+        self._probe_lane = probe_lane or ProbeLane
 
     async def run(
         self,
@@ -844,9 +1263,13 @@ class PackAssistant:
         # own state transition, and a note arriving ahead of it is a note about a session the UI
         # does not yet know has started.
         self._attach_skills(session, guidance)
+        # Constructed, not opened: nothing reaches a backend until a probe call gets past its
+        # own checks, so a session that never probes — every session before this lane existed —
+        # builds no retriever at all.
+        lane = self._probe_lane(session.pack)
         try:
             messages = await self._opening_with_images(session, guidance, prior_plan)
-            messages = await self._explore(session, messages)
+            messages = await self._explore(session, messages, lane=lane)
             plan = await self._propose(session, messages)
             session.plan = plan
             session.status = "checking"
@@ -880,6 +1303,12 @@ class PackAssistant:
             session.status = "failed"
             session.error = f"{e.__class__.__name__}: {e}"
             emit(session, "assist_status", status="failed", message=session.error)
+        finally:
+            # Unconditional, and outside the error channel above: a lane left open holds a
+            # retriever's connection pool for the life of the process, and a session that
+            # FAILED is exactly the one most likely to have opened one.
+            with contextlib.suppress(Exception):
+                await lane.close()
         return session
 
     # -- the method library ------------------------------------------------
@@ -1036,8 +1465,13 @@ class PackAssistant:
 
     # -- exploration -------------------------------------------------------
 
-    async def _explore(self, session, messages):
-        """Run tool rounds until the model stops asking, or a budget runs out."""
+    async def _explore(self, session, messages, *, lane=None):
+        """Run tool rounds until the model stops asking, or a budget runs out.
+
+        ``lane`` is optional so the exploration loop stays callable without one; the
+        difference is only that ``probe`` then answers with its degrade text instead of
+        measuring, which is the same answer the deployment gives when no backend is reachable.
+        """
         tools = _tool_schemas()
         for turn in range(self.max_turns):
             try:
@@ -1082,7 +1516,13 @@ class PackAssistant:
                 fn = getattr(call, "function", None)
                 name = str(getattr(fn, "name", "") or "")
                 args = _parse_args(getattr(fn, "arguments", "{}"))
-                result = dispatch_tool(session.pack, name, args)
+                result = await dispatch_tool_async(
+                    session.pack, name, args, lane=lane
+                )
+                if lane is not None:
+                    # Copied rather than aliased: the snapshot is serialised while the loop is
+                    # still running, and a live list would render half a probe.
+                    session.probes = list(lane.records)
                 session.tool_bytes += len(result.encode("utf-8"))
                 session.trail.append(
                     {
@@ -1533,14 +1973,15 @@ def plan_checks(
     allow_delete: bool = False,
     prepared: Optional[Dict[str, Any]] = None,
     dry_run: bool = True,
+    deltas: bool = True,
     max_runs: int = pack_dry_run.DEFAULT_MAX_RUNS,
     max_seconds: float = pack_dry_run.DEFAULT_MAX_SECONDS,
 ) -> Dict[str, Any]:
     """What a plan does to the pack, measured on the after-state rather than described.
 
     Returns ``{ran, introduced[], resolved[], baseline_errors, candidate_errors,
-    candidate_warnings, rulesets, dry_run, problems[], seconds}``. Two questions, one
-    candidate tree:
+    candidate_warnings, rulesets, dry_run, selection_delta, verdict_delta, problems[],
+    seconds}``. Four questions, one candidate tree:
 
     * would the pack still validate — reported as the errors the plan ADDS, never as the
       candidate's total. A pack with pre-existing errors is the normal state of one being
@@ -1548,6 +1989,16 @@ def plan_checks(
     * would the new conditions ever answer anything — the dry run, which is the only check
       that can see a condition that is valid, resolves, and reads ``unknown`` on every row
       that has ever come back.
+    * which PROCEDURE would adjudicate — the selection delta, and it is the only check that
+      looks outside the candidate pack. The two above ask what the edited use case does; this
+      one asks what the edit does to the ones it did not touch, because which ruleset runs is
+      decided by a keyword score over every playbook title at once. Warning-severity by
+      construction: a flip is usually the point of the edit, and it gates nothing.
+    * what it does to the FINDINGS of the runs already on record — the verdict delta, which
+      re-adjudicates the same stored evidence under the base pack and the candidate and names
+      the condition lines that moved. The three above can all pass while a reworded field
+      path or a threshold moved by one changes what a report concludes about a named person's
+      conduct. Same severity for the same reason: moving a finding is usually the point.
 
     Blocking CPU for tens of seconds, so it is a standalone function with no coroutine in it:
     the caller decides whether that runs on a thread. ``ran`` false with ``problems`` means
@@ -1564,6 +2015,8 @@ def plan_checks(
         "candidate_warnings": 0,
         "rulesets": None,
         "dry_run": None,
+        "selection_delta": None,
+        "verdict_delta": None,
         "problems": [],
         "seconds": 0.0,
     }
@@ -1600,6 +2053,18 @@ def plan_checks(
                         max_seconds=max_seconds,
                     )
                 )
+            if deltas:
+                # Both are cheap where they do not apply, and each short-circuits on its own
+                # surface: an edit leaving every playbook title and join key alone cannot
+                # move a score, and one leaving every ruleset spec, entity binding and data
+                # file alone cannot move a verdict. Neither reads a corpus in that case.
+                base_dir = pack_store.pack_dir(pack)
+                out["selection_delta"] = pack_selection_delta.selection_delta_for_dirs(
+                    base_dir, candidate
+                ).to_dict()
+                out["verdict_delta"] = pack_verdict_delta.verdict_delta_for_dirs(
+                    base_dir, candidate
+                ).to_dict()
             out["ran"] = True
     except Exception as e:  # noqa: BLE001 — an unmeasurable plan is reported, not refused
         logger.warning("Plan checks for %s could not run: %s", pack, e)
@@ -1637,12 +2102,19 @@ def apply_plan(
     doc = _plan_dict(plan)
     prep = _prepared_ops(pack, doc.get("ops") or [], allow_delete=allow_delete)
     if checks is None:
-        # Validation only. The gate is "does this plan break the pack"; the dry run answers
-        # "will the new condition ever fire", which is an authoring question for a human
-        # reading a preview and gates nothing — running it here would spend a replay budget
-        # on every write to produce a number no branch reads.
+        # Validation only. The gate is "does this plan break the pack"; the other three
+        # measurements answer "will the new condition ever fire", "which procedure will
+        # adjudicate" and "what moves in the findings already on record" — authoring
+        # questions for a human reading a preview, which gate nothing. Running them here
+        # would spend a replay budget and re-read the stored corpus twice on every write to
+        # produce numbers no branch consults.
         checks = plan_checks(
-            pack, plan, allow_delete=allow_delete, prepared=prep, dry_run=False
+            pack,
+            plan,
+            allow_delete=allow_delete,
+            prepared=prep,
+            dry_run=False,
+            deltas=False,
         )
     errors = list(prep["errors"]) + list(checks.get("introduced") or [])
     if errors:

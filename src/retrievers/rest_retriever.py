@@ -17,7 +17,7 @@ from typing import Dict, List
 import aiohttp
 
 from src.models.pydantic_models import RetrievalQuery
-from src.retrievers.base import DataRetriever, publish_query
+from src.retrievers.base import (DataRetriever, publish_query, raise_for_status_with_reason)
 from src.retrievers.field_mapping import map_entities
 from src.retrievers.query_guards import (epoch_clauses_encoded, leaf_of,
                                          partition_clauses_encoded)
@@ -68,9 +68,9 @@ class RestRetriever(DataRetriever):
         if self._session is None or self._session.closed:
             headers = {"Accept": "application/json"}
             auth = None
-            if self.token:
-                headers["Authorization"] = f"Bearer {self.token}"
-            elif self.username is not None:
+            # The bearer is sent per request instead (see `_auth_headers`): a session header is
+            # fixed at construction, and this session is reused across callers' runs.
+            if not self.token and self.username is not None:
                 auth = aiohttp.BasicAuth(self.username, self.password or "")
             self._session = aiohttp.ClientSession(
                 headers=headers,
@@ -78,6 +78,24 @@ class RestRetriever(DataRetriever):
                 timeout=aiohttp.ClientTimeout(total=self.timeout),
             )
         return self._session
+
+    def _auth_headers(self) -> Dict[str, str]:
+        """Per-request bearer, this caller's own where they replaced the deployment's.
+
+        Basic auth is deliberately not overridable: it is configured as a username and a
+        password rather than a named credential, so there is no name for a caller to replace
+        and the client carries it from construction.
+        """
+        token = self.token
+        name = self.config.get("token_env")
+        if name:
+            try:
+                from src.user_secrets import personal_value
+
+                token = personal_value(name) or token
+            except Exception as exc:  # noqa: BLE001 — an override may never fail a retrieval
+                logger.debug("Personal credential lookup failed: %s", exc)
+        return {"Authorization": f"Bearer {token}"} if token else {}
 
     def _field_schema(self) -> str:
         """Candidate ServiceNow fields from the pack's per-source entity_bindings."""
@@ -172,8 +190,10 @@ class RestRetriever(DataRetriever):
             }
             if sysparm_query:
                 params["sysparm_query"] = sysparm_query
-            async with session.get(url, params=params) as resp:
-                resp.raise_for_status()
+            async with session.get(
+                url, params=params, headers=self._auth_headers()
+            ) as resp:
+                await raise_for_status_with_reason(resp)
                 data = await resp.json()
             batch = data.get("result", []) or []
             if not batch:

@@ -5,7 +5,7 @@ Where durable state lives is one decision, taken once, in `build_storage(config)
 and does not know or care what is underneath.
 
     storage:
-      backend: local        # local | databricks | sql   (absent = local)
+      backend: local        # local | databricks | dbfs | sql   (absent = local)
 
 **A `storage:` block absent from `main_config.yaml` — which is every deployment that
 existed before this package — yields `LocalStorage` over `data_dir()`, i.e. exactly the
@@ -13,24 +13,62 @@ behaviour that shipped before.** The layout on disk is unchanged: `<root>/jobs/<
 `<root>/exports/fraud_report_<id>.md`, `<root>/feedback_log.jsonl`. A VM upgraded to this
 code reads its own existing files.
 
-### Four destinations, three implementations
+### Five destinations, four implementations
 
 | Destination | Config | Implementation |
 |---|---|---|
 | Local disk | `backend: local` (or no block) | `LocalStorage` over `data_dir()` |
 | An external / mounted volume, NFS share, attached disk | `backend: local` + `storage.root: /mnt/afir-state` | `LocalStorage` over that root |
 | A Unity Catalog Volume, **managed or external** | `backend: databricks` + `catalog`/`schema`/`volume` | `DatabricksStorage` over the Files API |
+| Workspace storage, no UC grant needed | `backend: dbfs` + `storage.dbfs.root` | `DbfsStorage`, `DatabricksStorage` over `/api/2.0/dbfs/*` |
 | A transactional database | `backend: sql` + `storage.sql.*` | `SqlStorage`, one row per blob |
 
 **An `external_volume` option would be a second spelling of an existing one, in both
-directions, which is why there are three implementations and not four.** A *mounted* volume
-is a filesystem: it takes `os.replace` and `fsync`, which is `LocalStorage` exactly, and the
-only thing that differs is the root — so `storage.root` is the whole feature, and it is now
-an exposed field rather than something reachable only by knowing the constructor signature.
-A *UC* Volume is the same one backend whether the volume is managed or external: both live
-at `/Volumes/<catalog>/<schema>/<volume>` and are addressed by the identical Files API, so
-the distinction is a Unity Catalog property that never reaches this code. A database is the
-one genuinely different mechanism, and it gets a genuinely different class.
+directions, which is why a mounted volume gets no implementation of its own.** A *mounted*
+volume is a filesystem: it takes `os.replace` and `fsync`, which is `LocalStorage` exactly,
+and the only thing that differs is the root — so `storage.root` is the whole feature, and it
+is now an exposed field rather than something reachable only by knowing the constructor
+signature. A *UC* Volume is the same one backend whether the volume is managed or external:
+both live at `/Volumes/<catalog>/<schema>/<volume>` and are addressed by the identical Files
+API, so the distinction is a Unity Catalog property that never reaches this code. A database
+is the one genuinely different mechanism, and it gets a genuinely different class.
+
+### The two Databricks destinations are one configured value apart
+
+`DbfsStorage` **subclasses** `DatabricksStorage` and overrides four remote primitives
+(`_upload`, `_download`, `_remove`, `_listdir`) plus `_resolve_root`. Everything that makes
+the backend safe — the single writer thread, coalescing, the `.prev` shadow, verify-on-readback
+with restore-or-remove, the bounded `flush()` a gate waits on, `degradation` — is inherited,
+because a second copy of that machinery would be a second reading of durability, free to
+disagree with the first.
+
+**A UC Volume is the one to prefer and DBFS is what a workspace that cannot grant it uses
+instead.** DBFS needs only the workspace token: no `USE CATALOG` → `USE SCHEMA` →
+`READ/WRITE VOLUME` chain, which is exactly the chain an app's service principal can be
+missing one link of. What it gives up is governance — a Volume is catalogued, lineage-tracked
+and grant-controlled; `/FileStore` is a workspace-wide path with none of that. So this is an
+option, not a migration: the grant can arrive at any time, and when it does the switch is one
+value.
+
+That "one value" is a property of the config layout and not an accident.
+`_workspace_connection` reads `host` / `token_env` / `verify_ssl` from the `databricks:`
+block and lets `dbfs:` override any of them, so the DBFS block declares only its
+**destination**. Re-declaring the connection per backend would leave two sets of credentials
+where only one is exercised — and the one that stops being maintained is the one nobody is
+currently using, i.e. whichever the deployment is about to switch to.
+
+**Four DBFS semantics were measured rather than assumed** (2026-08-31, against a live workspace;
+`tests/fake_dbfs_api.py` encodes each one, so a wrong guess fails a test instead of a
+deployment):
+
+| Measured | Why it matters |
+|---|---|
+| 1 MiB per call, **both** directions (`put` `contents`, `read` `length`) | An evidence sidecar reaches 2.07 MB, so `create` → `add-block` × N → `close` is the normal write and every download is a loop |
+| `offset == size` → `bytes_read: 0`; `offset > size` → **400** | The loop stops on a short block. Probing for the end discards everything already read |
+| `delete` of an absent path → **200**, unlike the Files API's 404 | `_remove` asks `get-status` first, or `delete()` claims it removed something that never existed and diverges from the `LocalStorage` oracle |
+| An empty directory → `{}` with **no** `files` key; an absent one → 404 | `body["files"]` raises. Both are "no entries" to the walk, only one is absence |
+
+Both write paths create their parent directories, so nothing calls `mkdirs`.
 
 ## Why the seam exists
 
@@ -293,6 +331,15 @@ listing test failed while the whole rest of the suite stayed green.
 | `job_store` | `PrefixedStorage(storage, "jobs")` | `load_all` lists; without the prefix it would sweep up exports and the feedback log. |
 | `report_generation`, both `ResultExporter` sites, `report_delivery` | `PrefixedStorage(storage, "exports")` — **the same object** | The stage writes the `.md`/`.pdf` that `report_delivery` serves. Two views of one backend work locally and diverge the moment either is remote. |
 | `feedback_loop` | the **un-prefixed root** | The three feedback files have always lived directly under `AFIR_DATA_DIR`. A prefix would relocate them, so an upgraded VM would read *zero* analyst reviews from a log still sitting on its disk and tuning would silently revert to the configured baseline. Safe because `feedback_loop` addresses its files by exact name and never lists. |
+
+**A per-caller view is a view of a view, and the nesting order is the consequence.**
+`owner_scoped` narrows a store that is *already* prefixed, so an owned run's document is
+`jobs/users/<segment>/<id>.json` while an unowned one keeps the flat `jobs/<id>.json` it had
+before the seam existed — deliberately, so nothing written by an earlier deployment moves. The
+overlay layers are the other way round (`users/<segment>/layers/{config,knowledge}/…`) because
+`user_overlay` narrows the *root* store, not a stage's view. Two prefixes named `users`, at two
+depths, meaning the same person: worth knowing before reading a listing.
+`docs/architecture/databricks-deployment.md` inventories what a deployed root actually holds.
 
 **`PrefixedStorage.list_keys` strips the prefix back off.** A caller must get out what it
 put in; otherwise `job_store` asks for `<id>.json`, gets back `jobs/<id>.json`, and every

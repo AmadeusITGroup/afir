@@ -16,7 +16,7 @@ import aiohttp
 from src.human_guidance import guidance_prompt_line
 from src.models.pydantic_models import (RetrievalQuery, SchemaSelection,
                                         SqlQuery)
-from src.retrievers.base import DataRetriever, publish_query
+from src.retrievers.base import (DataRetriever, publish_query, raise_for_status_with_reason)
 from src.retrievers.field_mapping import (declared_leaf_paths,
                                           event_time_column,
                                           form_split_bindings, incident_values,
@@ -134,14 +134,45 @@ class DatabricksRetriever(DataRetriever):
         self._session = None
 
     def _bearer_token(self) -> Optional[str]:
-        """Current token: a fresh SDK token when available, else the static one."""
+        """Current token: this caller's own if they set one, then a fresh SDK token, else static."""
+        own = self._personal_token()
+        if own:
+            return own
         if self.auth is not None:
             return self.auth.token()
         return self._static_token
 
+    def _personal_token(self) -> Optional[str]:
+        """The current run owner's own token for this backend's credential name, if any."""
+        name = self.config.get("api_key_env")
+        if not name:
+            return None
+        try:
+            from src.user_secrets import personal_value
+
+            return personal_value(name)
+        except Exception as exc:  # noqa: BLE001 — an override may never fail a retrieval
+            logger.debug("Personal credential lookup failed: %s", exc)
+            return None
+
+    def _auth_headers(self) -> Dict[str, str]:
+        """Per-REQUEST authorization, because the session's is baked in at construction.
+
+        One retriever is reused across runs and a session cannot be rebuilt while a statement
+        is in flight, so the token is sent per call: that is what lets one caller's personal
+        credential apply to their own run and nobody else's, and it makes the SDK refresh live
+        on a session that outlives a token's lifetime.
+        """
+        return {"Authorization": f"Bearer {self._bearer_token()}"}
+
     def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            headers = {"Authorization": f"Bearer {self._bearer_token()}"}
+            # Deliberately no Authorization here: a session header is fixed at construction,
+            # so it would be whichever caller's token happened to open the session, handed to
+            # every request that forgot to override it. Every request site passes
+            # `_auth_headers()`; an unauthenticated 401 is the honest failure of a new one
+            # that does not.
+            headers = {}
             ssl_ctx = _build_ssl_context(self.config)
             timeout = aiohttp.ClientTimeout(
                 total=self.http_total_timeout,
@@ -177,10 +208,13 @@ class DatabricksRetriever(DataRetriever):
             payload["schema"] = self.schema
 
         logger.info("Submitting Databricks SQL statement: %s", sql)
+        headers = self._auth_headers()
         async with session.post(
-            f"{self.workspace_url}/api/2.0/sql/statements", json=payload
+            f"{self.workspace_url}/api/2.0/sql/statements",
+            json=payload,
+            headers=headers,
         ) as resp:
-            resp.raise_for_status()
+            await raise_for_status_with_reason(resp)
             data = await resp.json()
 
         statement_id = data["statement_id"]
@@ -203,9 +237,12 @@ class DatabricksRetriever(DataRetriever):
                 attempts += 1
                 try:
                     async with session.get(
-                        f"{self.workspace_url}/api/2.0/sql/statements/{statement_id}"
+                        f"{self.workspace_url}/api/2.0/sql/statements/{statement_id}",
+                        # Re-derived per poll: a statement can outlive the token it was
+                        # submitted with.
+                        headers=self._auth_headers(),
                     ) as resp:
-                        resp.raise_for_status()
+                        await raise_for_status_with_reason(resp)
                         data = await resp.json()
                     state = data["status"]["state"]
                     poll_errors = 0
@@ -249,7 +286,8 @@ class DatabricksRetriever(DataRetriever):
         try:
             session = self._get_session()
             async with session.post(
-                f"{self.workspace_url}/api/2.0/sql/statements/{statement_id}/cancel"
+                f"{self.workspace_url}/api/2.0/sql/statements/{statement_id}/cancel",
+                headers=self._auth_headers(),
             ) as resp:
                 # 200 on success; ignore anything else (already terminal, etc.).
                 await resp.read()
@@ -340,22 +378,81 @@ class DatabricksRetriever(DataRetriever):
         ]
 
     async def _discover_columns(self, schema: str, qualify: bool = True) -> List[Dict]:
-        """All columns of one schema from information_schema; reconciles nested types."""
+        """All columns of one schema from information_schema, else DESCRIBE; reconciles nested types."""
         table_filter = ""
         if self.tables:
             quoted = ", ".join(f"'{t}'" for t in self.tables)
             table_filter = f"AND table_name IN ({quoted}) "
-        rows = await self._execute_sql(
-            "SELECT table_name, column_name, data_type, full_data_type, partition_index "
-            f"FROM {self.catalog}.information_schema.columns "
-            f"WHERE table_schema = '{schema}' "
-            f"{table_filter}"
-            "ORDER BY table_name, ordinal_position"
-        )
+        try:
+            rows = await self._execute_sql(
+                "SELECT table_name, column_name, data_type, full_data_type, partition_index "
+                f"FROM {self.catalog}.information_schema.columns "
+                f"WHERE table_schema = '{schema}' "
+                f"{table_filter}"
+                "ORDER BY table_name, ordinal_position"
+            )
+        except Exception as exc:  # noqa: BLE001 — a catalog without the view is not a failure
+            logger.warning(
+                "Source '%s': %s.information_schema is unreadable (%s); falling back to "
+                "DESCRIBE TABLE. An empty schema is not a degraded run — it drops every "
+                "declared binding as stale, so the query keeps its window bound and nothing "
+                "else, and an arbitrary page reads exactly like the subject's own rows.",
+                self.config.get("name", "?"),
+                self.catalog,
+                str(exc)[:200],
+            )
+            rows = []
+        if not rows:
+            rows = await self._describe_columns(schema)
         await self._reconcile_nested_types(rows, schema)
         if qualify:
             for row in rows:
                 row["table_name"] = f"{schema}.{row['table_name']}"
+        return rows
+
+    async def _describe_columns(self, schema: str) -> List[Dict]:
+        """Discovery rows built from ``DESCRIBE TABLE``, in the information_schema shape.
+
+        The legacy Hive metastore exposes no ``information_schema``, so the only reading of
+        such a catalog is per table. ``DESCRIBE TABLE`` also names the partition columns, in
+        a repeated section below the column list — which is why they are parsed here rather
+        than left to a pack declaration: a partition this path did not report is a partition
+        no generated query bounds, over a table large enough to be partitioned.
+        """
+        tables = list(self.tables or [])
+        if not tables:
+            try:
+                listed = await self._execute_sql(f"SHOW TABLES IN {self.catalog}.{schema}")
+            except Exception as exc:  # noqa: BLE001 — degrade to no schema, as before
+                logger.warning(
+                    "Source '%s': cannot list tables in %s.%s (%s).",
+                    self.config.get("name", "?"),
+                    self.catalog,
+                    schema,
+                    str(exc)[:200],
+                )
+                return []
+            tables = [
+                str(r.get("tableName") or r.get("table_name") or "").strip()
+                for r in listed
+            ]
+            tables = [t for t in tables if t][:_MAX_DESCRIBE_TABLES]
+        rows: List[Dict] = []
+        for table in tables[:_MAX_DESCRIBE_TABLES]:
+            fq = f"{self.catalog}.{schema}.{table}"
+            try:
+                described = await self._execute_sql(f"DESCRIBE TABLE {fq}")
+            except Exception as exc:  # noqa: BLE001 — one unreadable table is not the schema
+                logger.warning("Could not DESCRIBE %s (%s).", fq, str(exc)[:200])
+                continue
+            rows.extend(_columns_from_describe(described, table))
+        if rows:
+            logger.info(
+                "Source '%s': %d column(s) across %d table(s) read with DESCRIBE TABLE.",
+                self.config.get("name", "?"),
+                len(rows),
+                len({r["table_name"] for r in rows}),
+            )
         return rows
 
     async def _reconcile_nested_types(self, rows: List[Dict], schema: str) -> None:
@@ -1054,6 +1151,9 @@ _MAX_LEAVES_PER_TABLE = 60
 # Cap metadata statements per discovery pass; unchecked tables are named in a warning.
 _MAX_RECONCILE_STATEMENTS = 40
 
+# Cap tables DESCRIBEd when a catalog has no information_schema (one statement each).
+_MAX_DESCRIBE_TABLES = 20
+
 # Partial struct type marker: "... N more fields" — the only machine-readable signal.
 _TRUNCATED_TYPE_RE = re.compile(r"\.\.\.\s*(\d+)\s+more fields?", re.IGNORECASE)
 
@@ -1092,6 +1192,51 @@ def _live_column_types(described: List[Dict]) -> Dict[str, str]:
             break
         types[name] = str(row.get("data_type") or "").strip()
     return types
+
+
+def _columns_from_describe(described: List[Dict], table: str) -> List[Dict]:
+    """``DESCRIBE TABLE`` rows as information_schema-shaped discovery rows.
+
+    The output has three regions and only the first two are columns: the column list, then
+    a repeated ``# Partition Information`` section naming the partition columns in order,
+    then ``# Detailed Table Information``. A partition column appears TWICE, so it is
+    matched back onto its own row rather than appended — appended, the generator is shown a
+    duplicate leaf and the per-table leaf cap spends itself on it.
+    """
+    columns: List[Dict] = []
+    partitions: List[str] = []
+    region = "columns"
+    for row in described or []:
+        name = str(row.get("col_name") or "").strip()
+        if not name:
+            continue
+        if name.startswith("#"):
+            lowered = name.lower()
+            if "partition information" in lowered:
+                region = "partitions"
+            elif "detailed table information" in lowered:
+                break
+            continue  # a section's own `# col_name` header row
+        if region == "partitions":
+            if name not in partitions:
+                partitions.append(name)
+            continue
+        col_type = str(row.get("data_type") or "").strip()
+        columns.append(
+            {
+                "table_name": table,
+                "column_name": name,
+                "data_type": col_type,
+                "full_data_type": col_type,
+                "partition_index": None,
+            }
+        )
+    for order, name in enumerate(partitions):
+        for col in columns:
+            if col["column_name"] == name:
+                col["partition_index"] = order
+                break
+    return columns
 
 
 def struct_type_from_children(children: List[tuple]) -> str:

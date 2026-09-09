@@ -193,7 +193,8 @@ limiting (`src/utils/`).
   endpoint
 - Configurable durable state: local disk, a Databricks UC Volume, or a SQL
   database (`docs/architecture/storage.md`)
-- Deployment as a Databricks App or as a plain process on a laptop or VM
+- Deployment as a Databricks App, as a supervised continuous service on a cluster
+  driver behind the driver proxy, or as a plain process on a laptop or VM
   (`docs/architecture/databricks-deployment.md`)
 - Plugin system for custom analysis extensions
 - Export of investigation results in JSON, CSV, XML, and Excel formats, plus
@@ -302,6 +303,17 @@ is needed. Durable state should be pointed at a UC Volume or a SQL database,
 since container disk does not survive a restart. See
 [docs/architecture/databricks-deployment.md](docs/architecture/databricks-deployment.md).
 
+### Deploying on a cluster driver
+
+Where an App's container cannot reach a backend the investigation needs — a private
+Elasticsearch estate behind corporate DNS, typically — the same server runs on a cluster driver
+and is served by the driver proxy. `scripts/afir_service.py` makes that continuous: it publishes
+the tree and a pre-built virtualenv to a shared UC Volume, and a cluster-scoped init script
+(`scripts/driver_init.sh`) fetches them and starts the service on every cluster boot, supervised,
+with durable state on a second Volume. Nothing on an operator's machine is load-bearing after
+`provision`; who may open the page is the cluster's own permission list. The same document covers
+it, including every storage location and what is in it.
+
 ## Testing
 
 The suite needs `requirements-dev.txt` installed. No test calls a real LLM or a
@@ -334,7 +346,7 @@ at process start.
 | [docs/architecture/verdict-engine.md](docs/architecture/verdict-engine.md) | Rulesets, condition kinds, how a verdict is reached |
 | [docs/architecture/retrieval.md](docs/architecture/retrieval.md) | The four backends, query shaping, timeouts and row caps |
 | [docs/architecture/hitl.md](docs/architecture/hitl.md) | Gates, run modes, overrides, the feedback loop |
-| [docs/architecture/databricks-deployment.md](docs/architecture/databricks-deployment.md) | Deploying as a Databricks App |
+| [docs/architecture/databricks-deployment.md](docs/architecture/databricks-deployment.md) | Deploying as a Databricks App, or continuously on a cluster driver: the scripts, every storage location, what each asset is |
 | [docs/architecture/](docs/architecture/) | Design documents for every subsystem, including storage, RAG embeddings, report generation, extended thinking, run modes, correlation and the link lane |
 
 ## License

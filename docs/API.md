@@ -45,6 +45,8 @@ Both routes are unauthenticated and carry the same access caveat as every other 
 
 `GET /` returns the single-page control panel as `text/html`. The page bundles its own CSS and requires no external asset — it functions offline, including in a Databricks App. Every action the UI takes is driven by the endpoints in this document.
 
+`GET /afir` (and `GET /afir/`) serve the same document. Behind an ingress whose prefix is the platform's and names no service — a cluster driver proxy, at `/driver-proxy/o/<org>/<cluster>/<port>/` — that is the URL to bookmark, because it says what it opens. It is an alias and not a base path: the page's own calls stay root-relative and the browser-side prefix shim reads only the proxy's five segments, so nothing under it changes.
+
 ---
 
 ## 1. Launch a controllable job
@@ -53,10 +55,10 @@ Both routes are unauthenticated and carry the same access caveat as every other 
 curl -s -X POST "$BASE/api/v1/jobs" \
   -H 'Content-Type: application/json' \
   -d '{"description": "Multiple failed logins for user 4821, then a large transfer on 2024-08-26", "mode": "auto"}'
-# -> {"job_id": "39f4…", "incident_id": "3e31…", "status": "running"}
+# -> {"job_id": "39f4…", "incident_id": "3e31…", "status": "pending"}
 ```
 
-`status` is `running` or **`queued`**: a run costs ~38 minutes at the median and fans out
+`status` is `pending`, `running` or **`queued`**: a run costs ~38 minutes at the median and fans out
 ~19 retrievers against one shared LLM semaphore, so `jobs.max_concurrent_jobs` (default 2)
 bounds how many run stages at once and the rest wait in a FIFO backlog. A queued job is a
 real job — every endpoint below works on it, and the `job_status` event carries its
@@ -203,12 +205,14 @@ from duplicate names.
 
 ## 4. Discover jobs
 
-`GET /api/v1/jobs` lists all live jobs (newest first):
+`GET /api/v1/jobs` lists jobs, newest first — including finished ones the process no longer
+holds in memory:
 
 ```bash
 curl -s "$BASE/api/v1/jobs" | python -m json.tool
 # -> {"jobs": [{"job_id", "incident_id", "status", "run_mode", "current_stage",
-#               "created_at", "updated_at", "batch_id", "queue_position"}, …],
+#               "created_at", "updated_at", "batch_id", "queue_position",
+#               "owner", "owner_name", "live"}, …],
 #     "queue": {"width": 2, "max_queued": 256, "running": 2, "queued": 3,
 #               "admitted": 11, "queued_total": 4, "refused": 0, "withdrawn": 1}}
 ```
@@ -218,10 +222,21 @@ it cannot go stale as the queue drains; **0** means the job is not waiting. The 
 block rides alongside the rows because a caller reading `queued` on one job needs the width
 and the depth to know what it is waiting for.
 
+**`live: false` is a finished run answered from a compact row rather than from memory.** A
+terminal job is evicted after `jobs.completed_ttl_seconds` (default 3600) — that bounds
+*memory*, not visibility, so the row stays in the list and naming the id rehydrates the whole
+document from the store. `jobs.history_max_items` (default 2000) bounds how many such rows are
+enumerated; beyond it a run is still reachable by id until `jobs.retention_days` deletes the
+document. Without this, submitting one run erased every earlier run from the list while the
+documents sat untouched, which reads as a run that was deleted.
+
+`owner_name` is who asked for it, where the deployment reads an identity (§12).
+
 ### `GET /api/v1/incidents` — what finished, on disk
 
-`GET /api/v1/jobs` only knows about jobs the *current* process is holding. An incident
-whose run finished (or that a restart forgot) is reachable only by its id, which the
+`GET /api/v1/jobs` only knows about jobs the *current* process has seen — a run from before
+the last restart is not in it. An incident whose run finished that long ago is reachable only
+by its id, which the
 console's Report tab otherwise asks an operator to type from memory. This lists what has
 an artifact on disk, newest first:
 
@@ -306,7 +321,7 @@ the call — cancelling a backlog is a bulk action and one race in it must not r
 | `step` | advance exactly one stage (STEP mode) |
 | `cancel_stage` | cancel the current stage and stop the job |
 | `cancel_all` | cancel the whole job immediately |
-| `retry_stage` | re-run the failed stage (only after `stage_failed`) |
+| `retry_stage` | re-run one stage. Accepts `{"stage": "<name>", "pass": N}`; with no `stage` it defaults to the failed one, then the stopped one, and is refused if neither exists. An explicit `stage` is accepted **in any status**, a completed run included — re-running a stage whose answer was wrong is the point, and the stages after it follow. Whatever loop is live is cancelled first, wherever it sits: two loops over one run would share its context. |
 | `retry_all` | re-run the whole job from the first stage |
 | `skip_stage` | leave a stage's output as-is and continue from the next stage. Accepts `{"stage": "<name>"}`; defaults to the failed stage. This is the continuation path after an override (§5b) — `retry_stage` would re-run the stage and throw the human's value away. |
 | `release_gate` | abandon the open approval gate and continue as if approved, without review. Recorded as not reviewed in both `gate_history` and `interventions`. Distinct from `approve` on the gate endpoint (`POST .../gate`): `approve` means reviewed and accepted; `release_gate` means the gate is cleared without review, which a clock-driven timeout also records for the same reason. |
@@ -1344,12 +1359,26 @@ example ruleset, so `cp -r` would make the *template's* test fail.
 
 `503` on all five routes when no LLM client is wired.
 
-**Nothing here writes.** The assistant's tools are read-only — `list_files`,
-`read_file`, `search`, `pack_summary`, `validate` — and there is no write tool at all,
-which is what makes "nothing touches disk until you approve" structural rather than
-procedural. `pack_summary` is also what stops the model inventing a condition `kind`: it
-returns the entity types, source names, ruleset keys, shared-check ids and the kinds the
-evaluator actually dispatches.
+**Nothing here writes.** The assistant's eight tools are read-only — `list_files`,
+`read_file`, `search`, `pack_summary`, `validate`, `dry_run`, `read_skill` and `probe` — and
+there is no write tool at all, which is what makes "nothing touches disk until you approve"
+structural rather than procedural. `pack_summary` is also what stops the model inventing a
+condition `kind`: it returns the entity types, source names, ruleset keys, shared-check ids
+and the kinds the evaluator actually dispatches. `read_skill` reads one of the authoring method
+documents the deployment ships; a spine of them is injected unasked, and which ones applied
+rides back on the snapshot as `skills`, because a proposal written without that method
+knowledge comes back looking exactly like one written with it.
+
+**`probe` is the only one that leaves the machine**, and it is read-only *at the seam* rather
+than by instruction — the same `_read_only_reason` check the standalone instrument uses,
+applied before a connection is opened, because a prompt cannot be relied on to beat another
+prompt. It is bounded three ways from the `knowledge:` config block — a per-session probe
+count, a row cap and a timeout (`assistant_probes`, `assistant_probe_row_cap`,
+`assistant_probe_timeout_seconds`; **`0` disables the lane entirely**) — every probe is
+recorded on the session so the preview shows what was measured to justify a line, and a
+refusal, failure or timeout degrades to an entry in the plan's `questions` and **never to a
+number**. A pack authored against an unreachable backend therefore gets the same plan it got
+before the tool existed, with the measurements named as open.
 
 #### `POST /api/v1/knowledge/{pack}/assist` → `202`
 
@@ -1401,7 +1430,13 @@ Two hard budgets bound exploration: **8 turns** and **200 KB of tool output** (t
 456 KB schema files blow any context). Exceeding either appends an explicit "your
 exploration budget is spent, propose from what you have" turn rather than stopping
 silently, so the plan the operator sees was produced knowingly — `budget_spent` and a
-`assist_note` event say so.
+`assist_note` event say so. The probe budget above is the third and the one that bounds what
+leaves the machine; `probes` on the snapshot carries one row per **admitted** measurement —
+`{op, source, args, elapsed_s, result}`, the timeouts and the failures included, since a
+non-answer is a result — so the preview can be read as *what was measured* beside *what is
+proposed*. A refused probe spends no budget and appears on the `trail` like any other tool
+round, which is the distinction the two lists exist to keep: `probes` is what the pack's new
+numbers rest on, `trail` is everything the model tried.
 
 #### `GET /api/v1/knowledge/{pack}/assist/{session}` and `.../{session}/events`
 
@@ -1432,19 +1467,41 @@ must not sink a proposal whose other three ops are fine.
 
 The preview also carries `checks`, measured on the plan's **after-state** in a candidate
 tree rather than described: `{ran, introduced[], resolved[], baseline_errors,
-candidate_errors, candidate_warnings, rulesets, dry_run, problems[], seconds}`. Two
-questions, and the second is the one nothing else asks. **Would the pack still validate** —
-reported as the errors the plan *adds* (`introduced`) and never as the candidate's total,
-because a pack with pre-existing errors is the normal state of one being worked on and gating
-on the total makes the first fix unappliable. **And would the new conditions ever answer
-anything** — `dry_run` replays the touched rulesets over the evidence of stored runs and
-reports per-condition `pass`/`fail`/`unknown` counts plus the two findings a count cannot
-express, `always unknown` and `never evaluated` (`src/knowledge/pack_dry_run.py`,
-`docs/architecture/knowledge.md`). It states the bounds of its own reading: a stored run
-carries neither the per-source row cap nor whether a query constrained the acting identity,
-so each missing fact is reported **with its direction of error**. `ran: false` with
-`problems[]` means the measurement did not happen — never folded into a clean result, and
-never turned into a refusal either, since a plan is not at fault for a temp directory.
+candidate_errors, candidate_warnings, rulesets, dry_run, selection_delta, verdict_delta,
+problems[], seconds}`. **Four questions, and only the first gates** — each of the other three
+is blind to the next, which is why there are four rather than one.
+
+**Would the pack still validate** — reported as the errors the plan *adds* (`introduced`) and
+never as the candidate's total, because a pack with pre-existing errors is the normal state of
+one being worked on and gating on the total makes the first fix unappliable. **Would the new
+conditions ever answer anything** — `dry_run` replays the touched rulesets over the evidence of
+stored runs and reports per-condition `pass`/`fail`/`unknown` counts plus the two findings a
+count cannot express, `always unknown` and `never evaluated` (`src/knowledge/pack_dry_run.py`).
+It states the bounds of its own reading: a stored run carries neither the per-source row cap nor
+whether a query constrained the acting identity, so each missing fact is reported **with its
+direction of error**.
+
+The last two are the ones that look **outside** the candidate pack, because the two above ask
+what the edited use case does and neither can see what the edit does to the ones it did not
+touch. **Which procedure would adjudicate** — `selection_delta` re-scores the stored corpus under
+the base pack and the candidate and names the runs whose selected ruleset flips
+(`src/knowledge/pack_selection_delta.py`); which ruleset runs is a keyword score over every
+playbook title at once, so rewording one title silently re-scores every incident the pack has
+ever seen, and the losing procedure's conditions still resolve against real rows with every stage
+green. **And what the edit does to the findings already on record** — `verdict_delta`
+re-adjudicates the same stored evidence under both packs and names the per-subject, per-condition
+lines that moved, separating a `decided_flip` (pass↔fail) from a check that stopped answering
+(`src/knowledge/pack_verdict_delta.py`). Both are **warning-severity by construction**: a moved
+selection or a moved finding is usually the point of the edit, and "is this move correct" is a
+judgement no arithmetic settles. On both, **`compared: false` is a silence and not a clean bill** —
+no corpus, no replayable ruleset, an unchanged surface or a failed determinism control all report
+zero changes, and only that field says which. Both cost nothing where they do not apply: an edit
+leaving every title and join key alone cannot move a score, and one leaving every ruleset spec,
+entity binding and `data/` file alone cannot move a verdict, so neither reads the corpus at all.
+
+`ran: false` with `problems[]` means the measurement did not happen — never folded into a clean
+result, and never turned into a refusal either, since a plan is not at fault for a temp directory.
+Detail for all four: `docs/architecture/knowledge.md`.
 
 #### `POST /api/v1/knowledge/{pack}/assist/{session}/apply` — all or nothing
 
@@ -1461,9 +1518,11 @@ not become empty when the pre-image was not. **An error the plan *introduces* re
 whole write** on the same terms, because a proposal that leaves the pack failing validation is
 one the next run loads as an *empty* pack, and the operator approved a diff rather than that
 outcome — introduced, not total, so a pack already failing can still be repaired here. The
-dry run gates nothing: *will this condition ever fire* is an authoring question for a human
-reading the preview, and running a replay on every write would spend the budget to produce a
-number no branch reads. One problem → **`400`, nothing written**,
+other three measurements gate nothing and the apply does not spend them: *will this condition
+ever fire*, *which procedure would adjudicate* and *what moves in the findings already on
+record* are authoring questions for a human reading the preview, and computing them on every
+write would spend a replay budget and two corpus reads to produce numbers no branch consults.
+One problem → **`400`, nothing written**,
 with the per-op reasons so the next attempt is a correction rather than a re-run. A
 `delete` op requires `allow_delete: true`; without it the op is blocked *visibly* in the
 preview rather than omitted. An I/O failure mid-plan restores the files this call already
@@ -1488,6 +1547,280 @@ correction, so the proposal that was turned down stays inspectable beside its
 replacement. **`guidance` is required**: a reject with no correction would re-send the
 identical request and return the same plan, which reads as the assistant ignoring the
 operator.
+
+---
+
+## 12. Identity — who is asking, and where a write lands
+
+Only relevant behind an ingress that forwards a caller identity (a Databricks cluster
+driver proxy). **On a laptop, a VM, an Azure App Service and a Databricks App nothing
+here is reachable**: no identity resolves, every caller is the single local
+administrator, and every endpoint above behaves exactly as it did before this section
+existed. `identity.mode` (`auto` | `on` | `off`) decides, and `auto` means *on where the
+platform forwards a caller and off everywhere else*.
+
+Two roles. `admin` — an owner — edits the shared configuration and knowledge pack.
+`user` — a contributor or reader — edits their own **layer** over both. The full model,
+including the measured header sets and the merge semantics, is in
+`docs/architecture/identity.md`.
+
+### `GET /api/v1/whoami` — the caller, the role, and why
+
+```bash
+curl -s "$BASE/api/v1/whoami"
+# -> {"user_id": "7354…", "user_name": "someone@example.test",
+#     "role": "user", "source": "header", "groups": [],
+#     "role_reason": "role not established; defaulting to user",
+#     "mode": "auto", "enforced": true, "can_elevate": true,
+#     "edits_the_base": false}
+```
+
+- `source` — `token` (a forwarded credential was **validated** against the workspace),
+  `header` (platform-asserted name, no credential behind it), `local` (no ingress
+  identity at all).
+- `role_reason` — which check decided it. A caller who expected to be an administrator
+  can see what did not match instead of guessing.
+- `edits_the_base` — the one fact the editors branch on: `true` means a save changes the
+  shared file, `false` means it lands in this caller's own layer.
+
+A request whose identity cannot be trusted is **`403`, not `401`**: there is no
+credential for the caller to supply here — the ingress supplies it — so the remedy is
+which URL they used. `/`, `/afir`, `/health`, `/openapi.json` and `/docs` are reachable without
+one, because a platform probe carries none and the page has to load before it can say who
+the caller is.
+
+### `POST /api/v1/whoami/elevate` — prove membership the browser path cannot forward
+
+The cookie path forwards a validated *name* but no credential, so an owner arrives
+indistinguishable from a reader, and the server cannot look the caller's groups up
+(`GET /Users/{id}` needs workspace-admin). Pasting your own token is the way:
+
+```bash
+curl -s -X POST "$BASE/api/v1/whoami/elevate" -H 'Content-Type: application/json' \
+  -d '{"token": "dapi…"}'
+# -> {"accepted": true, "detail": "role admin: member of …", "role": "admin", …}
+# -> 403 {"error": "the token belongs to other@example.test, not to the signed-in caller"}
+```
+
+The token is validated against the identity the platform **already asserted**, so one
+user's token cannot elevate another; it is never stored and never logged. Turn the surface
+off with `identity.allow_self_elevation: false`. The alternative with no extra step is
+`identity.admin_users`, a name list.
+
+### Where a non-administrator's write goes
+
+Every mutating config and pack endpoint in §10 and §11 takes the same body and returns
+the same shape for both roles — the difference is the destination, and the response says
+so rather than leaving it to be inferred from a `200`:
+
+```bash
+curl -s -X PUT "$BASE/api/v1/config" -H 'Content-Type: application/json' \
+  -d '{"updates": {"anomaly_detection.threshold": 0.85}}'
+# as a user ->
+# {"changed": [ … ], "layer": true, "effect": "draft", "state": "clean",
+#  "restart_required": false,
+#  "note": "saved to your own layer. The running configuration and knowledge pack are
+#           the administrator's base; an administrator promotes a layer by saving the
+#           same text."}
+```
+
+**A layer is a durable, merged-forward, author-visible DRAFT.** It survives restarts, a
+subsequent read of the same path returns it, and it is re-merged when the administrator
+moves the base — but the pack and the config *this process runs on* are built at boot
+from the base, which is why `restart_required` is `false`: no restart applies a draft
+either. On a layered pack write the pack diagnostics are stamped
+`"validate_scope": "base"`, since they describe the files on disk and beside a draft would
+read as a verdict on what was just saved.
+
+An administrator's write to the base re-merges everybody's layers and reports it:
+
+```json
+{"changed": [ … ], "restart_required": true,
+ "rebased": {"dana.lee-example.test": {"source_catalog.yaml": "merged"},
+             "other-example.test":  {"source_catalog.yaml": "conflict"}}}
+```
+
+`clean` (the base did not move under this file) · `merged` (both sides applied) ·
+`conflict` (markers written **into the draft**, which is kept — losing an edit is worse
+than keeping one that no longer applies) · `adopted` (the draft now equals the base).
+
+Three writes have no draft to be and are **refused** for a non-administrator, with a 403
+naming the role, the reason and the remedy:
+
+| Route | Why |
+|---|---|
+| `POST /api/v1/knowledge/scaffold` | a new pack has no base to layer over |
+| `POST /api/v1/knowledge/{pack}/import` | this is the release verb — the version everybody runs |
+| `POST .../assist/{session}/apply` | all-or-nothing ops anchored in the base; anyone may still *ask* for a plan and read its preview |
+
+If no durable store is configured, a non-administrator's write is a **`503`** naming the
+one thing that still works — there is nowhere for their layer to live, and reporting
+success would lose the edit.
+
+### `GET /api/v1/overlay` — my own drafts, both trees
+
+```bash
+curl -s "$BASE/api/v1/overlay"
+# -> {"you": "someone@example.test", "role": "user",
+#     "edits_the_base": false, "effect": "draft",
+#     "config":    [{"path": "main_config.yaml", "state": "clean",
+#                    "edited_at": "2026-09-01T10:12:03Z", "rebased_at": null,
+#                    "conflict": false}],
+#     "knowledge": [{"path": "mock_domain/source_catalog.yaml", "state": "conflict",
+#                    "edited_at": "…", "rebased_at": "…", "conflict": true}]}
+```
+
+### `DELETE /api/v1/overlay/{label}?path=` — discard one of my overrides
+
+`label` is `config` or `knowledge`. This is the way back to the base view, and the only
+way out of a conflict — a conflicted draft is kept deliberately, so discarding it has to
+be a choice.
+
+```bash
+curl -s -X DELETE "$BASE/api/v1/overlay/knowledge?path=mock_domain/source_catalog.yaml"
+# -> {"dropped": true, "path": "mock_domain/source_catalog.yaml", "layer": "knowledge"}
+# -> 404 {"error": "you have no override of 'mock_domain/source_catalog.yaml'"}
+```
+
+### My own credentials — `/api/v1/secrets`
+
+The deployment ships with working credentials, and every caller's runs use them. A caller
+who has a token of their own may put it in and have *their* runs use it, with no effect on
+anybody else's. Three routes, and **none of them has an administrator override in either
+direction**: a credential is personal or it is the deployment's.
+
+**The value is never returned.** Not by this API, not to the page, not to a log line — what
+comes back is a `fingerprint` (the first bytes of a SHA-256 digest), which is enough to
+confirm a paste landed and to tell two credentials apart, and is not the credential. There
+is deliberately no read-back: the one person who does not need a secret displayed is the
+one who typed it.
+
+Keyed by **environment-variable name**, not by subsystem, because one name commonly backs
+several at once — asking for the same token four times is how three of the four go stale.
+`used_by` says what each name reaches. A name no reader on this deployment resolves is
+**refused**: storing it would report success and change nothing about the caller's runs.
+
+```bash
+curl -s "$BASE/api/v1/secrets"
+# -> {"you": "someone@example.test", "available": true,
+#     "secrets": [{"name": "DATABRICKS_TOKEN",
+#                  "used_by": ["LLM reasoning (every stage)", "SQL warehouses on 'analytics'"],
+#                  "personal": true, "source": "personal", "shared_configured": true,
+#                  "fingerprint": "9f2c1ab4", "updated_at": "2026-09-04T09:31:02Z"}],
+#     "withheld": [{"name": "AFIR_STORAGE_TOKEN", "reason": "durable state is shared …"}],
+#     "note": "A value you save here is used by your own runs only and is never displayed …"}
+
+curl -s -X PUT "$BASE/api/v1/secrets/DATABRICKS_TOKEN" \
+  -H 'Content-Type: application/json' -d '{"value": "dapi…"}'
+# -> {"saved": true, "name": "DATABRICKS_TOKEN", "personal": true, "fingerprint": "9f2c1ab4", …}
+# -> 400 {"error": "nothing on this deployment reads 'NOPE', so replacing it would change
+#                   none of your runs", "offerable": ["DATABRICKS_TOKEN", …]}
+# -> 503 {"error": "no durable store is configured, so a personal credential cannot be kept"}
+
+curl -s -X DELETE "$BASE/api/v1/secrets/DATABRICKS_TOKEN"
+# -> {"cleared": true, "name": "DATABRICKS_TOKEN", "personal": false, "source": "shared", …}
+# -> 404 {"error": "you have no personal credential for 'DATABRICKS_TOKEN'"}
+```
+
+Where the feature is off, `available` is `false` and a `reason` says which of the two
+reasons it is: no durable store is configured at all, or one is and the live config reads no
+credential by name. Those are different fixes, and a surface that only says "unavailable"
+sends the reader to the wrong one.
+
+`withheld` is part of the answer rather than a footnote: a surface listing four names and
+silently dropping three others reads as one that covers everything. Two credentials are
+withheld deliberately — the durable store's own (every caller's run history, reports and
+this deployment's audit trail live there, so a personal one would either do nothing or hide
+the caller's own runs from them), and Elasticsearch / Snowflake sign-in, which is configured
+as a username and a password rather than a named credential and is built into the client at
+boot, so there is no name to replace and no per-call seam to replace it at.
+
+**A name that appears in `secrets` never also appears in `withheld`.** One token can back the
+reasoning endpoint *and* the durable store — it does on the driver-proxy deployment — and a
+caller cannot act on a name listed as replaceable above and unreplaceable below. So the row
+is named for the subsystem that keeps the deployment's value (`Durable state (run history,
+reports, audit trail)`) and its reason names the credential: the limit still holds, and it is
+stated as the limit it is rather than as advice against the one replacement that works.
+
+A replacement applies **from the caller's next run**, and to their runs only. A run already
+under way keeps the credentials it started with, and a run resumed or retried by an
+administrator keeps its *submitter's* — a run does not change whose token it uses half way
+through.
+
+### Runs, batches and artifacts are scoped to their caller
+
+A submitted run records who asked for it, and `GET /api/v1/jobs`, `GET /api/v1/batches`
+and the gate inbox list only the caller's own. An administrator sees every run.
+
+- **Another caller's job is `404`, not `403`** — a 403 confirms the id exists, and the
+  body never names the owner. The same applies to every job sub-route, including
+  `control`, so nobody can cancel a run by guessing its id.
+- **A run with no owner is administrator-only.** That is every run from before this
+  existed and every run of a deployment that resolves no identity: attributing one to
+  whoever happens to ask would be inventing a claim.
+- Jobs and exports are written under `users/<segment>/…` in the configured store —
+  `jobs/users/<segment>/<id>.json`, `exports/users/<segment>/fraud_report_<id>.md`.
+- **And read back from there**, which is a second decision and not the same one: a
+  job-keyed route (`/api/v1/jobs/{id}/report|evidence|artifacts`) reads the **run's**
+  owner, so an administrator reading somebody else's finished run gets that run's
+  artifacts; an incident-keyed route has only an id, so it offers the caller's own
+  subtree, or every subtree for an administrator. The shared root is always tried first,
+  so a deployment that resolves no identity behaves exactly as it did before. Where an
+  artifact is missing the answer is `404` from the job lookup, or `exists: false` in
+  `/artifacts` — never another caller's file.
+
+### `GET /api/v1/audit` — who called, and what they changed
+
+**Administrators only**, because it names every other caller. The question a jobs listing
+cannot answer: every other durable record AFIR keeps is about a *run*, so a caller who only
+browses, reads someone else's report, is refused at the door or edits the shared configuration
+leaves no trace anywhere — and neither does the fact that anybody was here at all.
+
+```bash
+curl -s "$BASE/api/v1/audit?limit=50"
+curl -s "$BASE/api/v1/audit?user=someone@example.com&since=2026-09-01"
+# -> {"entries": [{"at": "2026-09-04T12:00:01+00:00", "kind": "request",
+#                  "user": "someone@example.com", "role": "user", "auth": "header",
+#                  "method": "GET", "path": "/api/v1/jobs", "status": 200, "ms": 12.5},
+#                 {"kind": "refused", "status": 403, "path": "/api/v1/jobs",
+#                  "detail": "two conflicting user headers"},
+#                 {"kind": "config_change", "user": "owner@example.com", "target": "base",
+#                  "changed": [{"path": "anomaly_detection.threshold", "from": "0.8",
+#                               "to": "0.55", "applies": "live"}]}],
+#     "count": 3, "limit": 50,
+#     "journal": {"enabled": true, "pending": 4, "dropped": 0, "write_failures": 0,
+#                 "flush_seconds": 30.0, "retention_days": 90, "days_held": 12}}
+```
+
+Five `kind`s, and each answers something a reader can act on:
+
+| `kind` | What it records |
+|---|---|
+| `request` | One completed HTTP call: method, path, status and duration. `auth` is `token` / `header` / `local`, so a single-operator entry is never read as an authenticated one. |
+| `refused` | An identity that could not be trusted, **with the reason** — the only record of why a caller reaching AFIR by a URL that strips the identity headers sees a bare 403. There is no `user`: that is what was refused. |
+| `config_change` | Each path with its before and after value, `target` saying whether it landed on the shared base or in that caller's own draft. Secret-shaped keys are redacted both ways; a long value is truncated and says how long it was. |
+| `secret_change` | A caller replaced or cleared one of their **own** credentials: the name, the action and the fingerprint. Never the value — this journal is readable by an administrator and the whole point of that surface is that the value is not. |
+| `journal_overflow` | Entries the app discarded while its sink was refusing writes. Present means the counts around it are **floors**. |
+
+Three properties worth knowing before you rely on it:
+
+- **It is durable, not a log line.** Entries are appended to the storage backend
+  (`audit/access-YYYY-MM-DD.jsonl`, one object per UTC day), because on a cluster driver
+  stdout is a file on ephemeral local disk. With `storage.backend: local` the journal inherits
+  that caveat.
+- **It is buffered, and the window is stated.** A Volume append is a read-modify-write
+  serialised on one thread, so an append per request would put an investigation's writes
+  behind a queue of page loads. Up to `audit.flush_seconds` (default 30) of entries are lost
+  by a hard kill; a clean shutdown drains them. **It is not a security control** and it is
+  never in the request path.
+- **Disabled answers `200` with an empty list**, not `404` — "nobody has done anything" and
+  "nothing is being recorded" are different answers, and `journal.enabled` is which one you
+  have. `audit.enabled: auto` follows the identity layer: on behind an ingress that names
+  callers, off on a laptop or a VM where every caller is the same local operator.
+
+Both records are plain JSON and JSONL behind the storage seam, so a census over them — runs
+per owner, plus the journal — is a read of `jobs/` and `audit/` and needs no endpoint of its
+own.
 
 ---
 
@@ -1656,17 +1989,21 @@ so:** this is the platform's liveness probe, it must stay fast, and it must not 
 depending on a collaborator being wired. No query parameter means a byte-identical response
 to what it has always returned.
 
-`GET /health?deep=1` answers the question the bare probe cannot. **Three failures leave a
+`GET /health?deep=1` answers the question the bare probe cannot. **Four failures leave a
 server that is genuinely up and a run that reports success**, and every one of them is
 announced only in a container log the operator cannot read: an empty LLM credential (all six
 LLM stages 401), a durable store that refuses every write (the run finishes and its pending
-approvals are gone on the next restart), and declared sources that built no retriever (the
+approvals are gone on the next restart), declared sources that built no retriever (the
 retrieval stage reports success, the conditions that needed them read `unknown`, and the
-verdict comes back INSUFFICIENT DATA — indistinguishable from *"the sources had nothing"*).
+verdict comes back INSUFFICIENT DATA — indistinguishable from *"the sources had nothing"*),
+and a knowledge pack that loaded **empty**, which is the widest of the four: a `pack_dir`
+that is absent from the deployed tree costs the glossary, the source catalog and every
+ruleset at once, and `load_knowledge_pack` reports it with a single `logger.warning`.
 
 ```bash
 curl -s "$BASE/health?deep=1" | python -m json.tool
 # -> {"status": "ok", "llm_credential": true, "pack": true, "jobs": 2, "pipeline": true,
+#     "pack_detail": "<pack>: 16 entities, 30 sources, 12 rulesets, 21 playbooks",
 #     "storage": "databricks", "storage_ok": true, "storage_detail": null,
 #     "sources_declared": 30, "sources_unavailable": {},
 #     "retrieval_cache": {"enabled": true, "entries": 12, "rows": 4103, "hits": 7,
@@ -1677,10 +2014,11 @@ curl -s "$BASE/health?deep=1" | python -m json.tool
 | key | meaning |
 |---|---|
 | `llm_credential` | `true` a token resolves · `false` wired but unusable (every LLM stage will 401) · `null` no LLM client wired at all |
-| `pack` | whether `knowledge.pack_dir` is configured |
+| `pack` | whether the pack **loaded**, counted from its own contents · `false` it loaded empty · `null` no pack wired. Not whether `knowledge.pack_dir` is *set*: an absent directory loads as an empty pack, so the name is set either way |
+| `pack_detail` | the pack's name and its counted contents, filled either way — a pack that loaded still has to be read for the ruleset a verdict needs |
 | `jobs` | count of live jobs, or `null` if no job manager is wired / the lister raised |
 | `pipeline` | whether an incident-processing function is wired |
-| `storage` | where durable state lives (`local` / `databricks` / `sql`), or `null` if no store is wired |
+| `storage` | where durable state lives (`local` / `databricks` / `dbfs` / `sql`), or `null` if no store is wired |
 | `storage_ok` | `true` usable · `false` **with `storage_detail` naming the cause** · `null` not wired |
 | `storage_detail` | why the store is unusable (a blank catalog, a 403 from a workspace-scoped PAT, an unset `$AFIR_SQL_DSN`, …), else `null` |
 | `sources_declared` | how many sources the pack declared *and* the engine resolved — built plus unavailable |

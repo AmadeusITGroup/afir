@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from src.identity import USER_PREFIX, owner_of, owner_prefix
 from src.storage import (LocalStorage, PrefixedStorage, StorageBackend,
                          json_verifier)
 from src.utils.paths import data_dir
@@ -113,12 +114,36 @@ class JobStore:
     def using_fallback(self) -> bool:
         return self._using_fallback
 
-    def _keys(self, job_id: str):
-        """The (doc, evidence) keys for a job, or (None, None) if unusable."""
+    def _keys(self, job_id: str, owner: str = ""):
+        """The (doc, evidence) keys for a job, or (None, None) if unusable.
+
+        An owned job lives under its owner's segment. An unowned one keeps the flat key it
+        has always had, so every job written before this existed still loads.
+        """
         if self.storage is None:
             return None, None
         safe = _safe_id(job_id)
-        return f"{safe}.json", f"{safe}.evidence.json"
+        base = f"{owner_prefix(owner)}/{safe}" if owner else safe
+        return f"{base}.json", f"{base}.evidence.json"
+
+    def _locate(self, job_id: str) -> Optional[str]:
+        """Find a job's doc key when the caller has no doc to read the owner from.
+
+        A search rather than an argument: `delete` is reached from prune and from the job
+        manager, neither of which holds the incident.
+        """
+        backend = self.storage
+        if backend is None:
+            return None
+        safe = _safe_id(job_id)
+        flat = f"{safe}.json"
+        if backend.exists(flat):
+            return flat
+        suffix = f"/{flat}"
+        for obj in backend.list_keys(USER_PREFIX):
+            if obj.key.endswith(suffix):
+                return obj.key
+        return None
 
     # -- write -------------------------------------------------------------
 
@@ -130,7 +155,7 @@ class JobStore:
         if not job_id:
             logger.warning("Refusing to persist a job doc with no job_id.")
             return False
-        doc_key, evidence_key = self._keys(job_id)
+        doc_key, evidence_key = self._keys(job_id, owner_of(doc.get("incident")))
         if doc_key is None:
             return False
 
@@ -212,7 +237,9 @@ class JobStore:
             if not isinstance(doc, dict) or not doc.get("job_id"):
                 logger.warning("Skipping unreadable job document %s", key)
                 continue
-            _, evidence_key = self._keys(doc["job_id"])
+            _, evidence_key = self._keys(
+                doc["job_id"], owner_of(doc.get("incident"))
+            )
             evidence = _parse(backend.get_text(evidence_key)) if evidence_key else None
             if isinstance(evidence, dict):
                 doc.setdefault("outputs", {}).update(evidence)
@@ -226,6 +253,38 @@ class JobStore:
             docs.append(doc)
         docs.sort(key=lambda x: x.get("created_at") or "")
         return docs
+
+    def load_one(self, job_id: str) -> Optional[dict]:
+        """One persisted job doc by id, evidence merged back in, or ``None``.
+
+        The read behind rehydrating a run the in-memory TTL evicted: `load_all` would read
+        every document to answer for one.
+        """
+        backend = self.storage
+        if backend is None:
+            return None
+        doc_key = self._locate(job_id)
+        if doc_key is None:
+            return None
+        doc = _parse(backend.get_text(doc_key)) or _parse(
+            backend.get_previous_text(doc_key)
+        )
+        if not isinstance(doc, dict) or not doc.get("job_id"):
+            logger.warning("Stored job document %s is unreadable.", doc_key)
+            return None
+        evidence = _parse(
+            backend.get_text(doc_key[: -len(".json")] + ".evidence.json")
+        )
+        if isinstance(evidence, dict):
+            doc.setdefault("outputs", {}).update(evidence)
+        elif doc.get("evidence_omitted"):
+            logger.warning(
+                "Job %s was persisted WITHOUT its evidence (%s); stages that consume it "
+                "cannot be re-run on this copy.",
+                doc["job_id"],
+                doc["evidence_omitted"],
+            )
+        return doc
 
     def _job_doc_keys(self) -> List[str]:
         """Every main-document key, excluding the evidence sidecars."""
@@ -241,11 +300,11 @@ class JobStore:
     # -- housekeeping ------------------------------------------------------
 
     def delete(self, job_id: str) -> bool:
-        doc_key, evidence_key = self._keys(job_id)
+        doc_key = self._locate(job_id)
         if doc_key is None:
             return False
         ok = self.storage.delete(doc_key)
-        self.storage.delete(evidence_key)
+        self.storage.delete(doc_key[: -len(".json")] + ".evidence.json")
         return ok
 
     def prune(self) -> int:

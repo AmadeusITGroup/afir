@@ -10,6 +10,14 @@ Three surfaces, in increasing order of how much damage they can do:
 3. **Import** — every file is validated before *any* is written: importing a matched pair where
    only the first is valid leaves the app running half of somebody else's environment.
 
+A fourth surface is the inverse of the other three: **My credentials** writes nothing shared at
+all. Everything above edits the deployment; that panel replaces one named credential for the
+caller's *own* runs, so it is the one place a secret may legitimately be typed — and the one
+place a saved value is never read back, not even to its author. What it lists is which names a
+reader actually resolves (a name nothing reads is refused rather than stored to no effect) and
+which are deliberately withheld, since a panel that silently omits half of them reads as
+complete.
+
 Three things the UI states rather than implies. A redacted secret means "keep what's on disk",
 so saving a field still holding ``__redacted__`` is a server-side no-op and a form that PUTs its
 own read back cannot overwrite a password; an ``${ENV_VAR}`` reference reads back verbatim,
@@ -29,11 +37,19 @@ CONFIGURE_HTML = r"""    <div class="panel subbar">
         server. Leaving that placeholder in a field keeps whatever is on disk. <code>${ENV_VAR}</code>
         references are shown as-is — that is a variable <em>name</em>, not a credential.
       </div>
+      <div class="banner" id="cfgDraftNote" data-user-only hidden>
+        Every field here is yours to change, and a save lands in <strong>your own draft</strong>:
+        durable, re-merged when an administrator moves the shared version, and with no effect on
+        what a run does. Nothing here is refused — the <span class="hbadge tag-live">live</span>
+        and <span class="hbadge tag-restart">restart</span> tags describe the shared version, so
+        neither applies to a draft.
+      </div>
       <div class="row" style="margin-top:0">
         <div class="seg">
           <label><input type="radio" name="cfgview" value="form" checked/> Form</label>
           <label><input type="radio" name="cfgview" value="raw"/> Raw YAML</label>
           <label><input type="radio" name="cfgview" value="io"/> Import / export</label>
+          <label><input type="radio" name="cfgview" value="creds"/> My credentials</label>
         </div>
         <button class="btn small" id="cfgReload" title="Re-read the files from disk, discarding unsaved edits"><svg class="ico"><use href="#i-refresh"/></svg> Reload from disk</button>
         <div class="spacer"></div>
@@ -91,5 +107,24 @@ CONFIGURE_HTML = r"""    <div class="panel subbar">
         <span class="statusline" id="cfgImportStatus"></span>
       </div>
       <div id="cfgImportList"></div>
+    </div>
+
+    <div class="panel" id="cfgCredsView" hidden>
+      <h2>My credentials <span class="sub" id="credWho"></span></h2>
+      <div class="banner">
+        This deployment ships with working credentials, and everything above is the
+        <strong>shared</strong> configuration. A value you put in here replaces one of them for
+        <strong>your own runs only</strong> — nobody else's run changes, and nothing you save here
+        appears in the shared config or in an export. It is <strong>never displayed again</strong>:
+        the fingerprint is how you confirm which value is in force, and a replacement applies from
+        your next run.
+      </div>
+      <div class="row" style="margin-top:0">
+        <button class="btn small" id="credReload"><svg class="ico"><use href="#i-refresh"/></svg> Reload</button>
+        <div class="spacer"></div>
+        <span class="statusline" id="credStatus"></span>
+      </div>
+      <div id="credRows"><div class="empty">Loading…</div></div>
+      <div id="credWithheld"></div>
     </div>
 """

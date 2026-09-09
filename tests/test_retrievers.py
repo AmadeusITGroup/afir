@@ -10,6 +10,7 @@ import re
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import aiohttp
 import pytest
 
 from src.log_retrieval import LogRetrievalEngine, _is_placeholder
@@ -17,6 +18,7 @@ from src.models.pydantic_models import (EsqlQuery, EsQueryDsl, ExtractedEntity,
                                         RetrievalQuery, SchemaSelection,
                                         SqlQuery)
 from src.retrievers.databricks_retriever import (DatabricksRetriever,
+                                                 _columns_from_describe,
                                                  _flatten_struct,
                                                  _live_column_types,
                                                  _normalize_struct_paths,
@@ -501,6 +503,74 @@ async def test_kibana_retriever_field_discovery_falls_back_on_error():
     assert schema == "fallback_field"  # falls back, never raises
 
 
+@pytest.mark.asyncio
+async def test_node_direct_gateway_addresses_the_index_and_unwraps_nothing():
+    """The same query language against a data node instead of the Kibana proxy.
+
+    A network can reach 9200 and not Kibana's own port, and switching to the ES|QL
+    retriever there would switch query LANGUAGES — invalidating every pack ``query_hints``
+    written for DSL. So the route lives in this retriever, and the three things that differ
+    are the path, the unwrapped body, and the absent ``rawResponse`` envelope.
+    """
+    config = {
+        "name": "siem_alerts",
+        "gateway": "node",
+        "url": "https://es-node-1.example.net:9200",
+        "username": "u",
+        "password": "p",
+        "index": "raw.prd.siem-alerts*",
+        "max_results": 25,
+    }
+    llm = MagicMock()
+    llm.structured_output = AsyncMock(
+        return_value=EsQueryDsl(
+            query={"bool": {"filter": [{"range": {"timestamp": {}}}]}}
+        )
+    )
+    retriever = KibanaRetriever(config, llm)
+
+    # A node answers with the response itself — no envelope to unwrap.
+    sample = _FakeResp({"hits": {"hits": [{"_source": {"alertId": "x"}}]}})
+    real = _FakeResp({"hits": {"hits": [{"_source": {"alertId": "a1"}}]}})
+    session = MagicMock()
+    session.closed = False
+    session.post = MagicMock(side_effect=[sample, real])
+    retriever._session = session
+
+    rows = await retriever.retrieve(_query("siem_alerts"))
+
+    assert rows == [{"alertId": "a1"}]
+    for call in session.post.call_args_list:
+        assert call.args[0] == (
+            "https://es-node-1.example.net:9200/raw.prd.siem-alerts*/_search"
+        )
+    # The body is the search body itself, and the retriever still owns the row cap.
+    real_body = session.post.call_args_list[1].kwargs["json"]
+    assert "params" not in real_body
+    assert real_body["size"] == 25
+    assert "bool" in real_body["query"]
+
+
+@pytest.mark.asyncio
+async def test_the_gateway_route_is_unchanged_and_is_the_default():
+    """A config naming no gateway is the gateway one — every caller that predates the
+    node route meant that, and this retriever is constructed directly in several places."""
+    config = {"name": "s", "url": "https://kibana.example.net", "index": "i*"}
+    assert KibanaRetriever(config, MagicMock()).gateway == "kibana"
+    assert KibanaRetriever(dict(config, gateway="node"), MagicMock()).gateway == "node"
+
+
+def test_a_node_direct_session_does_not_claim_to_be_kibana():
+    """``x-elastic-internal-origin`` is what ES reads to relax system-index restrictions.
+    Sending it while talking to the node directly is claiming to be a component we are not.
+    """
+    from src.retrievers.kibana_retriever import _KIBANA_HEADERS, _NODE_HEADERS
+
+    assert "x-elastic-internal-origin" in _KIBANA_HEADERS
+    assert "kbn-xsrf" in _KIBANA_HEADERS
+    assert set(_NODE_HEADERS) == {"Content-Type"}
+
+
 def test_merge_endpoint_elasticsearch_routes_to_kibana_gateway():
     """A backend with gateway:kibana yields type 'kibana' (else 'elasticsearch')."""
     from types import SimpleNamespace
@@ -539,6 +609,53 @@ def test_merge_endpoint_elasticsearch_routes_to_kibana_gateway():
         engine._merge_endpoint(direct_src, "elasticsearch", backends)["type"]
         == "elasticsearch"
     )
+
+
+def test_merge_endpoint_routes_gateway_node_to_the_dsl_retriever_and_carries_it():
+    """``gateway: node`` picks Query DSL over ES|QL *and* the addressing inside it.
+
+    Two halves, and the wrong one alone is silent: routing without threading the value
+    builds a retriever that POSTs ``/internal/search/es`` at a data node (404 on every
+    query), and threading without routing leaves the value on an ES|QL config that reads it
+    nowhere.
+    """
+    from types import SimpleNamespace
+
+    engine = LogRetrievalEngine.__new__(LogRetrievalEngine)
+    backends = {
+        "elasticsearch": {
+            "node-prd": {
+                "url": "https://es-node-1.example.net:9200",
+                "gateway": "node",
+                "username": "u",
+                "password": "p",
+            },
+            "esql-prd": {
+                "url": "https://es.example.net:9200",
+                "username": "u",
+                "password": "p",
+            },
+        }
+    }
+    engine.config = {"backends": backends}
+
+    def src(cluster):
+        return SimpleNamespace(
+            name="app_logs",
+            endpoints={
+                "kind": "elasticsearch",
+                "cluster": cluster,
+                "indices": ["j*"],
+            },
+        )
+
+    node = engine._merge_endpoint(src("node-prd"), "elasticsearch", backends)
+    assert node["type"] == "kibana"
+    assert node["gateway"] == "node"
+    # And an undeclared gateway still means ES|QL, carrying no gateway to read.
+    esql = engine._merge_endpoint(src("esql-prd"), "elasticsearch", backends)
+    assert esql["type"] == "elasticsearch"
+    assert esql["gateway"] is None
 
 
 def test_merge_endpoint_threads_default_filters_and_query_hints():
@@ -594,8 +711,18 @@ def test_merge_endpoint_threads_default_filters_and_query_hints():
 
 
 class _FakeResp:
-    def __init__(self, payload):
+    # `status` is modelled because the retrievers now read it: a fake without one cannot
+    # tell a 200 from a 403, which is the whole thing the real code decides here.
+    def __init__(self, payload, status=200, reason="OK"):
         self._payload = payload
+        self.status = status
+        self.reason = reason
+        self.request_info = None
+        self.history = ()
+        self.headers = {}
+
+    async def text(self):
+        return json.dumps(self._payload)
 
     async def __aenter__(self):
         return self
@@ -1706,8 +1833,13 @@ def test_auth_for_workspace_only_reuses_matching_host():
 class _CancelAwareResp:
     """Fake aiohttp response that also supports .read() for the cancel path."""
 
-    def __init__(self, payload):
+    def __init__(self, payload, status=200, reason="OK"):
         self._payload = payload
+        self.status = status
+        self.reason = reason
+        self.request_info = None
+        self.history = ()
+        self.headers = {}
 
     async def __aenter__(self):
         return self
@@ -1717,6 +1849,9 @@ class _CancelAwareResp:
 
     def raise_for_status(self):
         pass
+
+    async def text(self):
+        return json.dumps(self._payload)
 
     async def json(self):
         return self._payload
@@ -2564,6 +2699,173 @@ async def test_reconcile_bound_names_every_unverified_table(caplog):
     text = "\n".join(r.getMessage() for r in caplog.records)
     assert "t044" in text and "t040" in text
     assert "t000" not in text
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# A catalog with no information_schema — the legacy Hive metastore
+#
+# Discovery was information_schema-only, and its failure returned an EMPTY schema. That is
+# not a degraded run: `_in_schema` then rejects every path, so the pack's measured
+# `entity_bindings` are all dropped as STALE, `render_filters` emits no predicate, and the
+# generated query keeps its window bound alone — an arbitrary page of other identities'
+# rows, which reads downstream exactly like the subject's own.
+# ─────────────────────────────────────────────────────────────────────────────
+_DESCRIBE_HIVE = [
+    {"col_name": "timestamp", "data_type": "timestamp", "comment": None},
+    {"col_name": "date", "data_type": "date", "comment": None},
+    {"col_name": "login", "data_type": "string", "comment": None},
+    {"col_name": "robot", "data_type": "boolean", "comment": None},
+    {"col_name": "# Partition Information", "data_type": "", "comment": ""},
+    {"col_name": "# col_name", "data_type": "data_type", "comment": "comment"},
+    {"col_name": "date", "data_type": "date", "comment": None},
+    {"col_name": "", "data_type": "", "comment": ""},
+    {"col_name": "# Detailed Table Information", "data_type": "", "comment": ""},
+    {"col_name": "Catalog", "data_type": "hive_metastore", "comment": ""},
+    {"col_name": "Type", "data_type": "EXTERNAL", "comment": ""},
+    # A value that would parse as a type if the section break were missed.
+    {"col_name": "Provider", "data_type": "delta", "comment": ""},
+]
+
+
+def test_columns_from_describe_reads_the_three_regions():
+    """A partition column is listed TWICE and must not become a second leaf."""
+    rows = _columns_from_describe(_DESCRIBE_HIVE, "authhistorylog")
+
+    assert [r["column_name"] for r in rows] == ["timestamp", "date", "login", "robot"]
+    assert all(r["table_name"] == "authhistorylog" for r in rows)
+    # The partition is marked on the column's own row, so `_partitions_from_columns` sees it.
+    assert [r["partition_index"] for r in rows] == [None, 0, None, None]
+    assert {"Catalog", "Type", "Provider"}.isdisjoint(
+        {r["column_name"] for r in rows}
+    )
+
+
+@pytest.mark.asyncio
+async def test_discovery_falls_back_to_describe_when_there_is_no_information_schema():
+    config = {
+        "name": "auth_history",
+        "workspace_url": "https://workspace",
+        "warehouse_id": "wh1",
+        "api_key_env": "DATABRICKS_TOKEN",
+        "catalog": "hive_metastore",
+        "schema": "legacy_audit",
+        "tables": ["authhistorylog"],
+    }
+    retriever = DatabricksRetriever(config, MagicMock())
+    calls = []
+
+    async def fake_execute(sql):
+        calls.append(sql)
+        if "information_schema" in sql:
+            raise RuntimeError(
+                "[TABLE_OR_VIEW_NOT_FOUND] The table or view "
+                "`hive_metastore`.`information_schema`.`tables` cannot be found."
+            )
+        if sql.startswith("DESCRIBE TABLE"):
+            return [dict(r) for r in _DESCRIBE_HIVE]
+        return []
+
+    retriever._execute_sql = AsyncMock(side_effect=fake_execute)
+
+    rows = await retriever._discover_columns("legacy_audit")
+
+    assert [r["column_name"] for r in rows] == ["timestamp", "date", "login", "robot"]
+    assert any(c == "DESCRIBE TABLE hive_metastore.legacy_audit.authhistorylog" for c in calls)
+    # The declared table list is honoured, so no table listing is needed.
+    assert not any(c.startswith("SHOW TABLES") for c in calls)
+
+
+@pytest.mark.asyncio
+async def test_the_describe_fallback_still_yields_the_partition_bound():
+    """An unbounded scan of a partitioned table is the same silent failure one step on:
+    it times out, returns nothing, and every condition reading it goes `unknown`."""
+    config = {
+        "name": "auth_history",
+        "workspace_url": "https://workspace",
+        "warehouse_id": "wh1",
+        "api_key_env": "DATABRICKS_TOKEN",
+        "catalog": "hive_metastore",
+        "schema": "legacy_audit",
+        "tables": ["authhistorylog"],
+        "warehouse_warmup": False,
+    }
+    retriever = DatabricksRetriever(config, MagicMock())
+
+    async def fake_execute(sql):
+        if "information_schema" in sql:
+            raise RuntimeError("no information_schema in this catalog")
+        if sql.startswith("DESCRIBE TABLE"):
+            return [dict(r) for r in _DESCRIBE_HIVE]
+        return []
+
+    retriever._execute_sql = AsyncMock(side_effect=fake_execute)
+
+    schema = await retriever._get_field_schema()
+
+    assert "login" in schema
+    assert [p["name"] for p in retriever._discovered_partitions] == ["date"]
+
+
+@pytest.mark.asyncio
+async def test_the_fallback_lists_tables_when_the_pack_declares_none():
+    config = {
+        "name": "legacy",
+        "workspace_url": "https://workspace",
+        "warehouse_id": "wh1",
+        "api_key_env": "DATABRICKS_TOKEN",
+        "catalog": "hive_metastore",
+        "schema": "legacy_audit",
+    }
+    retriever = DatabricksRetriever(config, MagicMock())
+    calls = []
+
+    async def fake_execute(sql):
+        calls.append(sql)
+        if "information_schema" in sql:
+            raise RuntimeError("no information_schema in this catalog")
+        if sql.startswith("SHOW TABLES"):
+            return [
+                {"database": "legacy_audit", "tableName": "authhistorylog"},
+                {"database": "legacy_audit", "tableName": "authhistorylog_lh"},
+            ]
+        if sql.startswith("DESCRIBE TABLE"):
+            return [dict(r) for r in _DESCRIBE_HIVE]
+        return []
+
+    retriever._execute_sql = AsyncMock(side_effect=fake_execute)
+
+    rows = await retriever._discover_columns("legacy_audit")
+
+    # Schema-qualified, exactly as the information_schema path returns them: `_in_schema`
+    # reads one shape and a listed table that arrives bare is a table it cannot match.
+    assert {r["table_name"] for r in rows} == {
+        "legacy_audit.authhistorylog",
+        "legacy_audit.authhistorylog_lh",
+    }
+    assert sum(1 for c in calls if c.startswith("DESCRIBE TABLE")) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_readable_information_schema_is_never_second_guessed():
+    """The fallback is for a catalog that HAS none — it must not add a statement per table
+    to every UC source, nor let a DESCRIBE override what the catalog already answered."""
+    retriever, calls = _reconciling_retriever(
+        catalog_rows=[
+            {
+                "table_name": "events",
+                "column_name": "login",
+                "data_type": "string",
+                "full_data_type": "string",
+            }
+        ],
+        live_rows={},
+    )
+
+    rows = await retriever._discover_columns("audit")
+
+    assert [r["column_name"] for r in rows] == ["login"]
+    assert not any(c.startswith("DESCRIBE TABLE") for c in calls)
+    assert not any(c.startswith("SHOW TABLES") for c in calls)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -9803,3 +10105,74 @@ def test_the_two_SQL_retrievers_READ_the_declaration_off_the_source_config():
     assert snow.default_filters == {"application_phase": "PRD"}
     # A source declaring none gets an empty map, not None: the guard is then a no-op.
     assert DatabricksRetriever({**config, "default_filters": None}, MagicMock()).default_filters == {}
+
+
+@pytest.mark.asyncio
+async def test_a_4xx_carries_the_backend_reason_and_keeps_its_exception_type():
+    """A 403 must say WHICH 403 it was, without changing what catches it.
+
+    Measured on the deployed App: eleven sources failed as `403, message='Forbidden'`,
+    which is the same string for an expired token, a missing grant and a workspace
+    refusing the request's network — three different owners, one indistinguishable log.
+    The type is asserted alongside the message because `_gather` records the exception
+    TYPE in `unanswered_out` and the retry policy classifies on it.
+    """
+    from src.retrievers.base import raise_for_status_with_reason
+
+    resp = SimpleNamespace(
+        status=403,
+        reason="Forbidden",
+        request_info=None,
+        history=(),
+        headers={},
+        text=AsyncMock(return_value='{"error_code":403,"message":"Invalid access token."}'),
+    )
+    with pytest.raises(aiohttp.ClientResponseError) as excinfo:
+        await raise_for_status_with_reason(resp)
+    assert excinfo.value.status == 403
+    assert "Invalid access token" in excinfo.value.message
+    assert "Forbidden" in excinfo.value.message
+
+
+@pytest.mark.asyncio
+async def test_the_reason_never_carries_a_credential():
+    """An endpoint that echoes the request must not turn its error body into a token leak."""
+    from src.retrievers.base import raise_for_status_with_reason
+
+    resp = SimpleNamespace(
+        status=401,
+        reason="Unauthorized",
+        request_info=None,
+        history=(),
+        headers={},
+        text=AsyncMock(return_value="rejected header Authorization: Bearer dapi-secret-value"),
+    )
+    with pytest.raises(aiohttp.ClientResponseError) as excinfo:
+        await raise_for_status_with_reason(resp)
+    assert "dapi-secret-value" not in excinfo.value.message
+    assert "<redacted>" in excinfo.value.message
+
+
+@pytest.mark.asyncio
+async def test_a_2xx_is_not_disturbed():
+    """The helper replaces `raise_for_status`, so the success path must stay a no-op."""
+    from src.retrievers.base import raise_for_status_with_reason
+
+    text = AsyncMock(return_value="{}")
+    resp = SimpleNamespace(status=200, reason="OK", request_info=None, history=(),
+                           headers={}, text=text)
+    assert await raise_for_status_with_reason(resp) is None
+    # The body is left for the caller to read.
+    text.assert_not_awaited()
+
+
+def test_no_retriever_discards_a_4xx_body():
+    """Every HTTP backend routes through the one seam, or its 4xx goes back to being opaque."""
+    import pathlib
+
+    offenders = []
+    for path in sorted(pathlib.Path("src/retrievers").glob("*_retriever.py")):
+        body = path.read_text()
+        if "resp.raise_for_status()" in body:
+            offenders.append(path.name)
+    assert offenders == []

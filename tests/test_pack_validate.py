@@ -1835,6 +1835,88 @@ def test_a_pack_declaring_no_default_ruleset_is_never_mentioned(pack):
     ]
 
 
+# --- adjudication_policy: whether an unmatched incident is adjudicated at all ------------
+# Same two halves as `default_ruleset` — read from one file, must name a value the loader
+# knows — plus one of its own: abstaining means relabelling to a ruleset's `reject` label, so
+# a ruleset declaring none cannot abstain and keeps adjudicating under the default. All three
+# are errors because all three leave a pack that read as having taken a decision.
+
+
+def test_an_adjudication_policy_the_loader_does_not_know_is_an_error(pack):
+    """An unrecognised value falls back to `default`, i.e. to still adjudicating.
+
+    The failure is silent in the direction that costs something: a pack that asked to abstain
+    and mistyped it goes on producing a confident verdict under whichever ruleset the keyword
+    scorer's fallback reached.
+    """
+    (pack / "rulesets.yaml").write_text("adjudication_policy: astain\n")
+    hit = find(pv.validate_pack(pack), "adjudication-policy-unknown")
+    assert len(hit) == 1
+    assert hit[0]["severity"] == "error"
+    assert "astain" in hit[0]["detail"] or "astain" in hit[0]["message"]
+    assert "default, abstain" in hit[0]["detail"]
+    # It stops there: an unknown value is not also missing a label it never asked for.
+    assert not find(pv.validate_pack(pack), "abstain-without-reject-label")
+
+
+def test_an_adjudication_policy_inside_a_use_case_is_reported_as_INERT(pack):
+    """`pack.adjudication_policy()` reads the flat-root file only, so a use case's copy is
+    inert — and may be perfectly spelled, which is why the location gets its own code.
+    """
+    path = pack / RULES_REL
+    path.write_text("adjudication_policy: abstain\n" + path.read_text())
+    result = pv.validate_pack(pack)
+    hit = find(result, "adjudication-policy-not-at-pack-root")
+    assert len(hit) == 1
+    assert hit[0]["severity"] == "error"
+    assert hit[0]["path"] == RULES_REL
+    assert "rulesets.yaml" in hit[0]["hint"]
+    # And NOT reported as unknown or as label-less: the value is real and never took effect,
+    # so a second finding would send the author fixing a ruleset that is fine.
+    assert "adjudication-policy-unknown" not in codes(result)
+    assert "abstain-without-reject-label" not in codes(result)
+
+
+def test_abstaining_needs_a_word_to_abstain_in(pack):
+    """The one check specific to this key, and the one that cannot be inferred from the value.
+
+    `abstain` relabels the subject with the ruleset's own `reject` label — no new vocabulary,
+    no new schema value — so a ruleset declaring none keeps the default ruleset's verdict and
+    only annotates it. Declared and inert, which is what the error says.
+    """
+    (pack / "rulesets.yaml").write_text("adjudication_policy: abstain\n")
+    hit = find(pv.validate_pack(pack), "abstain-without-reject-label")
+    assert len(hit) == 1
+    assert hit[0]["severity"] == "error"
+    assert "example_use_case" in hit[0]["detail"]
+    assert "labels.reject" in hit[0]["hint"]
+
+    # Declaring the label clears it, and nothing else about the pack changed — the assertion
+    # is on this code alone, because the template's other findings are not this test's subject.
+    path = pack / RULES_REL
+    anchor = '      out_of_scope: "OUT OF SCOPE — PROCEDURE DOES NOT APPLY"'
+    text = path.read_text()
+    assert anchor in text, "the template's label block moved; re-anchor the insertion"
+    path.write_text(text.replace(anchor, anchor + '\n      reject: "RETURNED"', 1))
+    assert not find(pv.validate_pack(pack), "abstain-without-reject-label")
+
+
+def test_the_default_policy_asks_for_no_label_at_all(pack):
+    """`default` is what every pack authored before this key does, so it must want nothing."""
+    (pack / "rulesets.yaml").write_text("adjudication_policy: default\n")
+    assert not [
+        c for c in codes(pv.validate_pack(pack)) if c.startswith("adjudication-policy")
+    ]
+    assert not find(pv.validate_pack(pack), "abstain-without-reject-label")
+
+
+def test_a_pack_declaring_no_adjudication_policy_is_never_mentioned(pack):
+    """Silence is the default posture: the key is opt-in and the template declares none."""
+    result = pv.validate_pack(pack)
+    assert not [c for c in codes(result) if c.startswith("adjudication-policy")]
+    assert "abstain-without-reject-label" not in codes(result)
+
+
 # --- the exit taken when nothing decisive fired -----------------------------------------
 # `no_exclusion_fired` names which label the rollup's last branch exits to. Both ways of
 # getting it wrong are silent AND both land on the same value — the historical `fraud` exit,
@@ -3580,6 +3662,38 @@ def test_a_LONE_correlation_spec_reports_nothing_and_still_counts_itself(pack):
     result = pv.validate_pack(pack)
     assert result["counts"]["correlation_specs"] == 1
     assert not find(result, "spec-title-weak-discriminator")
+
+
+def test_a_LONE_correlation_specs_title_is_reported_as_UNSCORED(pack):
+    """The case the weak-token check cannot reach, because it returns before it.
+
+    A one-spec pack is a legitimate pack and its title is never scored: inverse spec frequency
+    weighs every token of a lone title at (1-1)/1 = 0, so the engine hands back the only
+    candidate whatever the incident says. That is not a defect — hence `info`, which leaves
+    `ok` true and adds no warning — but it is the one thing an author cannot tell from a
+    passing pack, and the day a second procedure lands the title has to discriminate.
+    """
+    result = pv.validate_pack(pack)
+    hits = find(result, "spec-title-unscored")
+    assert len(hits) == 1, [(h["path"], h["message"]) for h in hits]
+    assert hits[0]["severity"] == "info"
+    assert hits[0]["path"].endswith("example_playbook.md")
+    assert "nothing to fix" in hits[0]["hint"]
+    assert result["ok"] is True and result["errors"] == 0
+    assert result["infos"] >= 1
+
+
+def test_a_SECOND_spec_ends_the_unscored_info(pack):
+    """The info is about the pack's arity, so it must go when the arity changes.
+
+    Asserted separately from the weak-token check beside it: with two specs a title starts
+    being scored, which is exactly when the *other* diagnostic becomes meaningful. An info that
+    survived a second procedure would read as a permanent caption on every pack.
+    """
+    _second_spec(pack, "Rival Procedure — What This Other Pattern Involves")
+    result = pv.validate_pack(pack)
+    assert result["counts"]["correlation_specs"] == 2
+    assert not find(result, "spec-title-unscored")
 
 
 def test_a_playbook_with_no_correlation_block_is_not_a_spec(pack):
@@ -5343,3 +5457,362 @@ def test_the_forms_check_reads_whatever_a_pack_declares(name):
         for d in result["diagnostics"]
         if d["severity"] == "error" and "equivalence" in d["code"]
     ]
+
+
+# ------------------------------------------------- the procedure's own open questions
+
+
+def _question(**over):
+    """A WELL-FORMED `open_questions` declaration on the template ruleset, one key changed.
+
+    The baseline is what makes the rest of this block meaningful. Every test below asserts that
+    one code fires, and a checker that rejected every declaration would satisfy all of them at
+    once while making the key undeclarable — the failure mode a validator gets switched off for.
+    `test_a_well_formed_open_question_is_silent` is the control and each mutation starts from
+    these same bytes.
+
+    All three `meaning` outcomes are part of well-formedness rather than decoration: the
+    accessor DROPS an entry missing any of them, so an unlabelled outcome is not a lesser
+    declaration but no declaration at all.
+    """
+    entry = {
+        "id": "example_open_question",
+        "when": {"condition": "example_stub", "result": "unknown"},
+        "ask": {
+            "source": "record",
+            "scope_entity": "example_entity",
+            "question": "Was this recorded anywhere outside this procedure's own sources?",
+        },
+        "meaning": {
+            "rows": "it was recorded elsewhere, so the gap here has an explanation",
+            "empty": "nothing recorded it anywhere, which is what this silence would mean",
+            "unanswered": "still unknown — the source did not answer, so this is a gap",
+        },
+    }
+    drop = over.pop("_drop", ())
+    entry.update(over)
+    for key in drop:
+        entry.pop(key, None)
+
+    def mutate(spec):
+        spec["open_questions"] = [entry]
+
+    return mutate
+
+
+def question_codes(pack):
+    return [c for c in codes(pv.validate_pack(pack)) if c.startswith("open-question-")]
+
+
+def test_a_well_formed_open_question_is_silent(pack):
+    edit_rules(pack, _question())
+    assert question_codes(pack) == []
+    assert pv.validate_pack(pack)["counts"]["open_questions"] == 1
+
+
+def test_a_pack_declaring_no_open_questions_is_untouched_and_says_so_in_the_counts(pack):
+    """The whole lane must be inert for the pack every author starts from.
+
+    Same guarantee `follow_up_passes` and `entry_signals` give, and the count is what tells a
+    reader "this pack declares none" apart from "the check did not run".
+    """
+    result = pv.validate_pack(pack)
+    assert [c for c in codes(result) if c.startswith("open-question-")] == []
+    assert result["counts"]["open_questions"] == 0
+
+
+def test_an_open_question_with_no_id_is_an_ERROR(pack):
+    """An id is what a report cites and what an operator asks to have settled."""
+    edit_rules(pack, _question(_drop=("id",)))
+    hit = find(pv.validate_pack(pack), "open-question-no-id")
+    assert len(hit) == 1 and hit[0]["severity"] == "error"
+
+
+def test_two_open_questions_sharing_an_id_is_a_WARNING(pack):
+    """A reported question that cannot be traced back to ONE declaration.
+
+    A warning and not an error because both still load and both still report — what is lost is
+    the trace from the sentence back to the procedure that wrote it.
+    """
+
+    def mutate(spec):
+        _question()(spec)
+        spec["open_questions"].append(dict(spec["open_questions"][0]))
+
+    edit_rules(pack, mutate)
+    hit = find(pv.validate_pack(pack), "open-question-duplicate-id")
+    assert len(hit) == 1 and hit[0]["severity"] == "warning"
+
+
+def test_an_open_question_with_no_trigger_is_an_ERROR(pack):
+    """Neither `when.condition` nor `when.verdict_class` — nothing can ever raise it."""
+    edit_rules(pack, _question(when={"result": "unknown"}))
+    hit = find(pv.validate_pack(pack), "open-question-no-trigger")
+    assert len(hit) == 1 and hit[0]["severity"] == "error"
+    assert hit[0]["hint"]
+
+
+def test_a_trigger_naming_a_condition_this_ruleset_does_not_have_is_an_ERROR(pack):
+    """The commonest silent drop: a renamed condition leaves the question permanently unraised.
+
+    And the hint has to say what a *composite's child* is, because that is the near miss a
+    reader makes next: a child id looks like a condition id and reads correct in the YAML, but
+    the parent renders the single result a subject carries, so a trigger naming a child can
+    never match anything either.
+    """
+    edit_rules(pack, _question(when={"condition": "no_such_check", "result": "unknown"}))
+    hit = find(pv.validate_pack(pack), "open-question-unknown-condition")
+    assert len(hit) == 1 and hit[0]["severity"] == "error"
+    assert "child" in hit[0]["hint"].lower()
+
+
+def test_a_trigger_on_a_result_no_condition_ever_reads_is_an_ERROR(pack):
+    """`when.result` outside the engine's three-valued vocabulary matches nothing.
+
+    Asserted against the vocabulary the engine itself declares rather than a list spelled here,
+    for `link_directions`' reason: a list restated in the checker is a second answer to what the
+    engine reads.
+    """
+    edit_rules(pack, _question(when={"condition": "example_stub", "result": "failed"}))
+    hit = find(pv.validate_pack(pack), "open-question-unknown-result")
+    assert len(hit) == 1 and hit[0]["severity"] == "error"
+    for trigger in pv.inquiry_triggers():
+        assert trigger in hit[0]["message"]
+
+
+def test_every_real_trigger_result_is_accepted(pack):
+    """The positive control the check above needs.
+
+    Without it the error is satisfied by a checker that rejects every result, which would make
+    the key undeclarable and be discovered only by an author.
+    """
+    for result in pv.inquiry_triggers():
+        edit_rules(
+            pack, _question(when={"condition": "example_stub", "result": result})
+        )
+        assert question_codes(pack) == [], result
+
+
+def test_a_trigger_on_a_verdict_class_the_rollup_never_stamps_is_an_ERROR(pack):
+    edit_rules(pack, _question(when={"verdict_class": "extremely_bad"}))
+    hit = find(pv.validate_pack(pack), "open-question-unknown-verdict-class")
+    assert len(hit) == 1 and hit[0]["severity"] == "error"
+
+
+def test_a_verdict_class_trigger_alone_is_a_real_trigger(pack):
+    """The other half of the control: a question may be raised by the OUTCOME and no condition.
+
+    Asserted because `when.condition` is the shape every other test here uses, so a checker that
+    quietly required it would pass all of them.
+    """
+    for want in pv.verdict_classes():
+        edit_rules(pack, _question(when={"verdict_class": want}))
+        assert question_codes(pack) == [], want
+
+
+def test_an_open_question_with_no_source_is_an_ERROR(pack):
+    """Nothing to put the question to, so the accessor drops it."""
+    edit_rules(
+        pack,
+        _question(
+            ask={
+                "scope_entity": "example_entity",
+                "question": "Was this recorded anywhere else?",
+            }
+        ),
+    )
+    hit = find(pv.validate_pack(pack), "open-question-no-source")
+    assert len(hit) == 1 and hit[0]["severity"] == "error"
+
+
+def test_a_source_resolvable_NEITHER_way_is_an_ERROR(pack):
+    """Neither this ruleset's own `sources:` map nor the catalog — it can never be retrieved.
+
+    And the hint has to state the thing that makes this lane cheap, because the obvious fix for
+    an unknown source is to add it to `sources:` — which turns an advisory question into a hard
+    dependency scanned on every run, the opposite of what the key is for.
+    """
+    edit_rules(
+        pack,
+        _question(
+            ask={
+                "source": "not_a_source_anywhere",
+                "scope_entity": "example_entity",
+                "question": "Was this recorded anywhere else?",
+            }
+        ),
+    )
+    hit = find(pv.validate_pack(pack), "open-question-unknown-source")
+    assert len(hit) == 1 and hit[0]["severity"] == "error"
+    assert "not added to every run" in hit[0]["hint"].replace("NOT", "not")
+
+
+def test_a_PHYSICAL_source_name_is_accepted_as_well_as_a_logical_one(pack):
+    """The whole point of the lane: the question may name a source no ruleset declares.
+
+    A source outside the `sources:` map is exactly the interesting case — it is not retrieved on
+    every run, so the question is either free (this run happened to hold it) or one bounded
+    probe. A checker accepting only logical names would force every open question to become a
+    hard dependency.
+    """
+    edit_rules(
+        pack,
+        _question(
+            ask={
+                "source": "example_source",
+                "scope_entity": "example_entity",
+                "question": "Was this recorded anywhere else?",
+            }
+        ),
+    )
+    assert question_codes(pack) == []
+
+
+def test_an_open_question_with_no_question_text_is_a_WARNING(pack):
+    """A report would print the id where the question belongs.
+
+    A warning rather than an error because the source plus the scope is still a real ask and the
+    entry still loads — what is lost is the text a probe shapes its query from and the sentence
+    an operator reads.
+    """
+    edit_rules(
+        pack, _question(ask={"source": "record", "scope_entity": "example_entity"})
+    )
+    hit = find(pv.validate_pack(pack), "open-question-no-question-text")
+    assert len(hit) == 1 and hit[0]["severity"] == "warning"
+
+
+def test_a_scope_entity_the_glossary_does_not_declare_is_a_WARNING(pack):
+    """No run will hold a value of that type, so the question reports `unreachable` every time.
+
+    A warning and not an error because the entry loads and reports honestly — it is reachable
+    prose about an unreachable question, which is a different failure from a dropped one.
+    """
+    edit_rules(
+        pack,
+        _question(
+            ask={
+                "source": "record",
+                "scope_entity": "not_an_entity",
+                "question": "Was this recorded anywhere else?",
+            }
+        ),
+    )
+    hit = find(pv.validate_pack(pack), "open-question-unknown-scope-entity")
+    assert len(hit) == 1 and hit[0]["severity"] == "warning"
+    assert hit[0]["hint"]
+
+
+def test_an_absent_scope_entity_is_silent_because_it_INHERITS(pack):
+    """Omitting the key is not a defect: the question inherits the ruleset's subject entity.
+
+    The control for the warning above — without it, a checker demanding the key everywhere would
+    pass that test and make the common case noisy.
+    """
+    edit_rules(
+        pack,
+        _question(
+            ask={
+                "source": "record",
+                "question": "Was this recorded anywhere else?",
+            }
+        ),
+    )
+    assert question_codes(pack) == []
+
+
+@pytest.mark.parametrize("outcome", ["rows", "empty", "unanswered"])
+def test_an_outcome_with_no_declared_meaning_is_an_ERROR(pack, outcome):
+    """The one check this lane exists for, and it is per OUTCOME.
+
+    Three outcomes license three different next steps — a reading, a reading of a silence, and a
+    credential — so a declaration covering two of them is not two thirds of a question. The
+    accessor drops the whole entry, which is why this is an error and not a warning, and the
+    parametrisation is the assertion: a checker that only noticed a wholly absent `meaning:`
+    would pass a single combined test.
+    """
+    meaning = {
+        "rows": "recorded elsewhere",
+        "empty": "recorded nowhere",
+        "unanswered": "still unknown",
+    }
+    meaning.pop(outcome)
+    edit_rules(pack, _question(meaning=meaning))
+    hit = find(pv.validate_pack(pack), "open-question-missing-meaning")
+    assert len(hit) == 1 and hit[0]["severity"] == "error"
+    assert outcome in hit[0]["message"]
+    assert hit[0]["hint"]
+
+
+def test_a_blank_meaning_is_not_a_declared_one(pack):
+    """Whitespace is the near miss a template leaves behind, and it must not read as a label.
+
+    A key present with an empty value is the shape this repo has been bitten by before — a
+    comment-only YAML value parses to `None`, so `.get(k, default)` never fires — and here it
+    would let a report print "the procedure says that means: " with nothing after it.
+    """
+    edit_rules(
+        pack,
+        _question(
+            meaning={"rows": "recorded elsewhere", "empty": "   ", "unanswered": None}
+        ),
+    )
+    hit = find(pv.validate_pack(pack), "open-question-missing-meaning")
+    assert len(hit) == 1
+    assert "empty" in hit[0]["message"] and "unanswered" in hit[0]["message"]
+
+
+def test_open_questions_declared_as_a_mapping_is_an_ERROR(pack):
+    """One entry written without its `-` ignores the whole lane rather than one question."""
+
+    def mutate(spec):
+        spec["open_questions"] = {"id": "oops"}
+
+    edit_rules(pack, mutate)
+    hit = find(pv.validate_pack(pack), "open-question-not-a-list")
+    assert len(hit) == 1 and hit[0]["severity"] == "error"
+    # And it stops there: a mapping cannot be walked as entries, so reporting per-entry codes
+    # against its keys would be a page of findings about one typo.
+    assert question_codes(pack) == ["open-question-not-a-list"]
+
+
+def test_an_open_question_that_is_not_a_mapping_is_an_ERROR(pack):
+    def mutate(spec):
+        spec["open_questions"] = ["just a string"]
+
+    edit_rules(pack, mutate)
+    hit = find(pv.validate_pack(pack), "open-question-not-a-mapping")
+    assert len(hit) == 1 and hit[0]["severity"] == "error"
+
+
+def test_every_diagnostic_carries_a_line_a_reader_can_open(pack):
+    """A finding with no cursor is a finding an author has to go and search for.
+
+    Asserted over the whole block rather than per code, because the id-line lookup is the part
+    that varies: an entry with no id has nowhere of its own to point at and must fall back to
+    the key's line rather than to nothing.
+    """
+    edit_rules(pack, _question(_drop=("id", "meaning"), when={"result": "unknown"}))
+    hits = [
+        d for d in pv.validate_pack(pack)["diagnostics"] if d["code"].startswith("open-question-")
+    ]
+    assert len(hits) >= 3
+    for d in hits:
+        assert d["path"] and isinstance(d["line"], int) and d["line"] > 0
+
+
+@pytest.mark.parametrize("name", installed_packs())
+def test_no_installed_pack_declares_a_broken_open_question(name):
+    """The sweep, and the count is what keeps its silence honest.
+
+    A pack declaring nothing reports zero findings, which is also what a check that stopped
+    running reports — so the count is asserted beside the codes, exactly as the forms check
+    does one section up.
+    """
+    result = pv.validate_pack(PACKS / name)
+    assert not [
+        d
+        for d in result["diagnostics"]
+        if d["severity"] == "error" and d["code"].startswith("open-question-")
+    ], name
+    assert isinstance(result["counts"]["open_questions"], int)

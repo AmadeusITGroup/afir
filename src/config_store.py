@@ -32,6 +32,7 @@ from src.link_escalation import (
     PROBE_TIMEOUT_DEFAULT,
     PROBE_TIMEOUT_MAX,
 )
+from src.inquiry_probe import DEFAULT_MAX_INQUIRY_PROBES
 from src.utils.paths import config_dir
 
 logger = logging.getLogger(__name__)
@@ -541,6 +542,17 @@ SECTIONS: Tuple[Tuple[str, str, Tuple[Field, ...]], ...] = (
                 maximum=200000,
             ),
             Field(
+                "correlation.selection_margin_floor",
+                _MAIN,
+                "number",
+                "live",
+                minimum=0.0,
+                maximum=1.0,
+                help="Report a procedure selection as THIN when the runner-up held more than "
+                "this share of the winning score. Informational only — it cannot hold a gate "
+                "on its own. 0 disables it. Raise it where two procedures share vocabulary.",
+            ),
+            Field(
                 "correlation.links.escalation_mode",
                 _MAIN,
                 "choice",
@@ -656,6 +668,57 @@ SECTIONS: Tuple[Tuple[str, str, Tuple[Field, ...]], ...] = (
                 "independently of the depth cap and the cycle guard because a fan-out that is "
                 "shallow, acyclic and wide satisfies both and is still unbounded. Hitting it "
                 "stops the spawning and records why, rather than failing a run.",
+            ),
+            # The other advisory lane: what THIS procedure could not settle. Same ceilings as
+            # the rung-3 fields above, deliberately — one set of bounds for both lanes, so
+            # raising one is raising it in one place.
+            Field(
+                "correlation.inquiries.enabled",
+                _MAIN,
+                "boolean",
+                "live",
+                default=True,
+                help="Raise the open questions the adjudicating procedure declared about its "
+                "own evidence. A pack that declares none produces nothing either way. Nothing "
+                "in this lane is read by a condition or moves the verdict, its severity or "
+                "this run's stage health.",
+            ),
+            Field(
+                "correlation.inquiries.max_inquiry_probes_per_run",
+                _MAIN,
+                "integer",
+                "live",
+                minimum=0,
+                maximum=MAX_PROBES_CEILING,
+                default=DEFAULT_MAX_INQUIRY_PROBES,
+                help="How many open questions one run may settle with a query of their own. "
+                "Questions whose source the run already retrieved are answered from those rows "
+                "and are NOT counted here. The seconds available are what the link lane's "
+                "budgeted worst case leaves of the shared advisory ceiling, so raising a link "
+                "budget narrows this lane rather than widening the run.",
+            ),
+            Field(
+                "correlation.inquiries.probe_timeout_seconds",
+                _MAIN,
+                "integer",
+                "live",
+                minimum=1,
+                maximum=PROBE_TIMEOUT_MAX,
+                default=PROBE_TIMEOUT_DEFAULT,
+                help="Seconds one open-question query may run. It multiplies with the count "
+                "above, and the engine shortens each query rather than lengthening the run if "
+                "the product would exceed the ceiling the two advisory lanes share.",
+            ),
+            Field(
+                "correlation.inquiries.probe_row_cap",
+                _MAIN,
+                "integer",
+                "live",
+                minimum=1,
+                maximum=10000,
+                default=PROBE_ROW_CAP_DEFAULT,
+                help="Rows one open question may read — a different limit from every timeout. A "
+                "count at exactly this number is reported as a floor and never as a total.",
             ),
         ),
     ),
@@ -999,6 +1062,36 @@ SECTIONS: Tuple[Tuple[str, str, Tuple[Field, ...]], ...] = (
                 maximum=3650,
                 default=14,
             ),
+            # Both `restart`: read once when the manager is built.
+            Field(
+                "jobs.completed_ttl_seconds",
+                _MAIN,
+                "integer",
+                "restart",
+                minimum=60,
+                maximum=2_592_000,
+                default=3600,
+                label="finished run held in memory",
+                help="How long a finished run stays fully in memory. Past this the next "
+                "submission evicts it, keeping a compact row in the Jobs list and serving "
+                "any read of it from the store — so this bounds what the process HOLDS, not "
+                "how far back you can see. Raise it on a machine with memory to spare; the "
+                "documents are kept for 'job file retention' either way.",
+            ),
+            Field(
+                "jobs.history_max_items",
+                _MAIN,
+                "integer",
+                "restart",
+                minimum=1,
+                maximum=100_000,
+                default=2000,
+                label="finished runs listed",
+                help="How many evicted runs keep a row in the Jobs list. A memory bound on "
+                "the list only: lowering it hides old runs from the list without deleting "
+                "anything, and each one stays readable by id for as long as its document is "
+                "kept.",
+            ),
             # Exposed (not hardcoded) because gates display this summary. `live`: re-read per call.
             Field(
                 "jobs.summary_max_items",
@@ -1082,7 +1175,7 @@ SECTIONS: Tuple[Tuple[str, str, Tuple[Field, ...]], ...] = (
                 _MAIN,
                 "choice",
                 "restart",
-                choices=("local", "databricks", "sql"),
+                choices=("local", "databricks", "dbfs", "sql"),
                 default="local",
                 label="state backend",
                 help="WHERE job documents, evidence, exports and the feedback log live. "
@@ -1090,8 +1183,11 @@ SECTIONS: Tuple[Tuple[str, str, Tuple[Field, ...]], ...] = (
                 "/ external volume by setting 'state directory' below. databricks = a "
                 "Unity Catalog Volume over the Files API, MANAGED OR EXTERNAL (both live "
                 "in /Volumes and need no different setting) — available on a laptop or VM "
-                "too, not only inside an App. sql = a transactional database, the only "
-                "option safe across several replicas.",
+                "too, not only inside an App, and the one to prefer on Databricks. dbfs = "
+                "workspace storage over the DBFS API, which the same machinery writes and "
+                "which needs no Unity Catalog grant: for a workspace where the app cannot "
+                "be given USE CATALOG. sql = a transactional database, the only option "
+                "safe across several replicas.",
             ),
             Field(
                 "storage.root",
@@ -1180,6 +1276,24 @@ SECTIONS: Tuple[Tuple[str, str, Tuple[Field, ...]], ...] = (
                 "workspaces behind a self-signed corporate chain, and an insecure "
                 "posture must not be inherited by a store that holds pending approvals.",
             ),
+            # Only for `backend: dbfs`. One field and not four: the workspace URL, the
+            # token env var and the TLS posture are read from the databricks block above,
+            # so switching destination is one edit rather than a second set of credentials
+            # a deployment can drift out of maintaining.
+            Field(
+                "storage.dbfs.root",
+                _MAIN,
+                "string",
+                "restart",
+                default="/FileStore/afir/state",
+                label="DBFS state path",
+                help="Only for the dbfs backend: the DBFS directory every blob hangs off. "
+                "A DBFS path, NOT a filesystem path — it is written over the API, so "
+                "neither 'state directory' above nor a /dbfs mount is involved. Under "
+                "/FileStore by default because that is the one area a workspace user can "
+                "also browse, which is what an operator needs after a restart lost "
+                "something. The workspace and token come from the volume settings above.",
+            ),
             # Only for `backend: sql`.
             Field(
                 "storage.sql.dialect",
@@ -1222,6 +1336,176 @@ SECTIONS: Tuple[Tuple[str, str, Tuple[Field, ...]], ...] = (
                 help="Created if absent. Validated as a SQL identifier rather than "
                 "quoted, because it is the one value here that cannot be a bound "
                 "parameter; optionally schema-qualified (myschema.afir_blobs).",
+            ),
+        ),
+    ),
+    (
+        "identity",
+        "Who is asking (roles and per-caller state)",
+        (
+            # All `restart`: the resolver is built once and its policy is read on every
+            # request from that object.
+            Field(
+                "identity.mode",
+                _MAIN,
+                "choice",
+                "restart",
+                choices=("auto", "on", "off"),
+                default="auto",
+                label="read the caller's identity",
+                help="WHETHER requests carry a caller identity at all. auto = let the "
+                "platform decide: on behind a Databricks driver proxy, which forwards a "
+                "validated user, and off everywhere else — a laptop, a VM, an App "
+                "Service — where every caller is the single local administrator and "
+                "nothing is segregated. on = REQUIRE a validated identity and answer 403 "
+                "without one; set it where an ingress does forward one that auto cannot "
+                "detect. off = never read one. There is deliberately no fourth state "
+                "meaning 'read one but accept its absence': that makes an "
+                "unauthenticated request indistinguishable from the single-operator "
+                "case, at administrator.",
+            ),
+            Field(
+                "identity.admin_groups",
+                _MAIN,
+                "string",
+                "restart",
+                label="administrator groups",
+                help="Comma-separated group names whose members are administrators: they edit the shared "
+                "configuration and knowledge pack and see every run. Read from the groups "
+                "a validated token returns, so it works on the API path and — after the "
+                "caller posts their own token to /api/v1/whoami/elevate — on the browser "
+                "path, which forwards no credential to read groups with.",
+            ),
+            Field(
+                "identity.admin_users",
+                _MAIN,
+                "string",
+                "restart",
+                label="administrator users",
+                help="Comma-separated user names who are administrators, checked when no "
+                "group matched. This is the list that works on the browser path with no "
+                "elevation step, because a non-administrator cannot read another "
+                "account's group membership from the workspace at all.",
+            ),
+            Field(
+                "identity.workspace_host",
+                _MAIN,
+                "string",
+                "restart",
+                label="workspace host for validation",
+                help="Where a forwarded token is validated (the SCIM /Me endpoint). "
+                "Blank disables validation, which degrades to the platform-asserted name "
+                "and the administrator-users list — a working state, and the one to "
+                "expect where the app has no outbound route to its own workspace.",
+            ),
+            Field(
+                "identity.validation_ttl_seconds",
+                _MAIN,
+                "integer",
+                "restart",
+                minimum=0,
+                maximum=86400,
+                default=900,
+                label="identity cache seconds",
+                help="How long a validated identity is reused before the token is "
+                "checked again. A group change takes effect within this window.",
+            ),
+            Field(
+                "identity.allow_self_elevation",
+                _MAIN,
+                "boolean",
+                "restart",
+                default=True,
+                label="allow proving ownership with a token",
+                help="Whether /api/v1/whoami/elevate accepts a caller's own workspace "
+                "token as proof of group membership. Off leaves the administrator-users "
+                "list as the only route to the role.",
+            ),
+        ),
+    ),
+    (
+        "audit",
+        "Access journal (who called, and what they changed)",
+        (
+            # All `restart`: the journal is built once in main() and every surface holds that
+            # object, so a new buffer size or sink cannot be adopted mid-process.
+            Field(
+                "audit.enabled",
+                _MAIN,
+                "choice",
+                "restart",
+                choices=("auto", "on", "off"),
+                default="auto",
+                label="journal who called",
+                help="Record every request, refusal and configuration change to the "
+                "storage backend, so usage by other people is visible at all. auto "
+                "follows the identity layer: on where an ingress forwards a caller, off on "
+                "a laptop or a VM where every caller is the same local operator. Read it "
+                "back at GET /api/v1/audit, administrators only. Never in the request "
+                "path, and never able to fail a run.",
+            ),
+            Field(
+                "audit.flush_seconds",
+                _MAIN,
+                "integer",
+                "restart",
+                minimum=1,
+                maximum=3600,
+                default=30,
+                label="flush interval seconds",
+                help="How often buffered entries are appended. This IS the loss window: a "
+                "hard kill discards what has not landed, while a clean shutdown drains it. "
+                "Batched because a Volume append is a read-modify-write serialised on one "
+                "thread, so an append per request would put an investigation's writes "
+                "behind a queue of page loads.",
+            ),
+            Field(
+                "audit.max_buffer",
+                _MAIN,
+                "integer",
+                "restart",
+                minimum=1,
+                maximum=10000,
+                default=200,
+                label="entries per batch",
+                help="Flush early once this many entries are buffered, whichever comes "
+                "first.",
+            ),
+            Field(
+                "audit.max_pending",
+                _MAIN,
+                "integer",
+                "restart",
+                minimum=1,
+                maximum=1000000,
+                default=5000,
+                label="buffer ceiling",
+                help="Ceiling while the sink is refusing writes. Past it the OLDEST "
+                "entries are dropped and the count is journalled, because a buffer that "
+                "grows until the process dies takes the in-flight investigation with it.",
+            ),
+            Field(
+                "audit.retention_days",
+                _MAIN,
+                "integer",
+                "restart",
+                minimum=0,
+                maximum=3650,
+                default=90,
+                label="journal retention days",
+                help="Journal days older than this are deleted at boot. 0 keeps them "
+                "forever.",
+            ),
+            Field(
+                "audit.exclude_paths",
+                _MAIN,
+                "string",
+                "restart",
+                default="/health",
+                label="paths not journalled",
+                help="Comma-separated exact paths to skip. The platform's own liveness "
+                "probe hits /health every few seconds forever, which would drown "
+                "everything that carries information.",
             ),
         ),
     ),
@@ -1288,6 +1572,47 @@ SECTIONS: Tuple[Tuple[str, str, Tuple[Field, ...]], ...] = (
                 label="knowledge pack",
                 help="Directory under knowledge/ — the domain pack supplying entities, "
                 "sources and playbooks.",
+            ),
+            # All three `live`: the lane is constructed per authoring session, so the next
+            # session reads whatever is here without a restart.
+            Field(
+                "knowledge.assistant_probes",
+                _MAIN,
+                "integer",
+                "live",
+                minimum=0,
+                maximum=50,
+                label="assistant measurements per session",
+                help="How many read-only measurements the authoring assistant may run "
+                "against a live source in one session. 0 disables the lane, and the "
+                "assistant then writes each measurement it wanted into the plan's questions "
+                "for you to run — which is what it did before this existed. It never "
+                "degrades to a guessed number.",
+            ),
+            Field(
+                "knowledge.assistant_probe_row_cap",
+                _MAIN,
+                "integer",
+                "live",
+                minimum=1,
+                maximum=1000,
+                label="rows per measurement",
+                help="Rows one measurement may return. A cut list states that it was cut, "
+                "so the assistant cannot read twenty buckets of a hundred as the whole "
+                "distribution.",
+            ),
+            Field(
+                "knowledge.assistant_probe_timeout_seconds",
+                _MAIN,
+                "integer",
+                "live",
+                minimum=1,
+                maximum=600,
+                label="measurement timeout (s)",
+                help="The lane's own wall clock, deliberately not the source's: a primary "
+                "source is allowed 2h in a pipeline run, and an authoring turn inheriting "
+                "that hangs with nothing to show. A timeout is reported as a non-answer, "
+                "never as zero rows.",
             ),
             Field("rag.use_rag", _MAIN, "boolean", "restart"),
             # All `restart`: vectors are only comparable to an index built by the same model.
@@ -1815,6 +2140,86 @@ def plan_insert(lines: List[str], path: str) -> Optional[Tuple[int, List[str]]]:
     return end, block
 
 
+def group_by_file(updates: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Split ``{path: value}`` by the file each path lives in."""
+    by_file: Dict[str, Dict[str, Any]] = {}
+    for path, value in updates.items():
+        field = FIELDS[path]
+        by_file.setdefault(field.file, {})[path] = value
+    return by_file
+
+
+def patch_text(text: str, name: str, items: Dict[str, Any]) -> Tuple[str, List[dict], List[dict]]:
+    """Apply ``{path: value}`` to one file's TEXT; return (text, changed, skipped).
+
+    Text in, text out, so the same line-anchored patcher serves a file on disk and a
+    caller's own overlay of it. Raises if the result would not parse — an unparsable
+    candidate must not reach either destination.
+    """
+    lines = text.splitlines()
+    changed: List[dict] = []
+    skipped: List[dict] = []
+    dirty = False
+    for path, value in items.items():
+        index = _find_scalar_line(lines, path)
+        if index is None:
+            # Absent from the file: insert it, creating any missing parent sections.
+            plan = plan_insert(lines, path)
+            if plan is None:
+                skipped.append(
+                    {
+                        "path": path,
+                        "reason": "a section on this path holds a value rather than "
+                        "a block — restructure it in the raw editor",
+                    }
+                )
+                continue
+            at, block = plan
+            block[-1] = block[-1] + _emit(value)
+            lines[at:at] = block
+            changed.append(
+                {
+                    "path": path,
+                    "from": None,
+                    "to": str(value),
+                    "applies": FIELDS[path].applies,
+                    "inserted": True,
+                }
+            )
+            dirty = True
+            continue
+        match = re.match(r"^(\s*)([A-Za-z_][\w-]*)(\s*:\s*)(.*)$", lines[index])
+        if match is None:
+            skipped.append({"path": path, "reason": "unparsable line"})
+            continue
+        indent, key, sep, rest = match.groups()
+        old_value, comment = _split_comment(rest)
+        if not old_value.strip():
+            # The key opens a nested block (``foo:`` with children). Replacing that
+            # line with a scalar would orphan every child under it.
+            skipped.append({"path": path, "reason": "key holds a block, not a value"})
+            continue
+        new_rendered = _emit(value)
+        if _unquote(old_value) == _unquote(new_rendered):
+            continue  # no-op; don't churn the file or the .bak
+        spacer = " " if comment else ""
+        lines[index] = f"{indent}{key}{sep}{new_rendered}{spacer}{comment}"
+        changed.append(
+            {
+                "path": path,
+                "from": _unquote(old_value),
+                "to": str(value),
+                "applies": FIELDS[path].applies,
+            }
+        )
+        dirty = True
+    if not dirty:
+        return text, changed, skipped
+    new_text = "\n".join(lines) + ("\n" if text.endswith("\n") else "")
+    _verify_parses(new_text, name)
+    return new_text, changed, skipped
+
+
 def apply_updates(updates: Dict[str, Any]) -> Dict[str, Any]:
     """Write validated ``{path: value}`` into their files in place; return a change report.
 
@@ -1822,15 +2227,10 @@ def apply_updates(updates: Dict[str, Any]) -> Dict[str, Any]:
     Never appends at the end of a file: a duplicate key's winner is parser-dependent.
     ``durable: False`` when a push to the mirror failed — the edit is live but not durable.
     """
-    by_file: Dict[str, Dict[str, Any]] = {}
-    for path, value in updates.items():
-        field = FIELDS[path]
-        by_file.setdefault(field.file, {})[path] = value
-
     changed: List[dict] = []
     skipped: List[dict] = []
     durable = True
-    for name, items in by_file.items():
+    for name, items in group_by_file(updates).items():
         target = config_dir() / name
         if not target.exists():
             for path in items:
@@ -1838,72 +2238,12 @@ def apply_updates(updates: Dict[str, Any]) -> Dict[str, Any]:
             continue
         with open(target, "r") as handle:
             text = handle.read()
-        lines = text.splitlines()
-        dirty = False
-        for path, value in items.items():
-            index = _find_scalar_line(lines, path)
-            if index is None:
-                # Absent from the file: insert it, creating any missing parent sections.
-                plan = plan_insert(lines, path)
-                if plan is None:
-                    skipped.append(
-                        {
-                            "path": path,
-                            "reason": "a section on this path holds a value rather than "
-                            "a block — restructure it in the raw editor",
-                        }
-                    )
-                    continue
-                at, block = plan
-                block[-1] = block[-1] + _emit(value)
-                lines[at:at] = block
-                changed.append(
-                    {
-                        "path": path,
-                        "from": None,
-                        "to": str(value),
-                        "applies": FIELDS[path].applies,
-                        "inserted": True,
-                    }
-                )
-                dirty = True
-                continue
-            match = re.match(r"^(\s*)([A-Za-z_][\w-]*)(\s*:\s*)(.*)$", lines[index])
-            if match is None:
-                skipped.append({"path": path, "reason": "unparsable line"})
-                continue
-            indent, key, sep, rest = match.groups()
-            old_value, comment = _split_comment(rest)
-            if not old_value.strip():
-                # The key opens a nested block (``foo:`` with children). Replacing that
-                # line with a scalar would orphan every child under it.
-                skipped.append(
-                    {"path": path, "reason": "key holds a block, not a value"}
-                )
-                continue
-            new_rendered = _emit(value)
-            if _unquote(old_value) == _unquote(new_rendered):
-                continue  # no-op; don't churn the file or the .bak
-            spacer = " " if comment else ""
-            lines[index] = f"{indent}{key}{sep}{new_rendered}{spacer}{comment}"
-            changed.append(
-                {
-                    "path": path,
-                    "from": _unquote(old_value),
-                    "to": str(value),
-                    "applies": FIELDS[path].applies,
-                }
-            )
-            dirty = True
-        if dirty:
-            new_text = "\n".join(lines) + ("\n" if text.endswith("\n") else "")
-            _verify_parses(new_text, name)
+        new_text, file_changed, file_skipped = patch_text(text, name, items)
+        changed.extend(file_changed)
+        skipped.extend(file_skipped)
+        if new_text != text:
             durable = _atomic_write(target, new_text) and durable
-            logger.info(
-                "Config updated: %s (%d key(s))",
-                name,
-                len([c for c in changed if FIELDS[c["path"]].file == name]),
-            )
+            logger.info("Config updated: %s (%d key(s))", name, len(file_changed))
     return {"changed": changed, "skipped": skipped, "durable": durable}
 
 
@@ -1932,11 +2272,13 @@ def _atomic_write(target, text: str) -> bool:
     return bool(_MIRROR.push_path(target))
 
 
-def replace_file(name: str, text: str) -> dict:
-    """Replace a whole config file (raw editor / import), validating first.
+def validate_replacement(name: str, text: str):
+    """Raise ``ValueError`` unless `text` may be stored as `name`; return its parse.
 
-    Rejects text still carrying :data:`REDACTED`: writing it would silently overwrite a
-    credential with the placeholder string.
+    Split out of :func:`replace_file` so a caller holding its own copy of a config file
+    enforces the same three rules without writing the base. Validation is about the text,
+    not about who wrote it: a copy allowed to hold YAML the base would have refused defers
+    the refusal to whoever promotes it, who did not write the mistake.
     """
     if name not in CONFIG_FILES:
         raise ValueError(f"unknown config file '{name}'")
@@ -1951,6 +2293,16 @@ def replace_file(name: str, text: str) -> dict:
         raise ValueError(f"invalid YAML: {exc}") from exc
     if parsed is not None and not isinstance(parsed, dict):
         raise ValueError("a config file must be a YAML mapping at the top level")
+    return parsed
+
+
+def replace_file(name: str, text: str) -> dict:
+    """Replace a whole config file (raw editor / import), validating first.
+
+    Rejects text still carrying :data:`REDACTED`: writing it would silently overwrite a
+    credential with the placeholder string.
+    """
+    parsed = validate_replacement(name, text)
     target = config_dir() / name
     durable = _atomic_write(target, text if text.endswith("\n") else text + "\n")
     logger.info("Config file replaced wholesale: %s (%d bytes)", name, len(text))

@@ -115,7 +115,7 @@ resources:
         # the deploy, which is the loud direction.
         - name: llm-endpoint
           serving_endpoint:
-            name: databricks-claude-opus-5
+            name: <serving-endpoint>
             permission: CAN_QUERY
         # An unreachable embedding endpoint does NOT fail the boot — retrieval degrades to
         # the deterministic keyword `PlaybookFallback`, which is a quieter and worse outcome

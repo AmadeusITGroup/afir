@@ -998,6 +998,100 @@ def test_a_dry_run_that_exercised_nothing_says_so_while_still_collapsed():
     assert "c.rulesets" in body and "every ruleset" in body
 
 
+def test_a_selection_flip_is_visible_with_the_panel_shut():
+    """The one check that looks outside the candidate pack, and the one a shut panel can hide.
+
+    A plan that re-scores a past incident onto a different procedure produces no error, no
+    warning and a pack that loads — so if the count lives only inside the `<pre>`, an operator
+    who does not expand it approves a blast radius nobody stated. Both halves of the reading go
+    in the `<summary>`: how many of how many flipped, and how many LOST recognition, which is
+    the one direction an author never intends. The sentences themselves are the server's own
+    `render`, as with the dry run.
+    """
+    body = JS.split("function renderPlanChecks", 1)[1].split("\n}", 1)[0]
+    assert "if(c.selection_delta){" in body, (
+        "the panel is reached on the field's presence and nothing else — this check gates no "
+        "write, so a second condition in front of it removes the whole reading silently"
+    )
+    block = body[body.index("c.selection_delta") :]
+    summary = block[block.index("<details") : block.index("</summary>")]
+    assert "flipped" in summary and "s.scored" in summary
+    assert "lost" in summary and "LOSE recognition" in summary
+    assert "s.flips" in block and "s.flips_cut" in block, (
+        "a flip count that silently omits the cut ones under-states the radius"
+    )
+    assert "f.lost_recognition" in block, (
+        "which flips lost recognition is the server's own field, not a rule re-derived here"
+    )
+    assert "s.text" in block and 'pre class="mono"' in block
+
+
+def test_an_unmoved_vocabulary_reads_as_a_proof_and_a_missing_corpus_as_a_warning():
+    """Two reasons nothing was compared, and only one of them is reassuring.
+
+    Identical playbook titles and join keys score identically on every input, so "no title
+    changed" is an exact result — warned about on every ordinary pack edit it would be the
+    noise that gets a check switched off. "No stored run" and "the pack would not load" mean
+    nobody looked, and an empty flip list there is a silence rather than a clean bill. So the
+    panel keys on `vocabulary_changed` and never on the reason text, which is prose.
+    """
+    body = JS.split("function renderPlanChecks", 1)[1].split("\n}", 1)[0]
+    block = body[body.index("c.selection_delta") :]
+    assert "s.compared" in block, "the field a reader must check first"
+    assert "s.vocabulary_changed" in block, (
+        "the proof and the absence are told apart by the token sets, not by the sentence"
+    )
+    assert "s.reason" in block, "whichever it is, the panel names it"
+    unmoved = block[block.index("proven") :]
+    assert "'info'" in unmoved and "'warning'" in unmoved
+
+
+def test_a_moved_finding_is_visible_with_the_panel_shut():
+    """The one check about a FINDING, and the one whose headline a shut panel can hide.
+
+    The other three can all pass while a threshold moved by one changes what a past report
+    concluded about a named person's conduct — the pack loads, the conditions answer, the same
+    procedure adjudicates. So the `<summary>` carries how many runs read differently and,
+    separately, how many DETERMINATIONS changed: a `pass` that became a `fail` is a changed
+    finding, a `pass` that became `unknown` is a check that stopped answering, and printing
+    them as one number makes the first invisible inside the second.
+    """
+    body = JS.split("function renderPlanChecks", 1)[1].split("\n}", 1)[0]
+    assert "if(c.verdict_delta){" in body, (
+        "the panel is reached on the field's presence and nothing else — this check gates no "
+        "write, so a second condition in front of it removes the whole reading silently"
+    )
+    block = body[body.index("c.verdict_delta") :]
+    summary = block[block.index("<details") : block.index("</summary>")]
+    assert "v.runs_changed" in summary and "v.replayed" in summary
+    assert "v.decided_flips" in summary and "DETERMINATION" in summary
+    assert "v.changes" in block and "v.changes_cut" in block, (
+        "a moved-line count that silently omits the cut ones under-states the radius"
+    )
+    assert "v.text" in block and 'pre class="mono"' in block
+
+
+def test_an_unmoved_replay_surface_reads_as_a_proof_and_a_missing_corpus_as_a_warning():
+    """Two reasons no finding was compared, and only one of them is reassuring.
+
+    An adjudication is a function of the ruleset specs, the entity bindings, the pack data and
+    the stored rows — and the rows are the same on both sides — so "none of those changed" is
+    exact, and warning about it on every ordinary catalog or prose edit is the noise that gets
+    a check switched off. "No stored run" and "the pack would not load" mean nobody looked, and
+    an empty change list there is a silence. So the panel keys on `surface_changed` and never
+    on the reason text, which is prose.
+    """
+    body = JS.split("function renderPlanChecks", 1)[1].split("\n}", 1)[0]
+    block = body[body.index("c.verdict_delta") :]
+    assert "v.compared" in block, "the field a reader must check first"
+    assert "v.surface_changed" in block, (
+        "the proof and the absence are told apart by what the edit moved, not by the sentence"
+    )
+    assert "v.reason" in block, "whichever it is, the panel names it"
+    unmoved = block[block.index("proven") :]
+    assert "'info'" in unmoved and "'warning'" in unmoved
+
+
 def test_a_question_the_assistant_could_not_answer_is_shown_not_buried():
     """A guess inside an approved diff is indistinguishable from a finding.
 
@@ -1011,6 +1105,44 @@ def test_a_question_the_assistant_could_not_answer_is_shown_not_buried():
     assert body.index("p.questions") < body.index(
         "p.ops"
     ), "questions come before the ops"
+
+
+def test_the_measurements_behind_a_proposal_are_shown_above_the_diff():
+    """A number in an approved diff is only re-checkable if its measurement is on the page.
+
+    The assistant can now measure a live source itself, which is the point — but a measured
+    threshold and a plausible one are the same eight characters in a YAML file, and the diff
+    cannot tell them apart. So every measurement the session took is rendered in full, and
+    above the ops it justifies. Its own renderer rather than a row in the tool trail: the
+    trail says how many BYTES a call returned, which is the one thing about a measurement that
+    does not matter.
+    """
+    body = JS.split("function renderAssistProbes", 1)[1].split("\n}", 1)[0]
+    assert "pkProbes" in body
+    assert 'pre class="mono"' in body, "the whole measurement, not a summary of it"
+    assert "m.op" in body and "m.source" in body, "which op, on which source"
+    assert "question rather than a value" in body, (
+        "the banner has to state the rule the operator is checking the ops against — a "
+        "failed measurement beside a proposed number is what this panel exists to expose"
+    )
+    proposal = JS.split("function renderProposal", 1)[1].split("\n}", 1)[0]
+    assert "renderAssistProbes()" in proposal
+    assert proposal.index("renderAssistProbes()") < proposal.index(
+        "p.ops"
+    ), "provenance comes before the edits it is provenance for"
+    assert "pkProbes = d.probes" in JS, "the snapshot is the only source for these"
+
+
+def test_a_session_that_measured_nothing_renders_nothing():
+    """Every session before the probe lane existed measured nothing, and most still will.
+
+    A panel that is always present stops being read — the same reason `tool_mode` and
+    `image_mode` are shown only when degraded. So the empty case is an early return, asserted
+    because "0 measurements" rendered as a heading would train the operator past the heading.
+    """
+    body = JS.split("function renderAssistProbes", 1)[1].split("\n}", 1)[0]
+    first = body.split("\n", 2)[1]
+    assert "!pkProbes.length" in first and 'return ""' in first
 
 
 def test_both_degradations_are_rendered_and_not_merely_recorded():
@@ -1274,10 +1406,11 @@ def test_saving_config_reports_what_did_not_take_effect():
     assert "skipped" in body
 
 
-def test_config_has_all_three_surfaces():
-    """Form for the modelled keys, raw for the rest, import for a whole environment."""
+def test_config_has_all_four_surfaces():
+    """Form for the modelled keys, raw for the rest, import for a whole environment — and
+    `creds`, which is the only one that writes nothing shared."""
     offered = set(re.findall(r'name="cfgview"\s+value="([a-z]+)"', INDEX_HTML))
-    assert offered == {"form", "raw", "io"}
+    assert offered == {"form", "raw", "io", "creds"}
     for view in offered:
         assert f'id="cfg{view.capitalize()}View"' in INDEX_HTML, f"no view for {view}"
 
@@ -1376,7 +1509,7 @@ def test_every_sub_view_has_a_rail_item_and_a_target():
         r'(?:,\s*group:"([a-z]+)")?',
         block,
     )
-    assert len(entries) == 18, f"expected 18 sub-views, parsed {len(entries)}"
+    assert len(entries) == 19, f"expected 19 sub-views, parsed {len(entries)}"
     for key, kind, anchor, pop, group in entries:
         assert f'data-sub="{key}"' in INDEX_HTML, f"sub-view {key} has no rail item"
         if kind == "anchor":
@@ -2095,6 +2228,204 @@ def test_every_link_field_the_card_reads_is_one_the_SUMMARIZER_writes():
         assert field in view, f"linkCards reads s.{field}, the summary has no such key"
 
 
+def test_the_five_open_question_states_are_LABELLED_apart():
+    """Five labels, and the two silences must not read as one.
+
+    A question that was asked and came back EMPTY and one whose source never answered are the
+    same blank on this page unless they are labelled apart — and only the second is fixed by a
+    credential, while the first is a reading against the meaning the procedure declared in
+    advance. `not_asked` is a third thing again: nobody looked, which is the one an operator can
+    still authorise. The keys come from the engine's own list rather than being typed here, so a
+    sixth state added server-side fails HERE and not in a report a reader quietly mis-parses.
+    """
+    from src.inquiry import INQUIRY_STATES
+    from src.ui.theme import THEME_CSS
+
+    table = JS.split("const INQUIRY_STATE_LABEL = {", 1)[1].split("};", 1)[0]
+    labelled = set(re.findall(r"^\s*(\w+):", table, re.M))
+    assert labelled == set(
+        INQUIRY_STATES
+    ), "the card's state vocabulary drifted from src/inquiry"
+    # Five DISTINCT sentences: a shared label is the collapse in prose form.
+    said = re.findall(r'"([^"]+)"', table)
+    assert len(set(said)) == len(INQUIRY_STATES)
+    # The two a reader must not confuse, told apart by what each one is ABOUT and not by
+    # word order — one is a fact about the source's contents, the other about the source.
+    assert "the source had nothing" in table
+    assert "the source did not answer" in table
+
+    # An unrecognised state still RENDERS, under its raw name.
+    card = JS.split("function inquiryCard(", 1)[1].split("\n}\n", 1)[0]
+    assert "INQUIRY_STATE_LABEL[st] ||" in card
+
+    # Marked by what would FIX it, never by the outcome's polarity: whether zero rows is good
+    # news is what the procedure's declared meaning says, and a colour here would let a reader
+    # take the answer off the badge. So only the two that still owe somebody carry a rule.
+    for state in ("not_asked", "unanswered"):
+        assert f".s-{state}" in THEME_CSS, f"{state} owes somebody and has no badge rule"
+    for state in ("answered", "empty"):
+        assert (
+            f".lnk .st.s-{state}" not in THEME_CSS
+        ), f"{state} is settled; colouring it puts the finding on the badge"
+
+
+def test_an_open_question_states_its_MEANING_and_never_a_bare_COUNT():
+    """The failure class this whole lane exists to report, on the surface that shows it.
+
+    "4 rows matched" is not a finding: what four rows mean is the procedure's judgement, written
+    down before the run, and a number rendered without it invites the reader to supply their own.
+    So the count and the declared meaning render together, and a capped count says it is a floor
+    — because `4 rows` and `4 rows, and there were more` license different next steps.
+    """
+    card = JS.split("function inquiryCard(", 1)[1].split("\n}\n", 1)[0]
+    assert "rows_matched" in card and "meaning" in card
+    assert card.index("rows_matched") < card.index("f.meaning")
+    assert "row_cap_hit" in card and "a floor and not a total" in card
+    # The count is shown only where it MEANS something: a question nobody asked has no rows to
+    # report, and rendering `0` there is the unlabelled zero this lane exists to prevent.
+    assert '"answered"' in card and '"empty"' in card
+
+    # And an unreachable question says which value the run is missing, since an empty scope IS
+    # the reason — the same shape as the link card's pivot line.
+    assert "scope_entity" in card and "holds no value of it" in card
+
+
+def test_what_a_question_COST_is_separate_from_what_it_SETTLED():
+    """The free rung is the cheap half of the lane and reads as a spend unless it is stated.
+
+    A question settled from rows this run already retrieved cost no query at all; one settled by
+    a probe cost exactly one. The five states cannot say either thing, and an operator deciding
+    whether to authorise more looking needs the second number. Keyed on `probe_spent` and not on
+    the note's presence — the same rule `linkChildLine` learned — because a refusal carries a
+    note too, and keyed on the note it would badge a refused question as a spend.
+    """
+    fn = JS.split("function inquiryProbeLine(", 1)[1].split("\n}\n", 1)[0]
+    assert "f.probe_spent" in fn
+    assert "one query spent" in fn and "no query spent" in fn
+    # Silent when neither field is set, so a pack declaring nothing renders as it did before.
+    assert 'if(!spent && !note) return "";' in fn
+    # The server's sentence rides verbatim: it carries WHICH of the answers came back, and a
+    # sentence composed here from a boolean would be a second answer to that.
+    assert "f.probe_note" in fn and "esc(note)" in fn
+
+    card = JS.split("function inquiryCard(", 1)[1].split("\n}\n", 1)[0]
+    assert "inquiryProbeLine(f)" in card
+
+
+def test_the_open_question_lane_is_FRAMED_apart_and_says_so_in_ITS_OWN_words():
+    """The other advisory lane's one refusal, restated: no evidence added, no confidence added.
+
+    These are questions the adjudicating procedure raised about its OWN subject, which makes them
+    the more tempting of the two lanes to read as evidence the verdict merely has not folded in
+    yet. Two independent signals, because either alone fails a real reader: the frame, for the
+    reader who skips prose, and the sentence, for the one who reads it and would otherwise assume.
+    """
+    cards = JS.split("function inquiryCards(", 1)[1].split("\n}\n", 1)[0]
+    assert 'class="advisory"' in cards, "the lane is not framed apart from the evidence"
+    assert "not part of the verdict" in cards
+    assert "read by any condition" in cards
+    # Named explicitly, because these three are what an advisory finding would move if it were
+    # wired in, and each has its own test one file over.
+    assert "severity" in cards and "stage health" in cards
+    # And the reading is against a meaning declared IN ADVANCE — a question left open is not a
+    # negative finding, which is the misreading an unlabelled open row invites.
+    assert "in advance" in cards and "not a negative finding" in cards
+
+
+def test_no_open_question_is_the_normal_answer_and_renders_NOTHING():
+    """A pack declaring no `open_questions:` must produce the card it produced before.
+
+    The guard is on the ARRAY and not on truthiness: this summary reaches the page over SSE and
+    the field is absent on a replayed event from a run made before the lane existed, where
+    `[].map` would throw and take the whole correlation card down with it.
+    """
+    cards = JS.split("function inquiryCards(", 1)[1].split("\n}\n", 1)[0]
+    assert "Array.isArray(s.inquiries)" in cards
+    assert 'if(!qs.length) return "";' in cards
+    # A bounded list says so, through the one `shownOf` the page already owns.
+    assert "shownOf(qs.length, s.inquiry_count)" in cards
+    # Called at the END of the card — this run's own evidence first, then the other lane, then
+    # the questions it left. Both advisory lanes sit below everything the verdict stands behind.
+    corr = (
+        JS.split("const DETAIL = {", 1)[1]
+        .split("correlation(s){", 1)[1]
+        .split("\n  },", 1)[0]
+    )
+    assert "inquiryCards(s)" in corr
+    assert corr.index("inquiryCards(s)") > corr.index("Investigation evidence")
+
+
+def test_every_open_question_field_the_card_reads_is_one_the_SUMMARIZER_writes():
+    """The card renders from the server-side summary, never from the stage output.
+
+    A field name that exists only in the JS reads `undefined` and renders as silence — the same
+    class as a condition reading a path no schema carries, and invisible for the same reason:
+    the card still draws.
+    """
+    from src.models.pydantic_models import CorrelationResult, InquiryFinding
+    from src.pipeline_runner import summarize_stage
+
+    corr = CorrelationResult(
+        inquiries=[InquiryFinding(id="q", state="not_asked", question="Was it?")]
+    )
+    view = summarize_stage("correlation", corr)
+    assert "inquiries" in view and "inquiry_count" in view
+
+    js = (
+        JS.split("function inquiryCard(", 1)[1].split("\n}\n", 1)[0]
+        + JS.split("function inquiryCards(", 1)[1].split("\n}\n", 1)[0]
+        + JS.split("function inquiryProbeLine(", 1)[1].split("\n}\n", 1)[0]
+    )
+    for field in sorted(set(re.findall(r"\bf\.(\w+)", js))):
+        assert (
+            field in view["inquiries"][0]
+        ), f"inquiryCard reads f.{field}, the summary has no such key"
+    for field in sorted(set(re.findall(r"\bs\.(inquiry\w*)", js))):
+        assert field in view, f"inquiryCards reads s.{field}, the summary has no such key"
+
+
+def test_an_unselected_procedure_is_stated_ABOVE_the_evidence_it_produced():
+    """The one defect this card cannot render as an absence.
+
+    Every other degradation on this page shows up as something missing — no rows, no candidates,
+    an amber dot. A run whose procedure nobody selected produces a *full* card: real rows, real
+    condition results, a verdict with a summary. So the notice has to sit FIRST, above the
+    evidence it qualifies, and be amber rather than the advisory grey the link lane uses — that
+    lane is a suggestion to weigh, this is a defect in the run the reader is holding.
+    """
+    from src.ui.theme import THEME_CSS
+
+    fn = JS.split("function unselectedProcedureNotice(", 1)[1].split("\n}\n", 1)[0]
+    assert 's.procedure_unselected' in fn
+    # Renders nothing on every run whose procedure WAS chosen, which is every run today. The
+    # guard is on the string and not on the key: this summary reaches the page over SSE and a
+    # replayed event from an older run carries no such field at all.
+    assert 'if(!why) return "";' in fn
+    assert 'class="unsel"' in fn and 'class="advisory"' not in fn
+    for rule in (".unsel {", ".unsel .lane", ".unsel .why"):
+        assert rule in THEME_CSS, f"{rule} — the notice has no styling to set it apart"
+    # Amber, in the two-mode palette's own token: "a human is needed" everywhere on this page.
+    assert "var(--warn)" in THEME_CSS.split(".unsel .lane", 1)[1][:120]
+
+    corr = (
+        JS.split("const DETAIL = {", 1)[1]
+        .split("correlation(s){", 1)[1]
+        .split("\n  },", 1)[0]
+    )
+    assert "unselectedProcedureNotice(s)" in corr
+    assert corr.index("unselectedProcedureNotice(s)") < corr.index("Resolved keys"), (
+        "the notice must precede the evidence it qualifies — a reader who stops at the first "
+        "stat has read a confident answer under a procedure nobody chose"
+    )
+
+    # And the field is one the SUMMARIZER writes, not one that exists only in the JS.
+    from src.models.pydantic_models import CorrelationResult
+    from src.pipeline_runner import summarize_stage
+
+    view = summarize_stage("correlation", CorrelationResult())
+    assert view["procedure_unselected"] == ""
+
+
 def test_the_card_states_what_the_probe_COST_apart_from_what_it_SETTLED():
     """Two facts, two renderings — because the four states can only carry one of them.
 
@@ -2458,3 +2789,264 @@ def test_a_composed_referral_is_reachable_from_the_card_that_needs_it(routes):
     assert ".lnk .lref .rq" in THEME_CSS
     rule = THEME_CSS.split(".lnk .lref .rq", 1)[1].split("}", 1)[0]
     assert "user-select: text" in rule and "pre-wrap" in rule
+
+
+# --- 12. the base path -----------------------------------------------------
+# Every URL on this page is root-relative, which is right for ``python app.py`` and for a
+# Databricks App and wrong behind a cluster driver-proxy ingress, where the server is
+# served under ``/driver-proxy/o/<org>/<cluster>/<port>/``. The shim in ``src/ui/
+# script_base.py`` derives that prefix from ``location.pathname`` and wraps the three URL
+# natives, so no call site changes and the literal paths above stay matchable against the
+# router. These are text-level assertions — so is the rest of this file — and each one
+# fails when the shim is removed.
+
+
+def test_the_base_path_shim_wraps_the_three_url_natives():
+    """One shim or 57 edited call sites, and the second answer is the one that rots.
+
+    ``fetch``, ``EventSource`` and ``window.open`` are the only three ways this page names
+    a URL (the fourth, ``a.href``, is a ``blob:`` and carries no path).
+    """
+    assert "function afirBasePath(" in JS, "the base-path shim is gone"
+    assert "function afirUrl(" in JS
+    for native in ("window.fetch = afirFetch",
+                   "window.EventSource = AfirEventSource",
+                   "window.open = afirOpen"):
+        assert native in JS, f"{native.split(' =')[0]} is not wrapped"
+
+
+def test_the_base_path_shim_is_installed_before_the_first_call_site():
+    """A native captured before the wrap lands is a wrap that half applies — which is why
+    ``script_base`` is concatenated first rather than emitted as a second ``<script>``."""
+    install = JS.index("window.fetch = afirFetch")
+    first_fetch = JS.index('fetch("/')
+    assert install < first_fetch, "a call site is defined before the wrap is installed"
+    assert install < JS.index("new EventSource(")
+    assert install < JS.index('window.open("/')
+
+
+def test_the_base_path_shim_is_a_no_op_off_the_proxy():
+    """Local and Apps behaviour must stay byte-identical: nothing is replaced, and nothing
+    is prefixed, when the derived base is empty."""
+    guard = JS.index("if (AFIR_BASE) {")
+    for native in ("window.fetch = afirFetch",
+                   "window.EventSource = AfirEventSource",
+                   "window.open = afirOpen"):
+        assert JS.index(native) > guard, f"{native} is installed unconditionally"
+    url = JS.split("function afirUrl(", 1)[1].split("\n}\n", 1)[0]
+    assert "if (!AFIR_BASE) return u;" in url, "afirUrl rewrites with no base"
+
+
+def test_the_base_path_is_matched_by_shape_and_its_two_bounds_agree():
+    """The prefix is exactly the five segments the proxy strips. One too few and every
+    request 404s at the workspace; one too many and it 404s at the server — and both are
+    read as a route that does not exist rather than as a base path that is wrong."""
+    fn = JS.split("function afirBasePath(", 1)[1].split("\n}\n", 1)[0]
+    assert "parts.length < 6" in fn
+    assert "parts.slice(1, 6)" in fn, "the prefix is not the five segments checked above"
+    # Shape, not substring: both proxy spellings, the `/o/` marker, and a numeric port.
+    assert '"driver-proxy"' in fn and '"driver-proxy-api"' in fn
+    assert 'parts[2] !== "o"' in fn
+    assert "/^\\d+$/.test(parts[5])" in fn, "the port segment is not required to be numeric"
+    # Everything else is the empty string, which is what makes the shim a no-op.
+    assert fn.count('return "";') == 5
+
+
+def test_the_base_path_is_not_applied_twice_or_to_a_foreign_url():
+    """An already-prefixed URL prefixed again, or a ``blob:`` given a path, both surface as
+    a 404 that reads like a missing route."""
+    url = JS.split("function afirUrl(", 1)[1].split("\n}\n", 1)[0]
+    assert 'if (u.charAt(0) !== "/") return u;' in url, "a non-root-relative URL is rewritten"
+    assert 'if (u.indexOf(AFIR_BASE + "/") === 0) return u;' in url, "the wrap is re-entrant"
+    assert 'if (typeof u !== "string") return u;' in url
+
+
+def test_the_wrapped_event_source_is_a_real_event_source():
+    """``attachTo`` calls ``close()`` and ``addEventListener`` on it, so the wrapper has to
+    hand back the native instance — a constructor returning an object yields that object."""
+    fn = JS.split("function AfirEventSource(", 1)[1].split("\n}\n", 1)[0]
+    assert "return new AfirNativeEventSource(afirUrl(u), cfg);" in fn
+
+
+# ---------------------------------------------------------------------------
+# Identity: who is asking, what their role hides, where their edits land.
+# ---------------------------------------------------------------------------
+
+
+def _tag_with(id_: str) -> str:
+    """The opening tag carrying ``id="<id_>"``, for attribute assertions."""
+    m = re.search(r"<[^>]*" + re.escape(f'id="{id_}"') + r"[^>]*>", INDEX_HTML)
+    assert m, f"#{id_} is not in the page"
+    return m.group(0)
+
+
+def test_the_identity_chip_is_absent_until_the_server_says_a_caller_is_READ():
+    """A page that labelled a single-operator deployment "admin" would answer a question
+    nobody asked, and teach an operator to look for a role that does not exist. So the chip
+    ships ``hidden`` and is shown only on the server's own ``enforced`` — which is false on a
+    laptop, a VM, an App Service and a Databricks App alike."""
+    assert "hidden" in _tag_with("idBtn"), "the identity chip is visible before the answer"
+    fn = JS.split("function identityEnforced(", 1)[1].split("\n", 1)[0]
+    assert "idWhoami.enforced === true" in fn, "enforcement is not read off the server"
+    assert 'show("idBtn"' in JS.split("function applyIdentity(", 1)[1].split("\n}\n", 1)[0]
+
+
+def test_where_no_identity_is_READ_the_page_is_the_one_that_shipped():
+    """The whole per-caller model is unreachable off a cluster driver, so neither role marker
+    may hide anything there: a ``data-user-only`` draft banner on a laptop describes a layer
+    that cannot exist, and a hidden ``data-admin-only`` control would remove a working one."""
+    body = JS.split("function applyIdentity(", 1)[1].split("\n}\n", 1)[0]
+    off = body.split("if(!on){", 1)[1].split("return;", 1)[0]
+    assert '"[data-admin-only],[data-user-only]"' in off, "the markers are not cleared"
+    assert "n.hidden = false" in off
+    # Every marker in the markup ships hidden, or the un-hiding above is what it undoes.
+    for m in re.finditer(r"<[^>]*data-(?:admin|user)-only[^>]*>", INDEX_HTML):
+        tag = m.group(0)
+        if "data-user-only" in tag:
+            assert "hidden" in tag, f"a user-only node is visible by default: {tag[:70]}"
+
+
+def test_which_popovers_exist_has_ONE_answer():
+    """Four places ask it — close-all, the outside-click, the drag wiring and the resize
+    re-anchor — and a pop missing from any one of them is a panel that cannot be dismissed,
+    cannot be moved, or survives the click that opened the next one."""
+    assert 'const POPS = ["jobsPop","ctlPop","idPop"];' in JS
+    assert (
+        '["jobsPop","ctlPop"]' not in JS
+    ), "a second enumeration of the popovers is back"
+    for reader in ("function closeAllPops(", 'document.addEventListener("pointerdown"'):
+        body = JS.split(reader, 1)[1][:400]
+        assert "POPS" in body, f"{reader} does not read the one list"
+    assert JS.count("POPS.forEach") >= 3
+
+
+def test_the_third_popover_is_anchored_and_dismissable_like_the_other_two():
+    """Same three things the other two need: a trigger that ANNOUNCES its state, a close
+    control, and the shared dismissal wiring. No expand — it holds a list, not an editor."""
+    assert 'id="idPop"' in INDEX_HTML and 'id="idPopClose"' in INDEX_HTML
+    tag = _tag_with("idBtn")
+    assert tag.startswith("<button"), "the identity trigger is not a button"
+    assert 'aria-expanded="false"' in tag and 'aria-haspopup="dialog"' in tag
+    trig = JS.split("function popTrigger(", 1)[1].split("\n}\n", 1)[0]
+    assert '"idPop"' in trig and 'el("idBtn")' in trig, "#idPop has no trigger to return focus to"
+
+
+def test_every_write_states_WHICH_copy_it_landed_on():
+    """A non-administrator's save is a draft: durable, merged forward, and with no effect on
+    what a run does. That is invisible from the status code, from the file contents and from
+    the editor — so both write seams say it, from the RESPONSE's own ``layer`` rather than
+    from anything the page believes about the caller (a token elevation between the two calls
+    makes those disagree, and only one of them is a fact about the bytes on disk)."""
+    fn = JS.split("function writeScopeNote(", 1)[1].split("\n}\n", 1)[0]
+    assert "d.layer === true" in fn
+    assert "idWhoami" not in fn, "the write note is read off the caller, not the response"
+    for seam in ("function applyPackWrite", "async function saveConfig"):
+        body = JS.split(seam, 1)[1].split("\n}\n", 1)[0]
+        assert "writeScopeNote(d)" in body, f"{seam} does not say where its write went"
+    # The config seam has to do it BEFORE its own fallback: a layered patch reports no
+    # `reloaded` at all, so the banner would otherwise read "N value(s) written" and stop.
+    cfg = JS.split("async function saveConfig", 1)[1].split("\n}\n", 1)[0]
+    assert cfg.index("writeScopeNote(d)") < cfg.index('parts.push("nothing to change")')
+
+
+def test_a_draft_write_does_not_report_the_SHARED_pack_s_errors_as_its_own():
+    """A layered write is validated against the files on disk (``validate_scope: "base"``),
+    so reporting those diagnostics the way a base write's are read as a verdict on the text
+    just saved — and as an error the author cannot fix, because it is not theirs."""
+    body = JS.split("function applyPackWrite", 1)[1].split("\n}\n", 1)[0]
+    assert 'd.validate_scope === "base"' in body
+    assert "the shared pack has" in body, "a draft's diagnostics claim the draft's own errors"
+    assert 'baseScope ? "warn"' in body, "a shared pack error still fails the draft"
+    # And the open file says which copy it is, or its author reads a draft as what runs.
+    meta = JS.split("function draftSuffix(", 1)[1].split("\n}\n", 1)[0]
+    assert "your draft" in meta and "d.in_base === false" in meta
+    assert "draftSuffix(d)" in JS.split("async function openPackFile", 1)[1].split("\n}\n", 1)[0]
+
+
+def test_the_hidden_writes_are_the_THREE_the_server_actually_refuses():
+    """Hiding is a courtesy over the server's own 403, never the guard — so it has to agree
+    with it. Creating a pack, importing files and applying an assistant plan are refused;
+    every other write LAYERS, which is why no configuration control is marked."""
+    for id_ in ("pkScaffold", "pkImport", "pkApply"):
+        row = INDEX_HTML[: INDEX_HTML.index(f'id="{id_}"')].rsplit("<div", 1)[1]
+        tag = _tag_with(id_)
+        assert (
+            "data-admin-only" in tag or "data-admin-only" in row
+        ), f"#{id_} is offered to a caller the server refuses"
+    for id_ in ("cfgSave", "cfgRawSave", "cfgImport", "pkSave", "pkEditFirst"):
+        assert "data-admin-only" not in _tag_with(id_), f"#{id_} is hidden but not refused"
+    # Each refusal is explained where the control was, or its absence reads as a broken page.
+    for view in ("pkIoView", "pkAssistView"):
+        panel = INDEX_HTML.split(f'id="{view}"', 1)[1].split('<div class="panel"', 1)[0]
+        assert "data-user-only" in panel, f"{view} hides a control and says nothing"
+
+
+def test_a_draft_can_be_LISTED_and_DISCARDED_by_its_author():
+    """A rebase writes conflict markers INTO the draft and keeps it, because losing an edit is
+    worse than keeping one that no longer applies — so discarding is the author's decision and
+    the only way out of a conflict. It is also not undoable: the draft is the only copy."""
+    fn = JS.split("async function discardOverlay(", 1)[1].split("\n}\n", 1)[0]
+    assert 'method:"DELETE"' in fn, "the discard would issue a GET to a DELETE-only route"
+    assert "confirm(" in fn, "an unrecoverable delete with no confirmation"
+    assert "loadOverlay()" in fn, "the list still shows the draft that was just dropped"
+    row = JS.split("function overlayRow(", 1)[1].split("\n}\n", 1)[0]
+    assert "data-drop-layer" in row and "data-drop-path" in row
+    assert "row.conflict" in row, "a conflict is not called out in the list that can resolve it"
+    # Delegated, because the rows are rebuilt on every refresh and on every discard.
+    init = JS.rsplit("INITIALISATION", 1)[1]
+    assert 'el("idOverlayRows").addEventListener' in init
+    assert "loadWhoami();" in init, "nothing ever asks who is asking"
+
+
+def test_proving_groups_never_LEAVES_the_token_on_the_screen():
+    """The browser path forwards a validated name and no token, so an owner arrives
+    indistinguishable from a reader and needs a way to prove their groups. The field is a
+    password field and is cleared whether or not it worked — a token left in an input is a
+    token on a screen — and the role is re-READ afterwards rather than taken from the reply."""
+    assert 'type="password"' in _tag_with("idToken")
+    fn = JS.split("async function elevateIdentity(", 1)[1].split("\n}\n", 1)[0]
+    assert fn.count('el("idToken").value = "";') == 2, "a failure leaves the token in the field"
+    assert "await loadWhoami();" in fn, "the role is taken from the elevation response"
+
+
+def test_a_personal_credential_is_never_READ_BACK_onto_the_page():
+    """The one panel where a secret may legitimately be typed, and the only one that never
+    displays one — not even to its author. So the field is a password field, it is cleared on
+    every outcome, and what the row shows instead is the server's own answer about which value
+    is in force plus a fingerprint. A row rendering `s.value` would be the whole leak."""
+    row = JS.split("function secretRow(", 1)[1].split("\n}\n", 1)[0]
+    assert 'type="password"' in row, "a credential field that echoes what is typed"
+    assert "s.value" not in row, "the row renders the stored value"
+    assert "s.fingerprint" in row, "nothing confirms which value is in force"
+    # `personal` is the server's answer; a filled-looking box is not, since the box is empty.
+    assert "s.personal === true" in row
+    fn = JS.split("async function saveSecret(", 1)[1].split("\n}\n", 1)[0]
+    assert fn.count('box.value = "";') == 2, "a failure leaves the secret in the field"
+    assert 'method:"PUT"' in fn and "loadSecrets()" in fn
+    clear = JS.split("async function clearSecret(", 1)[1].split("\n}\n", 1)[0]
+    assert "confirm(" in clear, "an unrecoverable delete with no confirmation"
+    assert 'method:"DELETE"' in clear
+
+
+def test_the_credentials_PANEL_states_the_three_things_a_200_does_not():
+    """Own runs only, never displayed again, applies from the next run. None of the three is
+    visible from a response code, and each is a way an operator would otherwise be wrong."""
+    panel = INDEX_HTML.split('id="cfgCredsView"', 1)[1].split("</div>\n    </div>", 1)[0]
+    assert "your own runs only" in panel
+    assert "never be" in panel or "never displayed again" in panel
+    assert "next run" in panel
+    # The withheld list has a home, or a panel listing four names reads as listing all of them.
+    assert 'id="credWithheld"' in panel
+    body = JS.split("function renderSecrets(", 1)[1].split("\n}\n", 1)[0]
+    assert "d.withheld" in body, "the names that cannot be replaced are silently dropped"
+    # Loaded on entering the view: a per-caller fingerprint read at boot goes stale.
+    switch = JS.split("function setConfigView(", 1)[1].split("\n}\n", 1)[0]
+    assert "loadSecrets()" in switch
+
+
+def test_the_jobs_LIST_says_whose_runs_it_is_showing():
+    """A filtered list that does not say so reads as the whole list, and "nobody is running
+    anything" is then the wrong conclusion with nothing on the page to correct it."""
+    assert 'id="jobsScope"' in INDEX_HTML.split('id="jobsPop"', 1)[1]
+    body = JS.split("function applyIdentity(", 1)[1].split("\n}\n", 1)[0]
+    assert "your own runs only" in body and "every caller's runs" in body

@@ -57,7 +57,8 @@ independently sufficient, each fixed and pinned in `test_correlation.py`:
    to both), which is why the pinning test ships three.
 
 A tie is still broken by declaration order — unchanged, but now the last resort instead of the norm.
-And "no keyword match at all, with more than one spec" still returns `None` rather than guessing.
+And "no keyword match at all, with more than one spec" still returns `None` rather than guessing —
+which is the honest answer, and for a long time it reached no reader. See the next section.
 
 **The weighting has a corollary the scorer cannot fix, so the validator reports it.** Presence is
 tested with `t in text` — a SUBSTRING test, which is what lets a title token match an inflected word
@@ -72,6 +73,105 @@ an error: whether a short token discriminates is a claim about prose, and in som
 code is exactly the right one. It found a live instance in the fixture pack on the day it was written
 (a title reading `Handler and POD Signer Divergence`, `and` owned by it alone), which is the argument
 for the check rather than a note in an authoring guide.
+
+### The honest `None` reached no reader — four sites substituted the default
+
+`select_correlation_spec` returning `None` is the scorer's one honest answer, and **four downstream
+sites replaced it with the pack's default ruleset without saying so**: `pack.ruleset_spec("")`,
+`CorrelationModule.analyze`, `ApiCallGenerator._adjudicating_ruleset_key` and
+`pipeline_runner._adjudicating_ruleset_key`. A fifth path is worse because it is *unscored*: a
+one-spec pack returns its only spec with no keyword matching at all (inverse spec frequency weighs
+every token of a lone title at `(1-1)/1 = 0`). So the run that matched nothing and the run that
+matched are the same artifact — conditions resolving against real rows, a confident report under a
+substituted procedure's labels, every stage green. This is the same silent-failure class as a
+0-row source, one stage earlier and with no zero to notice.
+
+**The fix changes no control flow.** Which ruleset runs is unchanged; *how it was chosen* becomes a
+carried, scored, reported fact. `select_correlation_spec_explained(pack, analysis) -> (spec,
+SelectionBasis)` holds the original body and `select_correlation_spec` is a one-line wrapper over
+`[0]`, so every existing caller is untouched. `SelectionBasis` is a frozen dataclass — `basis`,
+`score`, `runner_up`, `spec_count`, the top four `candidates` as `(name, score)` — with `defaulted`
+(`basis == "no_match"`) and `margin` derived. Five bases, a closed set (`SELECTION_BASES`):
+
+| basis | meaning | reported |
+|---|---|---|
+| `pinned` | `pinned_use_case` resolved | no — a pin is a decision, never second-guessed |
+| `scored` | a keyword match won | only if the margin over the runner-up is **thin** |
+| `sole_spec` | one spec, returned unscored | no — see below |
+| `no_match` | >1 spec, nothing scored | **yes**, and it gates |
+| `no_specs` | the pack declares none | no — the verdict stage no-ops anyway |
+
+**A stale pin still falls through to scoring.** `pinned_use_case` naming a spec that no longer exists
+is deliberately not an error: a scored guess beats no verdict for a linked child run, and
+`test_link_children.py` pins that. Only a pin that *resolves* short-circuits.
+
+Where it is said, and why each reader needs its own copy:
+
+- **Stage health** (`src/stage_health.py`, `_selection_signals`): `procedure_not_selected` at **0.5**,
+  which **gates alone** against the 0.6 threshold — the same posture and the same reason as
+  `required_source_not_queried`: the run produced a well-formed answer to a question nobody asked. Its
+  reason names the zero-scoring candidates and the `pinned_use_case` remedy, because the operator's
+  fix is one click and only if they know the names. Beside it `procedure_selection_thin` at **0.15**
+  fires when `margin` is below `correlation.selection_margin_floor` (default **0.15**) — real
+  information that cannot flip a gate on its own, because the selection may well be right.
+  **`sole_spec` and `no_specs` are deliberately silent**: `no_match` requires `spec_count > 1`, so a
+  single-procedure pack and every currently-matching incident score exactly as before. The floor was
+  calibrated over 80 distinct incident summaries from the local run history against an installed
+  ten-spec pack — all `scored`, zero `no_match`, tightest margins 0.130 and 0.149.
+
+  **And `no_match` is near-unreachable on a ten-spec pack, measured live on the one incident built to
+  reach it.** A deliberately out-of-domain report (a building-maintenance ticket) was submitted to the
+  running deployment; the understanding stage answered honestly — *"no fraud, security or transactional
+  element … so no fraud investigation procedure applies"*, zero entities, zero correlation keys — and
+  selection still returned `scored`, winner 2.5 against a 1.5 runner-up, a 40% margin that correctly
+  fires neither signal. Two mechanisms did it, and both are properties of scoring prose rather than of
+  this pack: the summary earns tokens for **enumerating what is absent** (`access`, `fraud` and
+  `security` all appear only inside *"no … is described"*), and one token was a **homonym** — a water
+  `leak` against a procedure whose title means a data one. Negation-awareness alone would not have
+  reached `no_match` here: it removes the negated tokens and leaves the homonym as the sole scorer,
+  *widening* the margin to 0.9 against 0.0. So `no_match` states "no token of any procedure's
+  vocabulary occurs anywhere in the prose", which a rich pack makes rare, and it is not the signal that
+  catches an off-domain incident. **The signals that did:** `no_entities` at weight **1.0** on
+  understanding (health 0), `unresolved_join_keys` + `brief_degraded` on correlation (health 0.3), a
+  `null` verdict with no subject to adjudicate, and a report that named the miss in words. A future
+  strengthening should therefore measure *how much of a procedure's own vocabulary the incident
+  contains* rather than the winner's lead over second place — but not before that fraction separates
+  the corpus, since wrongly zeroing a real match is the expensive direction.
+- **The verdict and the brief** both carry a `procedure_unselected=` note (on *every* `SubjectVerdict`
+  and on `brief.notes`), rendered by `report_generation` as `PROCEDURE NOT SELECTED — …` beside
+  `source_unanswered=`. Both, because the report narrates from the brief and the appended verdict is
+  read on the same page; one without the other is the two-readings defect two sections down.
+- **The UI** shows one amber `.unsel` notice at the top of the correlation detail, above `Resolved
+  keys`. The field is **derived, not recomputed** — `_summ_correlation` reads the note back off the
+  verdict — so the page and the report cannot disagree, and no Pydantic model changed (which matters:
+  those models are the JSON schemas handed to the LLM).
+- **The planner** logs it, because `api_call_generator` resolves the same key one stage *earlier* to
+  find a ruleset's declared data dependencies, and a dependency list derived from a substituted
+  procedure is a plan for the wrong investigation.
+
+**True abstention is pack-declared and off by default.** `adjudication_policy: default | abstain` at
+the pack root (`rulesets.yaml`, beside `default_ruleset`; `pack.adjudication_policy()`). Under
+`abstain`, a `no_match` run relabels every subject to the ruleset's own `labels.reject` with
+`verdict_class="reject"` and a `reject_reason=` note, rewrites the summary from the new counts, and
+replaces the notification draft — **no new vocabulary and no new schema value**, since that class and
+label already existed and were merely unreachable. Two refusals matter more than the feature:
+
+- **A ruleset declaring no `reject` label cannot abstain**, so the engine logs and leaves the verdict
+  alone rather than inventing a word. `pack_validate` reports it at authoring time
+  (`abstain-without-reject-label`, an **error**: the pack asked not to adjudicate and still does),
+  alongside `adjudication-policy-unknown` and `adjudication-policy-not-at-pack-root` — the same two
+  halves `default_ruleset` has, for the same reason.
+- **A pack declaring nothing is byte-identical.** Every installed pack declares no
+  `adjudication_policy`, so its unmatched incidents are still adjudicated under its own declared
+  default; what changed is that the substitution is named. A pack's own integrity tests measure that
+  the gap is real at ten procedures (two uncovered fraud reports scoring zero against all of them) and
+  assert the reporting fires; `test_procedure_abstention.py` holds the mechanism, including the case a
+  single-procedure pack must not reach. `pack_validate` also emits `spec-title-unscored` (**info** —
+  not a defect, one procedure is a legitimate pack) for the one-spec case, which is precisely the arity
+  the weak-discriminator check returns before reaching.
+
+An annotation must never fail the stage, so `_annotate_procedure_selection` is wrapped whole and
+`_adjudication_policy()` answers `"default"` on any error, absent pack or absent attribute.
 
 ### And the verdict is EVALUATED once, for the same reason it is selected once
 

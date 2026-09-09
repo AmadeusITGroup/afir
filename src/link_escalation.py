@@ -425,6 +425,25 @@ def probe_budget(config: Optional[Dict[str, Any]] = None) -> Dict[str, int]:
     }
 
 
+def slice_text(seconds: float) -> str:
+    """The wall-clock slice one probe was given, in the words a refusal note reports it in.
+
+    Shared by both advisory lanes because the sentence is the same in both, and because the
+    obvious spelling — ``int(seconds)`` — reads a *nearly exhausted* deadline as a **disarmed**
+    lane: the last probe of a spent budget gets whatever is left, so 0.4s remaining printed as
+    "its 0s slice", which is the sentence a lane configured to spend nothing would produce.
+    Two facts under one wording, and their remedies are opposite — a larger budget against fewer
+    questions — so a sub-second slice keeps a decimal and only a genuine zero prints as one.
+    """
+    if seconds <= 0:
+        return "0s"
+    if seconds >= 1:
+        return f"{int(seconds)}s"
+    # Floored at a tenth rather than rounded, or a 40ms remainder prints "0.0s" and the
+    # distinction this function exists for is lost at one more decimal place.
+    return f"{max(0.1, seconds):.1f}s"
+
+
 def probe_row_cap(config: Optional[Dict[str, Any]] = None) -> int:
     """The rows one probe may hand to the settlement, from config else the default above."""
     declared = (config or {}).get("probe_row_cap")

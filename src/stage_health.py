@@ -47,16 +47,37 @@ _DEFAULT_WEIGHTS: Dict[str, float] = {
     "empty_sources": 0.4,  # pro-rata: scaled by the fraction of empty sources
     "source_timeout": 0.15,
     "source_failed": 0.15,
-    "source_truncated": 0.25,
+    # Lower than a timeout or a failure, and deliberately in the same tier as the other
+    # "a configured limit bit, and every reader of the count is told so" signals
+    # (detection_truncated_retried, narration_truncated_retried): the row cap is the
+    # operator's own `max_results`, the truncation is reported everywhere the count is read
+    # (evidence, brief, scope status, report), and a source at its cap still ANSWERED.
+    # It stays a deduction because "N rows" and "N rows, and there were more" are different
+    # findings — three capped sources gate; one or two are a limit, not a defect.
+    "source_truncated": 0.1,
     # correlation
     "no_records": FATAL,
     "unresolved_join_keys": 0.4,
+    # Gates alone, like required_source_not_queried: the procedure that adjudicates was the
+    # pack default rather than a match, and every condition still resolved against real rows,
+    # so the report reads confident either way. A human deciding which procedure applies is
+    # the only repair, and it is one click (pin a use case).
+    "procedure_not_selected": 0.5,
+    # The winner barely beat a rival. Real information, but the match is genuine: must not gate
+    # alone, or a domain whose procedures share vocabulary would pause on every run.
+    "procedure_selection_thin": 0.15,
     # Aggregation-only: every source is still named; low because the verdict doesn't read the pack.
     "evidence_degraded": 0.1,
     # Content dropped rather than aggregated: "lossier" and "incomplete" are different findings.
     "evidence_clipped": 0.3,
     "verdict_degraded": 0.3,
+    # Fires only where the brief degraded for a reason of its OWN (a projection leaf the
+    # retrieval dropped, a scope sweep that could not widen). `brief.degraded` is a SUPERSET
+    # of `verdict.degraded` by construction (usecases/base.py), so counting both charged one
+    # degradation twice — see _signals_correlation.
     "brief_degraded": 0.3,
+    # Narration ATTEMPTED and returned nothing. The volume gate's deterministic path is a
+    # configured design choice, not a defect, and does not fire this (see _signals_correlation).
     "narration_skipped": 0.1,
     # anomaly_detection
     "detection_llm_failed": FATAL,
@@ -73,6 +94,14 @@ _DEFAULT_WEIGHTS: Dict[str, float] = {
 
 # Default when config names none: passes a single 0.3 signal, gates on two.
 DEFAULT_THRESHOLD = 0.6
+
+# Margin below which a procedure selection is reported as thin (see _selection_margin_floor).
+# Measured over 80 distinct incident summaries from the local run history against a ten-spec
+# pack: every one selected by score, none unmatched, and the two tightest wins sat at 0.130 and
+# 0.149 — both correct, both between procedures that genuinely share vocabulary. 0.15 therefore
+# fires on exactly those two: enough to exercise the check on real evidence, and at weight 0.15
+# it cannot gate a run on its own.
+_DEFAULT_SELECTION_MARGIN_FLOOR = 0.15
 
 # Per-stage cap; repeated signals are already aggregated.
 _MAX_REASONS = 12
@@ -403,23 +432,36 @@ def _signals_log_retrieval(output, ctx) -> List[Signal]:
         specs = _zero_row_weights(ctx)
         weighted = sum(specs.get(name, {}).get("weight", 1.0) for name in empty)
         fraction = weighted / len(logs)
-        discounted = [n for n in empty if specs.get(n, {}).get("weight", 1.0) < 1.0]
+        # A source whose emptiness IS its answer (weight 0) is not part of this finding, so it
+        # must not be listed inside it either: the arithmetic already excluded it, and naming
+        # it first reads as the penalty whatever the number says.
+        answered = [n for n in empty if specs.get(n, {}).get("weight", 1.0) <= 0]
+        counted = [n for n in empty if n not in set(answered)]
+        discounted = [n for n in counted if specs.get(n, {}).get("weight", 1.0) < 1.0]
         detail = (
-            f"{len(empty)} of {len(logs)} source(s) returned zero rows: "
-            + ", ".join(str(e) for e in empty[:5])
+            f"{len(counted)} of {len(logs)} source(s) returned zero rows and the pack "
+            "declares no meaning for that: " + ", ".join(str(e) for e in counted[:5])
         )
         if discounted:
             # Name the discount: a silently smaller number the operator cannot check.
-            notes = [
-                f"{n} ({specs[n]['meaning']})" if specs[n].get("meaning") else str(n)
-                for n in discounted[:5]
-            ]
-            detail += " — discounted as expected/valid: " + "; ".join(notes)
+            detail += " — discounted as partly expected: " + "; ".join(
+                _named_meaning(n, specs) for n in discounted[:5]
+            )
+        if answered:
+            detail += (
+                f"; {len(answered)} further source(s) ANSWERED by being empty and are not "
+                "counted here: "
+                + "; ".join(_named_meaning(n, specs) for n in answered[:5])
+            )
         if fraction > 0:
             out.append(("empty_sources", detail, fraction))
         else:
             # Every empty source answered by being empty: report it, penalise nothing.
-            logger.info("Log retrieval: %s", detail)
+            logger.info(
+                "Log retrieval: %d source(s) answered by being empty; nothing scored: %s",
+                len(answered),
+                "; ".join(_named_meaning(n, specs) for n in answered[:5]),
+            )
 
     timed_out = [n for n, o in source_outcomes.items() if o.get("status") == "timeout"]
     if timed_out:
@@ -515,23 +557,113 @@ def _signals_correlation(output, ctx) -> List[Signal]:
                 )
             )
     verdict = getattr(output, "verdict", None)
-    if verdict is not None and getattr(verdict, "degraded", False) is True:
+    verdict_degraded = (
+        verdict is not None and getattr(verdict, "degraded", False) is True
+    )
+    if verdict_degraded:
         out.append(
             ("verdict_degraded", "Validation verdict is degraded (missing data)", 1.0)
         )
     brief = getattr(output, "brief", None)
+    # ONE degradation, charged once. `brief.degraded` starts as `bool(verdict.degraded)` and
+    # is then OR-ed with the brief's own two causes (usecases/base.py), so it can only be a
+    # superset: firing both codes deducted 0.6 for a single missing-data fact and, stacked
+    # with an evidence rung and a skipped narration, summed to exactly 1.0 — a stage scored
+    # 0.00 while the verdict, the conditions and every source were intact.
     if brief is not None and getattr(brief, "degraded", False) is True:
-        out.append(("brief_degraded", "Investigation brief is degraded", 1.0))
+        if verdict_degraded:
+            logger.info(
+                "Correlation: the brief is degraded because the verdict is; scored once."
+            )
+        else:
+            out.append(
+                (
+                    "brief_degraded",
+                    "Investigation brief is degraded for a reason of its own (a decisive "
+                    "check's input was dropped by retrieval, or the scope sweep could not "
+                    "widen) while the verdict itself is not",
+                    1.0,
+                )
+            )
 
     if not _nonempty_list(getattr(output, "findings", None)):
-        out.append(
+        # Empty findings has two causes and only one is a defect. The volume gate choosing
+        # the deterministic path is a CONFIGURED choice (correlation.max_records_for_llm),
+        # `summary_text` still flows downstream and no verdict reads `findings` — so it is
+        # logged, not charged. Narration that ran and came back empty is the defect.
+        mode = _narration_mode(ctx)
+        if mode == "deterministic":
+            logger.info(
+                "Correlation: no narrated findings; the volume gate ran the deterministic "
+                "path, which is a configured choice and not scored."
+            )
+        else:
+            out.append(
+                (
+                    "narration_skipped",
+                    "No narrated findings: the narration call ran and produced none, so "
+                    "the downstream stages read the deterministic summary only"
+                    if mode == "llm"
+                    else "No narrated findings, and this run did not record which path "
+                    "correlation took",
+                    1.0,
+                )
+            )
+    out.extend(_selection_signals(ctx))
+    return out
+
+
+def _selection_signals(ctx) -> List[Signal]:
+    """How the adjudicating procedure was chosen, where that is itself a finding.
+
+    Two codes, and the difference between them is what a human can do about it. ``no_match``
+    means the ruleset that ran was the pack's default rather than a match, and nothing
+    downstream can tell: the conditions resolved against real rows and the report reads
+    confident. ``thin`` means a real match that a rival nearly took.
+
+    Deliberately silent for ``sole_spec`` and ``no_specs``. A pack with one procedure, or none,
+    has nothing to have chosen wrongly, and scoring it would fire on every run of every
+    single-procedure deployment.
+    """
+    selection = _procedure_selection(ctx)
+    basis = str(selection.get("basis") or "")
+    if basis not in ("no_match", "scored"):
+        return []
+    if basis == "no_match":
+        rivals = ", ".join(
+            str(name) for name, _score in (selection.get("candidates") or []) if name
+        )
+        return [
             (
-                "narration_skipped",
-                "No narrated findings (the volume gate ran the deterministic path)",
+                "procedure_not_selected",
+                "No procedure matched this incident, so it was adjudicated under the pack's "
+                "DEFAULT ruleset rather than a recognised one. Every condition still "
+                "evaluated against real rows, so the verdict reads as confident whether or "
+                "not the procedure fits — which is why this is a finding and not a warning. "
+                "Repair is to pin the right procedure on the incident, or to give the "
+                "procedure that should have matched a title that discriminates. Candidates, "
+                f"all scoring zero: {rivals or 'none declared'}",
                 1.0,
             )
+        ]
+    floor = _selection_margin_floor(getattr(ctx, "config", None))
+    margin = _as_float(selection.get("margin"), 1.0)
+    if floor <= 0 or margin >= floor:
+        return []
+    candidates = selection.get("candidates") or []
+    named = ", ".join(f"{n} ({s})" for n, s in candidates[:2] if n)
+    return [
+        (
+            "procedure_selection_thin",
+            f"The procedure was selected by a margin of {margin:.0%} over the runner-up "
+            f"(floor {floor:.0%}), so two procedures read this incident almost equally well "
+            f"and the loser's conditions would also have resolved against real rows. The "
+            f"selection may well be right; it is worth a look because getting it wrong "
+            f"produces a confident verdict under the other procedure's labels. Top two: "
+            f"{named or 'unavailable'}",
+            1.0,
         )
-    return out
+    ]
 
 
 def _signals_anomaly_detection(output, ctx) -> List[Signal]:
@@ -650,6 +782,64 @@ def _stage_facts(ctx, stage_name) -> dict:
     return {}
 
 
+def _procedure_selection(ctx) -> dict:
+    """How this run's adjudicating procedure was chosen, as ``SelectionBasis.to_dict()``.
+
+    Run-recorded value wins for the same reason ``_generator_names`` prefers one: the
+    correlation module is shared across jobs and its attribute holds the last run's answer.
+    ``{}`` when nothing recorded, which reads as "not a defect" — a pack with no correlation
+    specs at all is a valid configuration, not an unselected incident.
+    """
+    try:
+        recorded = _stage_facts(ctx, "correlation").get("procedure_selection")
+        if isinstance(recorded, dict):
+            return recorded
+        module = (ctx.modules or {}).get("correlation") if ctx else None
+        basis = getattr(module, "last_selection", None)
+        as_dict = basis.to_dict() if hasattr(basis, "to_dict") else None
+        return as_dict if isinstance(as_dict, dict) else {}
+    except Exception:  # noqa: BLE001 — a scoring read must never fail the stage
+        return {}
+
+
+def _narration_mode(ctx) -> str:
+    """``"llm"``, ``"deterministic"``, or ``""`` when the run recorded neither.
+
+    Run-recorded value wins over the module attribute for the same reason
+    ``_procedure_selection`` prefers it: the correlation module is shared across jobs.
+    An unknown mode is scored as before — a defect the run cannot attribute is still a
+    defect, and only an explicit "deterministic" is the designed path.
+    """
+    try:
+        recorded = _stage_facts(ctx, "correlation").get("narration")
+        if isinstance(recorded, str) and recorded:
+            return recorded
+        module = (ctx.modules or {}).get("correlation") if ctx else None
+        mode = getattr(module, "last_narration", None)
+        return mode if isinstance(mode, str) else ""
+    except Exception:  # noqa: BLE001 — a scoring read must never fail the stage
+        return ""
+
+
+def _selection_margin_floor(config) -> float:
+    """Margin below which a scored win is reported as thin. 0 disables the check.
+
+    Configured rather than fixed because how much vocabulary two procedures share is a
+    property of the domain, not of the engine.
+    """
+    try:
+        raw = ((config or {}).get("correlation") or {}).get("selection_margin_floor")
+        if raw is None:
+            return _DEFAULT_SELECTION_MARGIN_FLOOR
+        return max(0.0, min(1.0, float(raw)))
+    except (TypeError, ValueError):
+        logger.warning(
+            "correlation.selection_margin_floor is not a number; using the default %s",
+            _DEFAULT_SELECTION_MARGIN_FLOOR,
+        )
+        return _DEFAULT_SELECTION_MARGIN_FLOOR
+
+
 def _zero_row_weights(ctx) -> Dict[str, Dict[str, Any]]:
     """{source: {"weight": float, "meaning": str}} from SourceDef.zero_rows, or {}.
     Never raises; a missing pack counts every empty source in full (conservative)."""
@@ -679,6 +869,12 @@ def _zero_row_weights(ctx) -> Dict[str, Dict[str, Any]]:
     except Exception:  # noqa: BLE001 — scoring must never break a run
         return {}
     return out
+
+
+def _named_meaning(name, specs: Dict[str, Dict[str, Any]]) -> str:
+    """``source (what empty means there)``, or the bare name when the pack declared none."""
+    meaning = str((specs.get(name) or {}).get("meaning") or "").strip()
+    return f"{name} ({meaning})" if meaning else str(name)
 
 
 def _generator_names(ctx, attr) -> List[str]:

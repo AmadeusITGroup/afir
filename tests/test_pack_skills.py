@@ -301,6 +301,12 @@ _ALLOWED_TOOLS = {
     "search",
     "validate",
     "dry_run",
+    # The eighth, and the only one that leaves the machine. Admitted on the same test the other
+    # seven are: `probe` reaches a live source through `pack_probe`, whose read-only posture is
+    # structural — the first token is checked against a closed verb tuple and a `;`-chain is
+    # refused rather than split — and it is checked twice, at the lane's seam before a
+    # connection is opened and again inside `Probe.ask`. It cannot write; that is why it is here.
+    "probe",
     "read_skill",
 }
 

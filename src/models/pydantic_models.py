@@ -1046,6 +1046,105 @@ class LinkFinding(BaseModel):
     )
 
 
+class InquiryFinding(BaseModel):
+    """One open question the adjudicating procedure declared about ITS OWN evidence.
+
+    The sibling of :class:`LinkFinding` on the other axis: a link asks whether ANOTHER
+    procedure applies, an inquiry asks what this procedure could not settle. Advisory on the
+    same terms — never read by a condition, never an input to the verdict, its severity or the
+    health score (asserted by ``tests/test_inquiries_never_change_the_verdict.py``).
+
+    ``state`` is one of five values (see ``src.inquiry.INQUIRY_STATES``) that must not
+    collapse: a question nobody asked, one asked and answered with nothing, and one whose
+    source never answered license three different next steps.
+    """
+
+    id: str = Field(
+        default="",
+        description="The pack's own id for this open question, so a report line can be cited "
+        "back to the declaration that raised it.",
+    )
+    state: str = Field(
+        default="",
+        description="What became of the question (see src.inquiry.INQUIRY_STATES).",
+    )
+    question: str = Field(
+        default="",
+        description="The question as it was asked, in the pack's words, with the scope values "
+        "substituted. This is the text the retrieval seam built a query from.",
+    )
+    source: str = Field(
+        default="",
+        description="The source the question was addressed to, resolved through the ruleset's "
+        "own sources map. Empty when the declaration named none the pack could resolve.",
+    )
+    trigger: str = Field(
+        default="",
+        description="Why the question was raised, in words: which condition read what, or "
+        "which verdict class the run reached.",
+    )
+    trigger_condition: str = Field(
+        default="",
+        description="Id of the condition whose result raised this question, where one did.",
+    )
+    trigger_result: str = Field(
+        default="",
+        description="The condition result that raised it (unknown, fail or pass). `unknown` is "
+        "the usual one: an open question is what a check that could not answer leaves behind.",
+    )
+    scope_entity: str = Field(
+        default="",
+        description="Entity type the question is scoped by — the ruleset's own subject entity "
+        "unless the declaration named another.",
+    )
+    scope_values: List[str] = Field(
+        default_factory=list,
+        description="Values of that type the question was asked about. Empty is what makes an "
+        "inquiry unreachable: an unscoped question scans the source over the whole window.",
+    )
+    meaning: str = Field(
+        default="",
+        description="What the outcome MEANS, in the pack's own words, chosen by state. An "
+        "unlabelled empty result is the failure class this repo is organised against, so a "
+        "declaration that omits an outcome's meaning is a validator error rather than a blank.",
+    )
+    rows_matched: int = Field(
+        default=0,
+        description="Rows the probe returned, after the declaration's own row selector. 0 with "
+        "state `empty` is an answer; 0 with any other state is not.",
+    )
+    row_cap_hit: bool = Field(
+        default=False,
+        description="True when the probe returned exactly its row cap, so the count is a floor "
+        "and not a total.",
+    )
+    probe_spent: bool = Field(
+        default=False,
+        description="Did this question cost a retrieval of its own? The rows it returned are "
+        "never added to the logs the verdict reads.",
+    )
+    probe_note: str = Field(
+        default="",
+        description="What the probe cost and what came back — or, when nothing was spent, which "
+        "bound declined it. Mirrors LinkFinding.probe_note: the states say what was ANSWERED and "
+        "none of them says what was SPENT.",
+    )
+    gap_reason: str = Field(
+        default="",
+        description="Why the question was not settled: the missing declaration for "
+        "`unreachable`, the withheld budget or licence for `not_asked`. Empty once answered.",
+    )
+    advisory_note: str = Field(
+        default="",
+        description="Provenance, so the reader can discount the line: it was added by the "
+        "inquiry lane and addressed to a human.",
+    )
+    note: str = Field(
+        default="",
+        description="The declaration's own free-text note, carried through verbatim.",
+    )
+
+
 class InvestigationBrief(BaseModel):
     """Deterministic distillation of raw rows, verdict, and KB into a compact brief
     fed to the report and anomaly LLM calls.
@@ -1142,6 +1241,12 @@ class InvestigationBrief(BaseModel):
         description="Candidate links to sibling procedures. ADVISORY: addressed to a human, "
         "never readable by a condition and never an input to this run's verdict.",
     )
+    inquiries: List["InquiryFinding"] = Field(
+        default_factory=list,
+        description="Open questions THIS procedure declared about its own evidence. ADVISORY on "
+        "the same terms as `links`, and on the other axis: a link points at another procedure, "
+        "an inquiry points at what this one could not settle.",
+    )
 
 
 class CaseAssessment(BaseModel):
@@ -1187,6 +1292,12 @@ class CorrelationResult(BaseModel):
         default_factory=list,
         description="Candidate links to sibling procedures, computed deterministically after "
         "the verdict. Do not populate this field: it is written by the engine, not narrated.",
+    )
+    inquiries: List["InquiryFinding"] = Field(
+        default_factory=list,
+        description="Open questions the adjudicating procedure declared about its own evidence, "
+        "computed deterministically after the verdict. Do not populate this field: it is written "
+        "by the engine, not narrated.",
     )
 
 

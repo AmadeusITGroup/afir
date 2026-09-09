@@ -56,11 +56,12 @@ env:
   # the SDK resolves", which is exactly what the injected OAuth credentials give an App. Set
   # it only to reach OpenAI or another workspace's endpoint.
   #
-  # `AFIR_LLM_MODEL` IS set, because the template's default names a different served model
-  # than this workspace has. A wrong model name is not a silent degrade — every LLM stage
-  # 404s — but it is one that reads as an endpoint problem rather than a config one.
+  # `AFIR_LLM_MODEL` IS set, because the template's default names a served model your
+  # workspace very likely does not have. A wrong model name is not a silent degrade — every
+  # LLM stage 404s — but it is one that reads as an endpoint problem rather than a config
+  # one, so fill this in before the first deploy.
   - name: AFIR_LLM_MODEL
-    value: "databricks-claude-opus-5"
+    value: "<serving-endpoint>"
 
   # The *working* copy of the YAML configs, not the durable one. The deployed bundle is
   # read-only, so `seed_working_copies()` fills this from the bundle at boot and the
