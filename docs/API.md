@@ -210,9 +210,9 @@ holds in memory:
 
 ```bash
 curl -s "$BASE/api/v1/jobs" | python -m json.tool
-# -> {"jobs": [{"job_id", "incident_id", "status", "run_mode", "current_stage",
-#               "created_at", "updated_at", "batch_id", "queue_position",
-#               "owner", "owner_name", "live"}, …],
+# -> {"jobs": [{"job_id", "incident_id", "label", "label_detail", "status", "run_mode",
+#               "current_stage", "created_at", "updated_at", "batch_id",
+#               "queue_position", "owner", "owner_name", "live"}, …],
 #     "queue": {"width": 2, "max_queued": 256, "running": 2, "queued": 3,
 #               "admitted": 11, "queued_total": 4, "refused": 0, "withdrawn": 1}}
 ```
@@ -221,6 +221,18 @@ curl -s "$BASE/api/v1/jobs" | python -m json.tool
 it cannot go stale as the queue drains; **0** means the job is not waiting. The `queue`
 block rides alongside the rows because a caller reading `queued` on one job needs the width
 and the depth to know what it is waiting for.
+
+**`label` is what a human recognises the run by; `incident_id` is what everything is keyed
+on.** A uuid says nothing about what was investigated, so the label carries the procedure
+that adjudicates, the subject entity, the event date and the id's own tail — every field
+truncated or padded to a fixed width, so a column of labels aligns wherever it is printed
+and an all-padding field reads as *this did not resolve* rather than as a guess. It is
+minted once, after the understanding stage (the first point at which the procedure and the
+subject exist), and never renamed afterwards: `label` is therefore `null` on a queued run
+and on one still in its first stage, and a caller who submitted their own `id` keeps it with
+the label beside it. Nothing is keyed on the label — every artifact filename, every
+`/api/v1/incidents/{incident_id}/…` lookup and every export stays on `incident_id`.
+`label_detail` says what each field was built from, including the ones that did not resolve.
 
 **`live: false` is a finished run answered from a compact row rather than from memory.** A
 terminal job is evicted after `jobs.completed_ttl_seconds` (default 3600) — that bounds

@@ -2331,7 +2331,9 @@ function renderInbox(rows){
     const low = r.health && r.health.gate_recommended;
     return '<div class="row" style="margin-top:.35rem">'
       + '<code class="healthnum">'+esc((r.job_id||"").slice(0,8))+'</code>'
-      + '<span>'+esc(r.incident_id||"")+'</span>'
+      /* The inbox is where an operator chooses between runs they did not launch, so the
+         name matters more here than anywhere: an id says nothing about which is which. */
+      + '<span title="'+esc(r.incident_id||"")+'">'+esc(runName(r))+'</span>'
       + '<span class="hbadge'+(low?" low":"")+'">'+esc(NAME[r.stage]||r.stage)+' · '+score+'</span>'
       + '<span class="statusline">'+esc(r.run_mode||"")+'</span>'
       + (r.reopened_after_restart ? '<span class="hbadge low">since restart</span>' : '')
@@ -2507,20 +2509,54 @@ async function pollJobs(){
   } catch(e){ setText("jobsStatus", "failed: "+e.message); }
 }
 
+/* The run's name, at a fixed width, with the id behind it. Falls back to the id for a run
+   that has not reached the understanding stage yet, and for one submitted under a caller's
+   own reference — both are legitimate, and neither may render as a blank cell. */
+function runName(r){
+  return r.label || r.incident_id || "";
+}
+
+/* Everything a list row can be recognised by, lower-cased for a substring match: an operator
+   filtering is typing something they half-remember, and which field it was in is exactly what
+   they do not remember. The alert text is deliberately not in here — it is not on a list row,
+   and pulling it into one would put a paragraph per run on the wire to search two words of. */
+function runHaystack(r){
+  return [r.label, r.incident_id, r.job_id, r.owner_name, r.owner]
+    .filter(Boolean).join(" ").toLowerCase();
+}
+
+function matchesRunFilter(r, text){
+  const q = (text || "").trim().toLowerCase();
+  return !q || runHaystack(r).indexOf(q) >= 0;
+}
+
+/* Held so the filter box re-renders from the rows already fetched. Re-polling on every
+   keystroke would put the list behind the typing. */
+let lastJobRows = [];
+
 function renderJobs(rows){
+  lastJobRows = rows;
   const onlyOpen = el("jobsOnlyOpen").checked;
-  const list = onlyOpen ? rows.filter(r => r.awaiting_stage) : rows;
+  const filter = el("jobsFilter") ? el("jobsFilter").value : "";
+  const list = (onlyOpen ? rows.filter(r => r.awaiting_stage) : rows)
+    .filter(r => matchesRunFilter(r, filter));
   if(!list.length){
+    /* Three empties, because the next move differs: widen the filter, answer a gate
+       elsewhere, or launch something. */
     el("jobsRows").innerHTML = '<div class="empty">'
-      + (onlyOpen ? "No job is waiting on a decision." : "No jobs yet.") + '</div>';
+      + (filter ? "No run matches “" + esc(filter) + "”."
+               : (onlyOpen ? "No job is waiting on a decision." : "No jobs yet.")) + '</div>';
     return;
   }
-  el("jobsRows").innerHTML = '<table class="tbl"><thead><tr><th>Job</th><th>Incident</th>'
+  el("jobsRows").innerHTML = '<table class="tbl"><thead><tr><th>Job</th><th>Run</th>'
     + '<th>Status</th><th>Who</th><th>Mode</th><th>Stage</th><th>Started</th><th></th></tr>'
     + '</thead><tbody>'
     + list.map(r => '<tr'+(r.job_id===jobId?' style="background:var(--row-attached)"':'')+'>'
         + '<td class="mono">'+esc((r.job_id||"").slice(0,8))+'</td>'
-        + '<td class="mono">'+esc(r.incident_id||"")+'</td>'
+        /* The label names the procedure, the subject and the date; the id it is keyed on
+           stays in the tooltip, which is what a bug report or a curl call needs. */
+        + '<td class="mono" title="'+esc((r.incident_id||"") + (r.label_detail ? " · " + r.label_detail : ""))+'">'
+        + esc(runName(r))+'</td>'
         + '<td><span class="pill '+esc(r.status||"")+'">'+esc(r.status||"")+'</span>'
         /* The position is the only thing an operator can act on for a run that has not
            started: "queued" alone does not say whether it is next or three hours out. */
@@ -2593,32 +2629,46 @@ async function loadRecentRuns(){
     incident_id: f.incident_id, has_report: f.has_report, has_pdf: f.has_pdf }; });
   jobs.forEach(j => {
     const key = j.incident_id || j.job_id;
+    /* The label comes from the job row: a report on disk is a file named after the id, so a
+       run whose job document has aged out keeps the id as its name. */
     merged[key] = Object.assign(merged[key] || {incident_id: j.incident_id}, {
       job_id: j.job_id, status: j.status, run_mode: j.run_mode,
+      label: j.label, label_detail: j.label_detail,
       awaiting_stage: j.awaiting_stage, created_at: j.created_at });
   });
-  renderRecentRuns(Object.values(merged));
+  lastRecentRows = Object.values(merged);
+  renderRecentRuns(lastRecentRows);
   setText("recentStatus", "");
 }
+
+/* Held for the same reason as lastJobRows: the filter re-renders, it does not re-fetch. */
+let lastRecentRows = [];
 
 function renderRecentRuns(rows){
   const host = el("recentRuns");
   if(!host) return;
+  const filter = el("recentFilter") ? el("recentFilter").value : "";
+  rows = rows.filter(r => matchesRunFilter(r, filter));
   if(!rows.length){
-    host.innerHTML = '<div class="empty">No runs yet. Launch one from Investigate.</div>';
+    host.innerHTML = '<div class="empty">'
+      + (filter ? "No run matches “" + esc(filter) + "”."
+                : "No runs yet. Launch one from Investigate.") + '</div>';
     return;
   }
   /* Live jobs first — a run that is still going, or holding a gate, is the one the
      operator came here for; a finished report is not going anywhere. */
   rows.sort((a,b) => (b.job_id?1:0) - (a.job_id?1:0));
-  host.innerHTML = '<table class="tbl"><thead><tr><th>Incident</th><th>Status</th>'
+  host.innerHTML = '<table class="tbl"><thead><tr><th>Run</th><th>Status</th>'
     + '<th>Mode</th><th>On disk</th><th></th></tr></thead><tbody>'
     + rows.map(r => {
         const id = r.incident_id || "";
         const live = r.job_id ? '<span class="pill '+esc(r.status||"")+'">'+esc(r.status||"live")+'</span>'
                              + (r.awaiting_stage ? ' <span class="hbadge low">needs you</span>' : '')
                              : '<span class="statusline">finished</span>';
-        return '<tr><td class="mono">'+esc(id||(r.job_id||"").slice(0,8))+'</td>'
+        /* Named by its label, opened by its id: the button below still carries the id, because
+           every artifact of the report is keyed on it. */
+        return '<tr><td class="mono" title="'+esc(id + (r.label_detail ? " · " + r.label_detail : ""))+'">'
+          + esc(runName(r)||(r.job_id||"").slice(0,8))+'</td>'
           + '<td>'+live+'</td>'
           + '<td class="mono">'+esc(r.run_mode||"—")+'</td>'
           + '<td class="mono">'+(r.has_report ? "report" : "—") + (r.has_pdf ? " · pdf" : "")+'</td>'

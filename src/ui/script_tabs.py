@@ -856,6 +856,9 @@ el("credRows").addEventListener("keydown", (ev) => {
 });
 el("jobsRefresh").addEventListener("click", pollJobs);
 el("jobsOnlyOpen").addEventListener("change", pollJobs);
+/* Re-renders the rows already fetched rather than re-polling: a fetch per keystroke puts the
+   list behind the typing, and the filter is over fields every row already carries. */
+el("jobsFilter").addEventListener("input", () => renderJobs(lastJobRows));
 /* A real button rather than a <label for>, so the file dialog is opened explicitly and the
    control can be disabled or relabelled without touching the input. */
 el("jobImport").addEventListener("click", () => el("jobImportFile").click());
@@ -922,6 +925,7 @@ el("logDownload").addEventListener("click", downloadLog);
 
 /* -- report -- */
 el("recentRefresh").addEventListener("click", loadRecentRuns);
+el("recentFilter").addEventListener("input", () => renderRecentRuns(lastRecentRows));
 el("repLoad").addEventListener("click", () => {
   const id = el("repLookup").value.trim();
   if(!id){ setText("repLookupStatus", "enter an incident id"); return; }

@@ -41,6 +41,10 @@ async def test_process_incident(mock_exporter):
         ),
     )
     modules["api_call"].generate.return_value = ["API call 1"]
+    # The real generator holds a pack or `None`; an AsyncMock's auto-child is neither, and
+    # `stamp_label` reads it. A mock pack whose every method returns a coroutine is caught by
+    # the label's own guard, so the run stays green and the double is what is wrong.
+    modules["api_call"].knowledge_pack = None
     modules["log_retrieval"].config = {"use_ssh_tunnel": True}
     modules["log_retrieval"].retrieve_with_tunnel.return_value = {"log1": "Log data"}
     modules["correlation"].analyze.return_value = CorrelationResult(

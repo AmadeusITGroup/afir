@@ -25,6 +25,10 @@ REPORT_HTML = r"""    <!-- Recent runs. The lookup box below asks for an inciden
       <h2>Recent runs <span class="sub">live jobs and finished reports — click one to open it</span></h2>
       <div class="row" style="margin-top:0">
         <button class="btn small" id="recentRefresh"><svg class="ico"><use href="#i-refresh"/></svg> Refresh</button>
+        <!-- The lookup box below needs an id you already know; this one takes any part of a
+             run's label, so a report is reachable from what the operator remembers about the
+             incident rather than from its key. -->
+        <input id="recentFilter" placeholder="filter runs" style="width:180px" aria-label="Filter recent runs"/>
         <div class="spacer"></div>
         <span class="statusline" id="recentStatus"></span>
       </div>

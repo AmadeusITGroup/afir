@@ -2,7 +2,6 @@ import asyncio
 import json
 import logging
 import time
-import uuid
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
@@ -20,6 +19,7 @@ from src import (
 from src.audit_journal import AuditJournal
 from src.identity import (LOCAL_IDENTITY, IdentityRefused,
                           build_identity_resolver, owner_of, stamp_owner)
+from src.incident_label import new_incident_id
 from src.knowledge import pack_assistant, pack_attachments, pack_store, pack_validate
 from src.links import compose_referral
 from src.utils.deployment import (
@@ -1028,8 +1028,14 @@ class IncidentInputInterface:
 
     @staticmethod
     def _normalize_incident(incident, source):
-        """Fill in missing id/timestamp and tag the source."""
-        incident.setdefault("id", str(uuid.uuid4()))
+        """Fill in missing id/timestamp and tag the source.
+
+        A caller's own id is kept: it is their handle, and it is usually the one string that
+        already means something to them. What replaces the minted one is short rather than
+        meaningful — the meaning arrives as `label` once the run has understood the incident
+        (`src/incident_label.py`), because nothing knowable at intake can name the procedure.
+        """
+        incident.setdefault("id", new_incident_id())
         incident.setdefault("timestamp", datetime.now(timezone.utc).isoformat())
         incident.setdefault("source", source)
         return incident

@@ -1053,6 +1053,13 @@ class ReportGenerationModule:
         # Titles mirror _REQUIRED_SECTIONS for keyword-match backfill.
         scope_content = [
             f"Incident ID: {incident_id}",
+            # The name this run is filed under everywhere else. Stated beside the id rather
+            # than instead of it: the id is what every artifact of this report is keyed on.
+            *(
+                [f"Run label: {incident['label']}"]
+                if incident.get("label")
+                else []
+            ),
             (
                 f"Severity (as stated by the incident): {severity}"
                 if severity

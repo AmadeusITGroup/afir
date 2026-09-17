@@ -230,6 +230,10 @@ GLOBAL_HTML = r"""    <div class="pop" id="jobsPop" role="dialog" aria-label="Jo
       <div class="row" style="margin-top:.5rem">
         <button class="btn small" id="jobsRefresh"><svg class="ico"><use href="#i-refresh"/></svg> Refresh</button>
         <label class="toggle"><input type="checkbox" id="jobsOnlyOpen"/> only jobs needing a decision</label>
+        <!-- Filters the rows already fetched, on the label / incident id / job id / owner.
+             The list is capped at 2000 rows and the point of a label is that you can
+             recognise part of one, so scrolling was the only way to use either. -->
+        <input id="jobsFilter" placeholder="filter runs" style="width:150px" aria-label="Filter runs"/>
       </div>
       <div id="jobsRows"></div>
       <div class="row">
