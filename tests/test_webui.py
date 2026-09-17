@@ -1635,6 +1635,65 @@ def test_recent_runs_lists_jobs_and_finished_incidents():
     assert "attachTo(" in rows
 
 
+def test_a_run_is_named_by_its_label_and_still_reachable_by_its_id():
+    """A uuid says nothing about what was investigated, which is the history's whole purpose.
+
+    The label is minted after understanding, so it is absent on a queued run and on one still
+    in its first stage — and a caller's own reference is kept as the id. Both fall back rather
+    than rendering a blank cell, and the id stays in the tooltip because that is what a bug
+    report, a curl call and an artifact filename all need.
+    """
+    name = JS.split("function runName(", 1)[1].split("\n}", 1)[0]
+    assert "r.label" in name and "r.incident_id" in name
+    for body in (
+        JS.split("function renderJobs", 1)[1].split("\n}\n", 1)[0],
+        JS.split("function renderRecentRuns", 1)[1].split("\nfunction ", 1)[0],
+        JS.split("function renderInbox", 1)[1].split("\n}\n", 1)[0],
+    ):
+        assert "runName(r)" in body, "a row that shows only an id is the defect"
+        assert "r.incident_id" in body, "the durable key must stay reachable"
+    # Both run lists head the column for what it now holds. Scoped to those two: the
+    # feedback history renders review records, which carry an incident id and no label.
+    for body in (
+        JS.split("function renderJobs", 1)[1].split("\n}\n", 1)[0],
+        JS.split("function renderRecentRuns", 1)[1].split("\nfunction ", 1)[0],
+    ):
+        assert "<th>Run</th>" in body
+        assert "<th>Incident</th>" not in body
+    from src.pipeline_runner import Job
+
+    # The server side, so a rename there fails HERE rather than at the next live run.
+    src = inspect.getsource(Job)
+    assert '"label"' in src and '"label_detail"' in src
+
+
+def test_a_run_can_be_found_by_what_the_operator_remembers_about_it():
+    """The lookup box beside these lists needs an id typed from memory — usable only by
+    someone who already has it. The filter takes any part of a run's name instead.
+
+    It re-renders from the rows already fetched: re-polling per keystroke would put the list
+    behind the typing. And an empty result says which of the three reasons it is, because
+    "widen the filter" and "launch something" are different next moves.
+    """
+    assert 'id="jobsFilter"' in INDEX_HTML
+    assert 'id="recentFilter"' in INDEX_HTML
+    match = JS.split("function matchesRunFilter(", 1)[1].split("\n}", 1)[0]
+    assert "return !q ||" in match, "an empty filter must hide nothing"
+    hay = JS.split("function runHaystack(", 1)[1].split("\n}", 1)[0]
+    for field in ("r.label", "r.incident_id", "r.job_id"):
+        assert field in hay
+    assert "toLowerCase" in hay and "toLowerCase" in match
+
+    jobs = JS.split("function renderJobs", 1)[1].split("\n}\n", 1)[0]
+    assert "matchesRunFilter(r, filter)" in jobs
+    assert "No run matches" in jobs
+    recent = JS.split("function renderRecentRuns", 1)[1].split("\nfunction ", 1)[0]
+    assert "matchesRunFilter(r, filter)" in recent
+    # Wired to the rows last rendered, not to a fetch.
+    assert "renderJobs(lastJobRows)" in JS
+    assert "renderRecentRuns(lastRecentRows)" in JS
+
+
 def test_a_job_can_be_imported_from_the_ui():
     """The export button already existed, so the round trip was half-built: a job
     document could leave this environment and never come back."""

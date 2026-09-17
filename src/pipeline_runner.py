@@ -13,6 +13,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from export_results import ResultExporter
 from human_guidance import render_guidance
 from identity import owner_of, owner_scoped
+from incident_label import stamp_label
 from job_queue import JobQueue, QueueFull
 from job_store import EVIDENCE_KEYS
 from link_children import child_budget, child_incident, plan_child_spawns
@@ -326,6 +327,10 @@ class Job:
         return {
             "job_id": self.job_id,
             "incident_id": self.incident.get("id"),
+            # Null until the understanding stage has run: what a label names does not exist
+            # before then, and a placeholder would be read as a fact about the run.
+            "label": self.incident.get("label"),
+            "label_detail": self.incident.get("label_detail"),
             "status": self.status.value,
             "run_mode": self.run_mode.value,
             "current_stage": self.current_stage,
@@ -379,9 +384,18 @@ def _guidance(ctx: JobContext, stage_name):
 
 
 async def _run_understanding(ctx: JobContext):
-    return await ctx.modules["understanding"].process(
+    result = await ctx.modules["understanding"].process(
         ctx.incident, guidance=_guidance(ctx, "understanding")
     )
+    # The first point at which this run can be named: the label needs the procedure and the
+    # subject, and neither exists until now. Stamped on the incident rather than on the job so
+    # the exports, the report and the classic inline path all read the same string.
+    stamp_label(
+        ctx.incident,
+        getattr(ctx.modules.get("api_call"), "knowledge_pack", None),
+        getattr(result, "analysis", None),
+    )
+    return result
 
 
 def _pass_record(ctx: JobContext, pass_number: int) -> Dict[str, Any]:
@@ -1972,6 +1986,10 @@ class JobManager:
         return {
             "job_id": job.job_id,
             "incident_id": job.incident.get("id"),
+            # Carried in the row, not derived by the reader: this is the shape `_prune` keeps,
+            # so a run evicted from memory has to stay recognisable by the same name.
+            "label": job.incident.get("label"),
+            "label_detail": job.incident.get("label_detail"),
             "status": job.status.value,
             "run_mode": job.run_mode.value,
             "current_stage": job.current_stage,
@@ -2013,6 +2031,9 @@ class JobManager:
             {
                 "job_id": job.job_id,
                 "incident_id": job.incident.get("id"),
+                # A gate is answered from the inbox, where the operator is choosing between
+                # runs they did not launch; an id alone says nothing about which is which.
+                "label": job.incident.get("label"),
                 "run_mode": job.run_mode.value,
                 # The job's own status, so a client can tell an answerable gate from one
                 # on a run that has since ended.

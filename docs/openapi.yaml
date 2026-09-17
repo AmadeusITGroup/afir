@@ -3316,6 +3316,23 @@ components:
           description: Unique job identifier (UUID).
         incident_id:
           type: string
+        label:
+          type: string
+          nullable: true
+          description: >
+            A fixed-width human name for this run — procedure, subject, event
+            date and the incident id's own tail, every field truncated or padded
+            to its own width so a column of them aligns. Minted once after the
+            understanding stage and never a rename, so it is null while a run is
+            queued or still understanding its incident; a field that did not
+            resolve is all padding rather than a guess. Not a key: every
+            artifact stays keyed on incident_id.
+        label_detail:
+          type: string
+          nullable: true
+          description: >
+            What each of the label's fields was built from, including the ones
+            that did not resolve and why. Null exactly when label is.
         status:
           type: string
           enum: [queued, running, paused, completed, failed, cancelled]

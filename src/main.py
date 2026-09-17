@@ -12,6 +12,7 @@ from export_results import ResultExporter
 from identity import owner_scoped
 from feedback_loop import FeedbackLoop
 from incident_input import IncidentInputInterface
+from incident_label import stamp_label
 from incident_understanding import IncidentUnderstandingModule
 from inquiry_probe import build_inquiry_probe
 from job_store import build_job_store
@@ -107,6 +108,13 @@ async def process_incident(incident, modules):
 
         understanding = await modules["understanding"].process(incident)
         logger.info(f"Incident {incident['id']} understanding complete")
+        # Same seam as the job runner's understanding stage: a run's name is minted where its
+        # procedure and subject first exist, and the id it is keyed on never moves.
+        stamp_label(
+            incident,
+            getattr(modules.get("api_call"), "knowledge_pack", None),
+            getattr(understanding, "analysis", None),
+        )
 
         queries = await modules["api_call"].generate(understanding)
         logger.info(
